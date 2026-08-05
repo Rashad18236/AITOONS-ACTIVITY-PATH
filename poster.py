@@ -3,6 +3,7 @@ import csv, io, math, re
 from dataclasses import dataclass
 import numpy as np
 import requests
+import trimesh
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -157,3 +158,26 @@ def compose(track, elev, bounds, p):
         d.ellipse([qx - w / 2, qy - w / 2, qx + w / 2, qy + w / 2], fill=255)
     hm[np.asarray(img) > 0] -= p.groove_d_mm
     return hm, surface, track_px
+
+
+def _grid_faces(idx):
+    a = idx[:-1, :-1].ravel(); b = idx[:-1, 1:].ravel()
+    c = idx[1:, 1:].ravel(); d = idx[1:, :-1].ravel()
+    return np.concatenate([np.stack([a, b, c], 1), np.stack([a, c, d], 1)])
+
+
+def heightmap_mesh(hm, res_mm):
+    """Watertight solid: heightmap top, vertical walls, flat back at z=0."""
+    H, W = hm.shape
+    yy, xx = np.mgrid[0:H, 0:W].astype(float)
+    top = np.stack([xx * res_mm, (H - 1 - yy) * res_mm, hm], -1).reshape(-1, 3)
+    bot = top.copy(); bot[:, 2] = 0.0
+    V = np.vstack([top, bot])
+    idx = np.arange(H * W).reshape(H, W)
+    # top winds CCW seen from +z (reversed), back keeps grid order so it faces -z
+    faces = [_grid_faces(idx)[:, ::-1], _grid_faces(idx + H * W)]
+    for edge in (idx[0], idx[:, -1], idx[-1][::-1], idx[:, 0][::-1]):  # boundary loop
+        t0, t1 = edge[:-1], edge[1:]
+        faces.append(np.stack([t0, t1, t1 + H * W], 1))
+        faces.append(np.stack([t0, t1 + H * W, t0 + H * W], 1))
+    return trimesh.Trimesh(V, np.vstack(faces), process=False)

@@ -91,3 +91,15 @@ def test_compose_text_embossed():
     hm, _, _ = poster.compose(track, elev, bounds, p2)
     bar = hm[N - fpx:, :]
     assert bar.max() > p.base_mm + p.frame_height_mm       # something raised on bottom bar
+
+
+def test_heightmap_mesh_watertight():
+    rng = np.random.default_rng(0)
+    hm = 4.0 + rng.random((20, 30)) * 5
+    m = poster.heightmap_mesh(hm, 0.5)
+    assert m.is_watertight
+    assert m.is_winding_consistent   # normals all outward, or slicers choke
+    assert m.volume > 0
+    assert abs(m.bounds[1][0] - 29 * 0.5) < 1e-6   # x extent = (W-1)*res
+    assert abs(m.bounds[1][2] - hm.max()) < 1e-6   # top = max height
+    assert m.bounds[0][2] == 0                     # flat back at z=0
