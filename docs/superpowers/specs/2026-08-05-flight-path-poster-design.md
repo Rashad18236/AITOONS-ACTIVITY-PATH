@@ -81,4 +81,42 @@ Key invariant: both meshes derive from one heightmap → guaranteed fit (0.30mm 
 ## Out of scope (deliberate)
 
 - Long-haul/continental flights (projection distortion), multi-tile posters,
-  AMS multi-color export, FR24 API fetch, hosting, GPX. Add only when actually needed.
+  FR24 API fetch, hosting, GPX. Add only when actually needed.
+
+---
+
+# Addendum 2026-08-05: colored relief + split frame (approved)
+
+Supersedes the single-poster output. Three deliverables per generate:
+
+| File | Content | Filament |
+|---|---|---|
+| `frame.stl` | Backplate (base thickness, full footprint) + frame ring + embossed text, one solid | Black |
+| `relief.3mf` | Multi-body, printed in place with AMS: terrain body (green), water caps (blue), big-city caps (grey) | Slots 1/2/3 |
+| `path.stl` | Glue-in strip, unchanged geometry (sampled from relief surface) | Red / any |
+
+- Relief plate has its own flat back, footprint = size − 2·frame − 2·fit clearance;
+  it glues onto the backplate inside the frame ring.
+- Land cover: ESA WorldCover 10m via public Terrascope WMS
+  (`https://services.terrascope.be/wms/v2`, layer `WORLDCOVER_2021_MAP`, EPSG:3857 bbox);
+  classify PNG pixels by legend palette: water #0064C8 → blue, built-up #FA0000 → grey,
+  everything else green. "Big cities only": morphological opening (PIL Min/MaxFilter),
+  kernel sized from `city_min_km` real-world width; small water speckle removed with k=3 opening.
+- Geometry stays heightmap-only: terrain body top is depressed `cap_mm` under cap masks
+  and `groove_d_mm` under the groove (groove pixels excluded from cap masks);
+  caps are `cap_mm` slabs following the pre-groove surface, meshed by a new
+  `masked_slab_mesh(mask, top, thickness, res_mm)` (cell-based, watertight).
+- 3MF is hand-written (zip+XML, no new deps): standard core objects with display colors
+  plus Bambu `Metadata/model_settings.config` mapping each body to extruder 1/2/3.
+- New Params: `cap_mm=0.6`, `plate_mm=2.0` (relief minimum thickness), `fit_mm=0.2`
+  (relief↔frame side clearance), `city_min_km=1.5`. Display colors are constants,
+  not Params: green #4CAF50, blue #2196F3, grey #9E9E9E, black #222222, red #CC2222.
+- UI: three download links; preview shows frame (black, STLLoader), relief (3MFLoader,
+  per-body colors), strip (red) assembled: relief and strip translated by
+  (frame+fit, frame+fit, base) onto the backplate.
+- Known ceilings (accepted): relief.3mf is large (~80–120MB XML at 250mm defaults) and
+  the browser 3MF parse is slow; upgrade path is mesh decimation or binary attachments.
+  Text emboss stays black-on-black (frame filament); contrasting text = 4th slot, later.
+- check_output.py extends to the trio: frame footprint/watertight, relief bodies
+  round-tripped from the 3MF (also validates the writer), caps within relief bounds,
+  strip vs relief surface.
