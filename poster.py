@@ -185,15 +185,17 @@ def heightmap_mesh(hm, res_mm):
     H, W = hm.shape
     yy, xx = np.mgrid[0:H, 0:W].astype(float)
     top = np.stack([xx * res_mm, (H - 1 - yy) * res_mm, hm], -1).reshape(-1, 3)
-    bot = top.copy(); bot[:, 2] = 0.0
-    V = np.vstack([top, bot])
     idx = np.arange(H * W).reshape(H, W)
-    # top winds CCW seen from +z (reversed), back keeps grid order so it faces -z
-    faces = [_grid_faces(idx)[:, ::-1], _grid_faces(idx + H * W)]
-    for edge in (idx[0], idx[:, -1], idx[-1][::-1], idx[:, 0][::-1]):  # boundary loop
-        t0, t1 = edge[:-1], edge[1:]
-        faces.append(np.stack([t0, t1, t1 + H * W], 1))
-        faces.append(np.stack([t0, t1 + H * W, t0 + H * W], 1))
+    # boundary loop, no repeated corners: north edge E, east edge S, south W, west N
+    ring = np.concatenate([idx[0], idx[1:, -1], idx[-1, -2::-1], idx[-2:0:-1, 0]])
+    bot = top[ring].copy(); bot[:, 2] = 0.0   # back only needs the boundary ring
+    V = np.vstack([top, bot])
+    b = H * W + np.arange(len(ring))
+    t0, t1, b0, b1 = ring, np.roll(ring, -1), b, np.roll(b, -1)
+    faces = [_grid_faces(idx)[:, ::-1],       # top winds CCW seen from +z (reversed)
+             np.stack([t0, t1, b1], 1), np.stack([t0, b1, b0], 1)]   # walls
+    # flat back: one fan off b[0] instead of a full-resolution grid (half the STL)
+    faces.append(np.stack([np.full(len(b) - 2, b[0]), b[1:-1], b[2:]], 1))
     return trimesh.Trimesh(V, np.vstack(faces), process=False)
 
 
