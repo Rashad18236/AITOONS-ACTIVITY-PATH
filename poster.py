@@ -114,7 +114,7 @@ class Params:
     frame_height_mm: float = 10.0
     groove_w_mm: float = 2.0
     groove_d_mm: float = 1.5
-    clearance_mm: float = 0.15
+    clearance_mm: float = 0.30  # per side; FDM PLA seating margin (rasterisation ±1px + elephant-foot)
     text: str = ""
     text_mm: float = 8.0
     res_mm: float = 0.4
