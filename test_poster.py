@@ -390,3 +390,18 @@ def test_masked_slab_mesh_geometry():
 
 def test_masked_slab_mesh_empty():
     assert poster.masked_slab_mesh(np.zeros((5, 5), bool), np.ones((5, 5)), 0.6, 0.5) is None
+
+
+def test_3mf_roundtrip():
+    a = poster.heightmap_mesh(np.full((4, 4), 2.0), 1.0)
+    b = poster.heightmap_mesh(np.full((3, 3), 1.0), 1.0)
+    data = poster.write_3mf([(a, "terrain", "#4CAF50", 1), (b, "water", "#2196F3", 2)])
+    import zipfile, io as _io
+    z = zipfile.ZipFile(_io.BytesIO(data))
+    assert "3D/3dmodel.model" in z.namelist() and "Metadata/model_settings.config" in z.namelist()
+    got = poster.read_3mf(data)
+    assert [g[0] for g in got] == ["terrain", "water"]
+    assert got[0][1].shape == (len(a.vertices), 3) and got[0][2].shape == (len(a.faces), 3)
+    assert np.allclose(got[0][1], a.vertices, atol=1e-3)
+    cfg = z.read("Metadata/model_settings.config").decode()
+    assert 'value="1"' in cfg and 'value="2"' in cfg
