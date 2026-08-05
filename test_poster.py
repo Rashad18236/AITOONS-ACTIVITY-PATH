@@ -25,6 +25,41 @@ def test_parse_kml_linestring_fallback():
     assert t.shape == (2, 3) and t[1, 0] == 47.50
 
 
+def _fr24_ga_kml():
+    """FR24 GA export shape: a straight Route line, single-point fixes, and a
+    Trail folder of chaining 2-point segments that re-draw the same flight."""
+    path = [(8.00 + i / 100, 47.00 + i / 100, 500.0 + 100 * i) for i in range(13)]
+    singles = "".join(
+        f"<Placemark><Point><coordinates>{lo},{la},0</coordinates></Point></Placemark>"
+        for lo, la, _ in path)
+    trail = "".join(
+        f"<Placemark><LineString><coordinates>{a[0]},{a[1]},{a[2]} "
+        f"{b[0]},{b[1]},{b[2]}</coordinates></LineString></Placemark>"
+        for a, b in zip(path, path[1:]))
+    return (f'<kml><Folder><name>Route</name><Placemark><LineString>'
+            f'<coordinates>9.90,47.90,0 7.00,46.00,0</coordinates>'
+            f'</LineString></Placemark>{singles}</Folder>'
+            f'<Folder><name>Trail</name>{trail}</Folder></kml>'), path
+
+
+def test_parse_kml_fr24_ga_picks_trail_only():
+    xml, path = _fr24_ga_kml()
+    t = poster.parse_track("ga.kml", xml.encode())
+    assert t.shape == (13, 3)                                  # stitched trail, not doubled
+    assert len(t) < 13 + 12 * 2                                # nowhere near concatenation
+    assert (t[0, 0], t[0, 1]) == (path[0][1], path[0][0])
+    assert (t[-1, 0], t[-1, 1]) == (path[-1][1], path[-1][0])
+    assert (t[:, 2] > 0).all()                                 # real altitudes, not the 0-alt fixes
+    for lat, lon in ((47.90, 9.90), (46.00, 7.00)):            # no Route endpoints
+        assert not ((t[:, 0] == lat) & (t[:, 1] == lon)).any()
+
+
+def test_parse_dedupes_consecutive_duplicates():
+    xml = ("<kml><coordinates>8.55,47.46,430 8.55,47.46,430 "
+           "8.60,47.50,900</coordinates></kml>")
+    assert poster.parse_track("x.kml", xml.encode()).shape == (2, 3)
+
+
 def test_parse_csv_fr24():
     t = poster.parse_track("flight.csv", CSV.encode())
     assert t.shape == (2, 3)

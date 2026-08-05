@@ -11,23 +11,41 @@ def parse_track(name: str, data: bytes) -> np.ndarray:
     """Return (N,3) array of lat, lon, alt_m from FR24 KML or CSV export."""
     text = data.decode("utf-8", "replace")
     pts = _parse_kml(text) if name.lower().endswith(".kml") else _parse_csv(text)
-    if len(pts) < 2:
+    t = np.array(pts, dtype=float).reshape(-1, 3)
+    if len(t) > 1:  # drop repeated fixes at the same position (parked aircraft)
+        t = t[np.r_[True, np.any(np.diff(t[:, :2], axis=0), axis=1)]]
+    if len(t) < 2:
         raise ValueError("No track points found — is this a FlightRadar24 KML/CSV export?")
-    return np.array(pts, dtype=float)
+    return t
 
 
 def _parse_kml(text):
     # ponytail: regex over XML — FR24 exports are machine-generated, fine here
     pts = [(float(la), float(lo), float(al)) for lo, la, al in
            re.findall(r"<gx:coord>([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)</gx:coord>", text)]
-    if not pts:  # plain LineString fallback: "lon,lat,alt lon,lat,alt ..."
-        for block in re.findall(r"<coordinates>(.*?)</coordinates>", text, re.S):
-            for triple in block.split():
-                p = triple.split(",")
-                if len(p) >= 2:
-                    pts.append((float(p[1]), float(p[0]),
-                                float(p[2]) if len(p) > 2 else 0.0))
-    return pts
+    if pts:
+        return pts
+    # plain <coordinates> fallback: "lon,lat,alt lon,lat,alt ...". FR24 GA exports hold
+    # the same flight up to three times over, so pick ONE representation, never concatenate.
+    blocks = [[(float(p[1]), float(p[0]), float(p[2]) if len(p) > 2 else 0.0)
+               for p in (t.split(",") for t in block.split()) if len(p) >= 2]
+              for block in re.findall(r"<coordinates>(.*?)</coordinates>", text, re.S)]
+    biggest = max(blocks, key=len, default=[])
+    if len(biggest) >= 10:
+        return biggest  # 1. classic single-LineString track (ignores 2-point Route lines)
+    twos = [b for b in blocks if len(b) == 2]
+    if len(twos) >= 10:
+        # 2. Trail folder: many 2-point segments, each starting where the last ended and
+        # carrying real altitudes. Keep the longest chain; unchained bits are Route lines.
+        chains, cur = [], []
+        for a, b in twos:
+            if cur and abs(cur[-1][0] - a[0]) < 1e-9 and abs(cur[-1][1] - a[1]) < 1e-9:
+                cur.append(b)
+            else:
+                cur = [a, b]
+                chains.append(cur)
+        return max(chains, key=len)
+    return [p for b in blocks for p in b]  # 3. tiny hand-made file: take everything
 
 
 def _parse_csv(text):
