@@ -152,12 +152,26 @@ def compose(track, elev, bounds, p):
     surface = hm.copy()
     img = Image.new("L", (N, N))
     d = ImageDraw.Draw(img)
-    w = max(int(p.groove_w_mm / p.res_mm), 2)
-    d.line([tuple(q) for q in track_px], fill=255, width=w, joint="curve")
-    for qx, qy in track_px[[0, -1]]:  # round the end caps (line() cuts them square)
-        d.ellipse([qx - w / 2, qy - w / 2, qx + w / 2, qy + w / 2], fill=255)
+    # carve the groove from the strip's own offset geometry: line(width=) is not a
+    # constant perpendicular width (1.42mm at 45° for a nominal 2.0mm), so the strip
+    # would not seat. Per-segment quads, not one ribbon polygon — a single polygon
+    # even-odd fills leaves holes where the track hairpins back over itself.
+    C, nrm = _offsets(track_px)
+    L, R = C + nrm * (p.groove_w_mm / 2 / p.res_mm), C - nrm * (p.groove_w_mm / 2 / p.res_mm)
+    for i in range(len(C) - 1):
+        d.polygon([tuple(L[i]), tuple(L[i + 1]), tuple(R[i + 1]), tuple(R[i])], fill=255)
     hm[np.asarray(img) > 0] -= p.groove_d_mm
     return hm, surface, track_px
+
+
+def _offsets(track_px):
+    """Resample the centerline to ~1 sample/pixel -> (C, unit normals), pixel space."""
+    d = np.r_[0, np.cumsum(np.hypot(*np.diff(track_px, axis=0).T))]
+    t = np.linspace(0, d[-1], max(int(d[-1]), 8))
+    C = np.stack([np.interp(t, d, track_px[:, 0]), np.interp(t, d, track_px[:, 1])], 1)
+    tang = np.gradient(C, axis=0)
+    tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-12
+    return C, np.stack([-tang[:, 1], tang[:, 0]], 1)
 
 
 def _grid_faces(idx):
@@ -185,21 +199,15 @@ def heightmap_mesh(hm, res_mm):
 
 def strip_mesh(track_px, surface, p):
     """Constant-thickness ribbon that seats in the groove and stands proud."""
-    d = np.r_[0, np.cumsum(np.hypot(*np.diff(track_px, axis=0).T))]
-    n = max(int(d[-1]), 8)  # ~1 sample per heightmap pixel
-    t = np.linspace(0, d[-1], n)
-    cx = np.interp(t, d, track_px[:, 0])
-    cy = np.interp(t, d, track_px[:, 1])
-    tang = np.gradient(np.stack([cx, cy], 1), axis=0)
-    tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-12
-    nrm = np.stack([-tang[:, 1], tang[:, 0]], 1)
+    C, nrm = _offsets(track_px)  # same centerline compose() carved the groove from
+    n = len(C)
+    cx, cy = C[:, 0], C[:, 1]
     half = (p.groove_w_mm / 2 - p.clearance_mm) / p.res_mm  # px
     H, W = surface.shape
     # ponytail: nearest-neighbour surface sampling; bilinear if strip shows steps
     zc = surface[np.clip(cy.round().astype(int), 0, H - 1),
                  np.clip(cx.round().astype(int), 0, W - 1)]
     z_top, z_bot = zc + p.proud_mm, zc - p.groove_d_mm
-    C = np.stack([cx, cy], 1)
     L, R = C + nrm * half, C - nrm * half
 
     def mm(q, z):

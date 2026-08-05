@@ -79,10 +79,39 @@ def test_compose_shapes_and_frame():
 def test_compose_groove_carved():
     p, N, fpx, elev, track, bounds = _synthetic()
     hm, surface, tpx = poster.compose(track, elev, bounds, p)
-    mid = tpx[len(tpx) // 2]
+    mid = (tpx[0] + tpx[-1]) / 2      # len(tpx)//2 was the endpoint, not the middle
     x, y = int(round(mid[0])), int(round(mid[1]))
     assert surface[y, x] - hm[y, x] == p.groove_d_mm       # carved by exactly groove depth
     assert fpx <= x < N - fpx and fpx <= y < N - fpx       # track inside relief area
+
+
+def test_strip_seats_in_groove_at_every_angle():
+    """Fit invariant: the carved groove is never narrower than the strip.
+
+    Rasterisation puts each edge within half a pixel of nominal, so absolute
+    per-pixel containment is a sub-pixel stricter than the physical fit — the
+    strip is slid in, not pinned to the centreline. Contiguous perpendicular
+    width per station is the criterion. line(width=) fails this at ~45°."""
+    p, N, fpx, elev, _, _ = _synthetic()
+    a = np.linspace(0, np.pi / 2, 40)                    # arc sweeps 90° of heading
+    trk = np.stack([47.0 + 0.3 * np.sin(a), 8.0 + 0.3 * (1 - np.cos(a)),
+                    np.zeros_like(a)], 1)
+    bounds = poster.track_bounds(trk, p.margin_pct)
+    hm, surface, tpx = poster.compose(trk, elev, bounds, p)
+    groove = (surface - hm) > 0
+    C, nrm = poster._offsets(tpx)
+    half = (p.groove_w_mm / 2 - p.clearance_mm) / p.res_mm   # strip half-width, px
+    step = np.arange(0, 3 * half, 0.25)                      # march out from centreline
+
+    def reach(sign):                                         # contiguous carved px
+        q = C[:, None] + sign * nrm[:, None] * step[None, :, None]
+        ok = groove[q[..., 1].round().astype(int).clip(0, N - 1),
+                    q[..., 0].round().astype(int).clip(0, N - 1)]
+        return (np.where(ok.all(1), len(step), ok.argmin(1)) - 1) * 0.25
+
+    w = (reach(1.0) + reach(-1.0))[2:-2] * p.res_mm          # skip the square ends
+    assert w.min() >= p.groove_w_mm - 2 * p.clearance_mm, \
+        f"groove pinches to {w.min():.2f}mm, strip is {p.groove_w_mm - 2 * p.clearance_mm}mm"
 
 
 def test_compose_text_embossed():
