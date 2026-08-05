@@ -3,7 +3,7 @@ import csv, io, math, re
 from dataclasses import dataclass
 import numpy as np
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 
 def parse_track(name: str, data: bytes) -> np.ndarray:
@@ -100,3 +100,60 @@ def fetch_elevation(bounds, px_out):
     b, d = int(pyT - ty0 * 256), int(pyB - ty0 * 256)
     crop = elev[b:max(d, b + 2), a:max(c, a + 2)].astype(np.float32)
     return np.asarray(Image.fromarray(crop, "F").resize((px_out, px_out), Image.BILINEAR))
+
+
+@dataclass
+class Params:
+    size_mm: float = 250.0
+    base_mm: float = 4.0
+    relief_mm: float = 20.0
+    exaggeration: float = 1.5
+    margin_pct: float = 15.0
+    frame_mm: float = 12.0
+    frame_height_mm: float = 10.0
+    groove_w_mm: float = 2.0
+    groove_d_mm: float = 1.5
+    clearance_mm: float = 0.15
+    text: str = ""
+    text_mm: float = 8.0
+    res_mm: float = 0.4
+    proud_mm: float = 1.0
+
+
+def compose(track, elev, bounds, p):
+    """One (N,N) heightmap in mm: terrain + frame + text, then groove carved.
+
+    Returns (hm, surface_before_groove, track_px)."""
+    N = int(p.size_mm / p.res_mm)
+    fpx = int(p.frame_mm / p.res_mm)
+    hm = np.full((N, N), p.base_mm)
+    e0, e1 = float(elev.min()), float(elev.max())
+    hm[fpx:N - fpx, fpx:N - fpx] += (elev - e0) / max(e1 - e0, 1e-9) \
+        * p.relief_mm * p.exaggeration
+    ring = np.ones((N, N), bool)
+    ring[fpx:N - fpx, fpx:N - fpx] = False
+    hm[ring] = p.base_mm + p.frame_height_mm
+    if p.text:
+        img = Image.new("L", (N, N))
+        d = ImageDraw.Draw(img)
+        font = ImageFont.load_default(size=max(int(p.text_mm / p.res_mm), 6))
+        w = d.textlength(p.text, font=font)
+        d.text(((N - w) / 2, N - fpx + (fpx - p.text_mm / p.res_mm) / 2),
+               p.text, fill=255, font=font)
+        hm[np.asarray(img) > 0] += 0.8  # emboss height, mm
+    # project track into heightmap pixels (row 0 = north)
+    x0, y0, x1, y1 = bounds
+    inner = N - 2 * fpx
+    xy = np.array([_merc(la, lo) for la, lo, _ in track])
+    tx = (xy[:, 0] - x0) / (x1 - x0) * inner + fpx
+    ty = (y1 - xy[:, 1]) / (y1 - y0) * inner + fpx
+    track_px = np.stack([tx, ty], 1)
+    surface = hm.copy()
+    img = Image.new("L", (N, N))
+    d = ImageDraw.Draw(img)
+    w = max(int(p.groove_w_mm / p.res_mm), 2)
+    d.line([tuple(q) for q in track_px], fill=255, width=w, joint="curve")
+    for qx, qy in track_px[[0, -1]]:  # round the end caps (line() cuts them square)
+        d.ellipse([qx - w / 2, qy - w / 2, qx + w / 2, qy + w / 2], fill=255)
+    hm[np.asarray(img) > 0] -= p.groove_d_mm
+    return hm, surface, track_px

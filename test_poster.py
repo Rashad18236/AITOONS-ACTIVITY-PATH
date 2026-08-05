@@ -50,3 +50,44 @@ def test_decode_terrarium():
     e = poster.decode_terrarium(rgb)
     assert e[0, 0] == -32768
     assert abs(e[0, 1] - (128 * 256 + 4 + 128 / 256 - 32768)) < 1e-9
+
+
+def _params(**kw):
+    return poster.Params(**{"size_mm": 40.0, "frame_mm": 4.0, "res_mm": 0.5, **kw})
+
+
+def _synthetic():
+    p = _params()
+    N = int(p.size_mm / p.res_mm)              # 80
+    fpx = int(p.frame_mm / p.res_mm)           # 8
+    inner = N - 2 * fpx                        # 64
+    elev = np.tile(np.linspace(0, 1000, inner), (inner, 1))  # E-W gradient
+    track = np.array([[47.0, 8.0, 0], [47.5, 9.0, 3000]])
+    bounds = poster.track_bounds(track, p.margin_pct)
+    return p, N, fpx, elev, track, bounds
+
+
+def test_compose_shapes_and_frame():
+    p, N, fpx, elev, track, bounds = _synthetic()
+    hm, surface, tpx = poster.compose(track, elev, bounds, p)
+    assert hm.shape == (N, N) and surface.shape == (N, N)
+    assert hm[0, 0] == p.base_mm + p.frame_height_mm       # frame ring is flat
+    assert abs(hm[N // 2, fpx] - p.base_mm) < p.relief_mm  # relief starts at base
+    assert hm[fpx:N-fpx, fpx:N-fpx].max() <= p.base_mm + p.relief_mm * p.exaggeration + 1e-6
+
+
+def test_compose_groove_carved():
+    p, N, fpx, elev, track, bounds = _synthetic()
+    hm, surface, tpx = poster.compose(track, elev, bounds, p)
+    mid = tpx[len(tpx) // 2]
+    x, y = int(round(mid[0])), int(round(mid[1]))
+    assert surface[y, x] - hm[y, x] == p.groove_d_mm       # carved by exactly groove depth
+    assert fpx <= x < N - fpx and fpx <= y < N - fpx       # track inside relief area
+
+
+def test_compose_text_embossed():
+    p, N, fpx, elev, track, bounds = _synthetic()
+    p2 = _params(text="TEST", text_mm=3.0)
+    hm, _, _ = poster.compose(track, elev, bounds, p2)
+    bar = hm[N - fpx:, :]
+    assert bar.max() > p.base_mm + p.frame_height_mm       # something raised on bottom bar
