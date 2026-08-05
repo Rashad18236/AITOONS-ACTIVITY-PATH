@@ -231,6 +231,11 @@ def strip_mesh(track_px, surface, p):
 
 def build_poster(track, p=Params()):
     """Track -> (poster_stl_bytes, path_strip_stl_bytes)."""
+    # ponytail: reject rather than clamp — a typo'd 2500mm is a mistake to surface,
+    # not to silently honour, and N^2 grids OOM the box. Raise the cap if a bigger
+    # plate ever shows up.
+    if p.size_mm > 256 or p.res_mm < 0.2:
+        raise ValueError("size_mm must be <= 256 (plate limit) and res_mm >= 0.2")
     bounds = track_bounds(track, p.margin_pct)
     N = int(p.size_mm / p.res_mm)
     fpx = int(p.frame_mm / p.res_mm)

@@ -162,6 +162,14 @@ def test_build_poster_end_to_end(monkeypatch):
     assert len(stl_b) > 84
 
 
+def test_build_poster_rejects_oversized_grid():
+    track = np.array([[47.0, 8.0, 0], [47.5, 9.0, 3000]])
+    with pytest.raises(ValueError):
+        poster.build_poster(track, _params(size_mm=2500.0))   # typo, not a request
+    with pytest.raises(ValueError):
+        poster.build_poster(track, _params(res_mm=0.01))
+
+
 def test_generate_endpoint(monkeypatch):
     from fastapi.testclient import TestClient
     import app as appmod

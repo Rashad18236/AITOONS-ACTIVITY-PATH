@@ -97,7 +97,8 @@ document.getElementById('go').onclick = async () => {
     if (!r.ok) { status.textContent = 'Error: ' + JSON.stringify((await r.json()).detail); return; }
     const j = await r.json();
     status.textContent = 'Decoding meshes…';
-    meshes.forEach(m => scene.remove(m)); meshes = [];
+    meshes.forEach(m => { scene.remove(m); m.geometry.dispose(); m.material.dispose(); });
+    meshes = [];
     const pb = show(j.poster, 0xf0f0f0);
     const sb = show(j.path, 0xcc2222);
     new THREE.Box3().setFromObject(meshes[0]).getCenter(controls.target);
