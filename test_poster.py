@@ -35,3 +35,18 @@ def test_parse_csv_fr24():
 def test_parse_rejects_empty():
     with pytest.raises(ValueError):
         poster.parse_track("x.csv", b"Timestamp,Position\n")
+
+
+def test_track_bounds_square_with_margin():
+    t = np.array([[47.0, 8.0, 0], [47.5, 9.0, 0]])
+    x0, y0, x1, y1 = poster.track_bounds(t, 15.0)
+    assert abs((x1 - x0) - (y1 - y0)) < 1e-12          # square
+    import math
+    assert x0 < math.radians(8.0) and x1 > math.radians(9.0)  # margin outside track
+
+
+def test_decode_terrarium():
+    rgb = np.array([[[0, 0, 0], [128, 4, 128]]], dtype=np.uint8)
+    e = poster.decode_terrarium(rgb)
+    assert e[0, 0] == -32768
+    assert abs(e[0, 1] - (128 * 256 + 4 + 128 / 256 - 32768)) < 1e-9
