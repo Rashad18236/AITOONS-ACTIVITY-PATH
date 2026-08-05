@@ -17,13 +17,12 @@ async def generate(file: UploadFile, params: str = Form("{}")):
     except (ValueError, AttributeError) as e:
         raise HTTPException(400, str(e))
     try:
-        # Task 5 wires the coloured relief bodies through as 3MF; until then the
-        # frame is the "poster" download so the endpoint stays honest.
-        stl_poster, _bodies, stl_strip = core.build_poster(track, core.Params(**kw))
-    except Exception as e:  # DEM fetch or meshing failed
+        frame_stl, bodies, path_stl = core.build_poster(track, core.Params(**kw))
+        relief_3mf = core.write_3mf(bodies)
+    except Exception as e:  # DEM/land-cover fetch or meshing failed
         raise HTTPException(502, f"Generation failed: {e}")
-    return {"poster": base64.b64encode(stl_poster).decode(),
-            "path": base64.b64encode(stl_strip).decode()}
+    b64 = lambda d: base64.b64encode(d).decode()
+    return {"frame": b64(frame_stl), "relief": b64(relief_3mf), "path": b64(path_stl)}
 
 
 app.mount("/", StaticFiles(directory="static", html=True))

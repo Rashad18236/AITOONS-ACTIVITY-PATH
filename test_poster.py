@@ -320,15 +320,20 @@ def test_build_poster_rejects_oversized_grid():
 def test_generate_endpoint(monkeypatch):
     from fastapi.testclient import TestClient
     import app as appmod
-    _fake_fetches(monkeypatch)
+    _fake_fetches(monkeypatch, lc_code=1)      # water everywhere -> relief has 2 bodies
     client = TestClient(appmod.app)
     params = '{"size_mm": 40, "frame_mm": 4, "res_mm": 0.5, "text": "ZRH-GVA"}'
     r = client.post("/generate", files={"file": ("f.kml", KML.encode())},
                     data={"params": params})
     assert r.status_code == 200
     import base64
-    assert len(base64.b64decode(r.json()["poster"])) > 84
-    assert len(base64.b64decode(r.json()["path"])) > 84
+    j = r.json()
+    assert set(j) == {"frame", "relief", "path"}
+    frame, relief, path = (base64.b64decode(j[k]) for k in ("frame", "relief", "path"))
+    assert frame[:5] != b"solid" and len(frame) > 84       # binary STL
+    assert path[:5] != b"solid" and len(path) > 84
+    assert relief[:2] == b"PK"                             # 3MF is a zip
+    assert [b[0] for b in poster.read_3mf(relief)] == ["terrain", "water"]
 
 
 def test_generate_bad_file():
