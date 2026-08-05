@@ -154,3 +154,14 @@ def test_generate_bad_file():
     r = TestClient(appmod.app).post(
         "/generate", files={"file": ("x.csv", b"junk")}, data={"params": "{}"})
     assert r.status_code == 400
+
+
+def test_generate_bad_params_json():
+    from fastapi.testclient import TestClient
+    import app as appmod
+    client = TestClient(appmod.app)
+    files = {"file": ("f.kml", KML.encode())}
+    assert client.post("/generate", files=files,
+                       data={"params": "not-json"}).status_code == 400
+    assert client.post("/generate", files=files,   # valid JSON, not an object
+                       data={"params": "5"}).status_code == 400

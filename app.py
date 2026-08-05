@@ -11,10 +11,10 @@ _ALLOWED = {f.name for f in fields(core.Params)}
 
 @app.post("/generate")
 async def generate(file: UploadFile, params: str = Form("{}")):
-    kw = {k: v for k, v in json.loads(params).items() if k in _ALLOWED}
-    try:
+    try:  # AttributeError: valid JSON that isn't an object, e.g. "5" or "[1]"
+        kw = {k: v for k, v in json.loads(params).items() if k in _ALLOWED}
         track = core.parse_track(file.filename or "", await file.read())
-    except ValueError as e:
+    except (ValueError, AttributeError) as e:
         raise HTTPException(400, str(e))
     try:
         stl_poster, stl_strip = core.build_poster(track, core.Params(**kw))
