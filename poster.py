@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import numpy as np
 import requests
 import trimesh
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 
 def parse_track(name: str, data: bytes) -> np.ndarray:
@@ -119,6 +119,42 @@ def fetch_elevation(bounds, px_out):
     b, d = int(pyT - ty0 * 256), int(pyB - ty0 * 256)
     crop = elev[b:max(d, b + 2), a:max(c, a + 2)].astype(np.float32)
     return np.asarray(Image.fromarray(crop, "F").resize((px_out, px_out), Image.BILINEAR))
+
+
+WMS_URL = ("https://services.terrascope.be/wms/v2?SERVICE=WMS&VERSION=1.3.0"
+           "&REQUEST=GetMap&LAYERS=WORLDCOVER_2021_MAP&STYLES=&FORMAT=image/png"
+           "&CRS=EPSG:3857&BBOX={x0},{y0},{x1},{y1}&WIDTH={w}&HEIGHT={h}")
+COLORS = {"frame": "#222222", "green": "#4CAF50", "water": "#2196F3",
+          "city": "#9E9E9E", "strip": "#CC2222"}
+_R3857 = 6378137.0
+
+
+def _opened(mask, k):
+    """Morphological opening via PIL: erode then dilate with a k*k kernel."""
+    img = Image.fromarray(mask.astype(np.uint8) * 255)
+    img = img.filter(ImageFilter.MinFilter(k)).filter(ImageFilter.MaxFilter(k))
+    return np.asarray(img) > 0
+
+
+def classify_landcover(rgb, km_per_px, city_min_km):
+    """WorldCover RGB -> codes: 0 green, 1 water, 2 big-city."""
+    def near(target):
+        return (np.abs(rgb.astype(int) - target).max(axis=2) <= 10)
+    water = _opened(near((0, 100, 200)), 3)                     # drop 1px speckle
+    k = max(3, int(round(city_min_km / km_per_px)) | 1)         # odd, >=3
+    city = _opened(near((250, 0, 0)), k)                        # villages vanish
+    lc = np.zeros(rgb.shape[:2], np.uint8)
+    lc[water] = 1
+    lc[city & ~water] = 2
+    return lc
+
+
+def fetch_landcover(bounds, px_out, km_per_px, city_min_km):
+    """WorldCover land-cover codes for bounds, (px_out, px_out), row 0 = north."""
+    x0, y0, x1, y1 = (v * _R3857 for v in bounds)   # merc radians -> EPSG:3857 meters
+    url = WMS_URL.format(x0=x0, y0=y0, x1=x1, y1=y1, w=px_out, h=px_out)
+    img = Image.open(io.BytesIO(_get(url))).convert("RGB")
+    return classify_landcover(np.asarray(img), km_per_px, city_min_km)
 
 
 @dataclass

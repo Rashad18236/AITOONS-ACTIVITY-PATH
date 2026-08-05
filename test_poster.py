@@ -237,3 +237,25 @@ def test_generate_bad_params_json():
                        data={"params": "not-json"}).status_code == 400
     assert client.post("/generate", files=files,   # valid JSON, not an object
                        data={"params": "5"}).status_code == 400
+
+
+def test_classify_landcover_palette():
+    rgb = np.zeros((20, 20, 3), np.uint8)          # default -> green(0)
+    rgb[2:8, 2:18] = (0, 100, 200)                 # water bar
+    rgb[12:19, 2:19] = (250, 0, 0)                 # big city block
+    rgb[10, 10] = (0, 100, 200)                    # 1px pond -> speckle, removed
+    rgb[0, 0] = (247, 3, 2)                        # within +-10 of built-up, but 1px -> removed
+    lc = poster.classify_landcover(rgb, km_per_px=0.5, city_min_km=1.5)
+    assert lc[5, 10] == 1                          # water kept
+    assert lc[15, 10] == 2                         # city kept
+    assert lc[10, 10] == 0 and lc[0, 0] == 0       # speckles gone
+    assert lc[1, 1] == 0
+
+
+def test_classify_city_threshold_scales():
+    rgb = np.zeros((40, 40, 3), np.uint8)
+    rgb[10:14, 10:14] = (250, 0, 0)                # 4px-wide town
+    # at 0.1 km/px a 1.5km city needs ~15px -> town removed
+    assert (poster.classify_landcover(rgb, 0.1, 1.5) == 2).sum() == 0
+    # at 1.0 km/px the kernel floors at 3 -> 4px town survives opening
+    assert (poster.classify_landcover(rgb, 1.0, 1.5) == 2).sum() > 0
