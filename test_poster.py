@@ -259,3 +259,23 @@ def test_classify_city_threshold_scales():
     assert (poster.classify_landcover(rgb, 0.1, 1.5) == 2).sum() == 0
     # at 1.0 km/px the kernel floors at 3 -> 4px town survives opening
     assert (poster.classify_landcover(rgb, 1.0, 1.5) == 2).sum() > 0
+
+
+def test_masked_slab_mesh_geometry():
+    rng = np.random.default_rng(1)
+    top = 10.0 + rng.random((30, 30)) * 3
+    mask = np.zeros((30, 30), bool)
+    mask[5:15, 5:25] = True                        # rectangle blob
+    mask[20:28, 3:9] = True                        # second blob
+    m = poster.masked_slab_mesh(mask, top, 0.6, 0.5)
+    assert m.is_watertight and m.is_winding_consistent and m.volume > 0
+    # thickness: z-extent at any x,y column is exactly 0.6 below local top
+    assert abs(m.bounds[1][2] - top[mask].max()) < 1e-6
+    assert abs(m.bounds[0][2] - (top[np.where(mask)].min() - 0.6)) < 1e-6
+    # volume ~ cell_area * thickness (cells = all-4-corner-masked)
+    cells = mask[:-1, :-1] & mask[:-1, 1:] & mask[1:, :-1] & mask[1:, 1:]
+    assert abs(m.volume - cells.sum() * 0.5 * 0.5 * 0.6) / m.volume < 0.01
+
+
+def test_masked_slab_mesh_empty():
+    assert poster.masked_slab_mesh(np.zeros((5, 5), bool), np.ones((5, 5)), 0.6, 0.5) is None

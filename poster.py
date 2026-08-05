@@ -253,6 +253,37 @@ def heightmap_mesh(hm, res_mm):
     return trimesh.Trimesh(V, np.vstack(faces), process=False)
 
 
+def masked_slab_mesh(mask, top, thickness, res_mm):
+    """Constant-thickness slab over masked cells; top follows `top` surface."""
+    H, W = top.shape
+    cells = mask[:-1, :-1] & mask[:-1, 1:] & mask[1:, :-1] & mask[1:, 1:]
+    rc = np.argwhere(cells)
+    if not len(rc):
+        return None
+    used = np.zeros((H, W), bool)
+    for dr, dc in ((0, 0), (0, 1), (1, 0), (1, 1)):
+        used[rc[:, 0] + dr, rc[:, 1] + dc] = True
+    idx = -np.ones((H, W), int)
+    vy, vx = np.where(used)
+    idx[vy, vx] = np.arange(len(vy))
+    n = len(vy)
+    vt = np.stack([vx * res_mm, (H - 1 - vy) * res_mm, top[vy, vx]], 1)
+    vb = vt.copy(); vb[:, 2] -= thickness
+    F = []
+    # ponytail: python loop over cells, vectorize if generation time hurts
+    incell = lambda r, c: 0 <= r < H - 1 and 0 <= c < W - 1 and cells[r, c]
+    for r, c in rc:
+        a, b, d, e = idx[r, c], idx[r, c + 1], idx[r + 1, c + 1], idx[r + 1, c]
+        F += [[d, b, a], [e, d, a]]                     # top, +z
+        F += [[a + n, b + n, d + n], [a + n, d + n, e + n]]  # bottom, -z
+        # wall edge order is the reverse of the top face's edge, so the two agree
+        for (nr, nc, v0, v1) in ((r - 1, c, a, b), (r + 1, c, d, e),
+                                 (r, c - 1, e, a), (r, c + 1, b, d)):
+            if not incell(nr, nc):                       # boundary edge -> wall
+                F += [[v0, v1, v1 + n], [v0, v1 + n, v0 + n]]
+    return trimesh.Trimesh(np.vstack([vt, vb]), np.array(F), process=False)
+
+
 def strip_mesh(track_px, surface, p):
     """Constant-thickness ribbon that seats in the groove and stands proud."""
     C, nrm = _offsets(track_px)  # same centerline compose() carved the groove from
