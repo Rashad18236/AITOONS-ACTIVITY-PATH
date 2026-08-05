@@ -131,3 +131,26 @@ def test_build_poster_end_to_end(monkeypatch):
     stl_a, stl_b = poster.build_poster(track, p)
     assert stl_a[:5] != b"solid" and len(stl_a) > 84   # binary STL
     assert len(stl_b) > 84
+
+
+def test_generate_endpoint(monkeypatch):
+    from fastapi.testclient import TestClient
+    import app as appmod
+    monkeypatch.setattr(poster, "fetch_elevation",
+                        lambda bounds, px: np.tile(np.linspace(0, 500, px), (px, 1)))
+    client = TestClient(appmod.app)
+    params = '{"size_mm": 40, "frame_mm": 4, "res_mm": 0.5, "text": "ZRH-GVA"}'
+    r = client.post("/generate", files={"file": ("f.kml", KML.encode())},
+                    data={"params": params})
+    assert r.status_code == 200
+    import base64
+    assert len(base64.b64decode(r.json()["poster"])) > 84
+    assert len(base64.b64decode(r.json()["path"])) > 84
+
+
+def test_generate_bad_file():
+    from fastapi.testclient import TestClient
+    import app as appmod
+    r = TestClient(appmod.app).post(
+        "/generate", files={"file": ("x.csv", b"junk")}, data={"params": "{}"})
+    assert r.status_code == 400
