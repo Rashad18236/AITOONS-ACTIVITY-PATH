@@ -283,10 +283,31 @@ def heightmap_mesh(hm, res_mm):
     return trimesh.Trimesh(V, np.vstack(faces), process=False)
 
 
+def _unpinch(cells):
+    """Drop cells that meet another only at a corner.
+
+    Two diagonal cells with neither shared orthogonal neighbour present pinch at
+    one vertex; the vertical wall edge there ends up in four wall quads instead of
+    two, and the slab is not watertight. Dropping one cell of each pair is the only
+    fix that cannot grow the cap into the groove — filling the notch could, and a
+    cap slab over the groove fights the strip.
+    ponytail: a 1px diagonal staircase decimates to isolated cells. The masks are
+    already speckle-opened upstream, so this bites nothing real; duplicate the
+    pinch vertex per connected component instead if a cap ever visibly frays."""
+    while True:
+        a = cells[:-1, :-1] & cells[1:, 1:] & ~cells[:-1, 1:] & ~cells[1:, :-1]
+        b = cells[:-1, 1:] & cells[1:, :-1] & ~cells[:-1, :-1] & ~cells[1:, 1:]
+        if not (a.any() or b.any()):
+            return cells
+        cells = cells.copy()
+        cells[1:, 1:] &= ~a
+        cells[1:, :-1] &= ~b
+
+
 def masked_slab_mesh(mask, top, thickness, res_mm):
     """Constant-thickness slab over masked cells; top follows `top` surface."""
     H, W = top.shape
-    cells = mask[:-1, :-1] & mask[:-1, 1:] & mask[1:, :-1] & mask[1:, 1:]
+    cells = _unpinch(mask[:-1, :-1] & mask[:-1, 1:] & mask[1:, :-1] & mask[1:, 1:])
     rc = np.argwhere(cells)
     if not len(rc):
         return None

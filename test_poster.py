@@ -393,6 +393,24 @@ def test_masked_slab_mesh_geometry():
     assert abs(m.volume - cells.sum() * 0.5 * 0.5 * 0.6) / m.volume < 0.01
 
 
+def test_masked_slab_mesh_corner_touch_is_watertight():
+    """Blobby real-world masks have diagonal pinch points; two cells that meet at
+    only a corner share one vertical wall edge between four wall quads, which is
+    not manifold. Caught by the live e2e, invisible to rectangular test blobs."""
+    top = np.full((6, 6), 10.0)
+    mask = np.zeros((6, 6), bool)
+    mask[0:2, 0:2] = True                                  # cell (0,0)
+    mask[1:3, 1:3] = True                                  # cell (1,1), corner-touching
+    m = poster.masked_slab_mesh(mask, top, 0.6, 1.0)
+    assert m.is_watertight and m.is_winding_consistent and m.volume > 0
+    # the other diagonal, and a staircase of them
+    mask2 = np.zeros((8, 8), bool)
+    for i in range(4):
+        mask2[i:i + 2, 6 - 2 * i - 2:6 - 2 * i] = True     # anti-diagonal staircase
+    m2 = poster.masked_slab_mesh(mask2, np.full((8, 8), 10.0), 0.6, 1.0)
+    assert m2.is_watertight and m2.is_winding_consistent and m2.volume > 0
+
+
 def test_masked_slab_mesh_empty():
     assert poster.masked_slab_mesh(np.zeros((5, 5), bool), np.ones((5, 5)), 0.6, 0.5) is None
 
