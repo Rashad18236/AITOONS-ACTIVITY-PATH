@@ -103,3 +103,31 @@ def test_heightmap_mesh_watertight():
     assert abs(m.bounds[1][0] - 29 * 0.5) < 1e-6   # x extent = (W-1)*res
     assert abs(m.bounds[1][2] - hm.max()) < 1e-6   # top = max height
     assert m.bounds[0][2] == 0                     # flat back at z=0
+
+
+def test_strip_mesh_geometry():
+    p = _params()
+    N = int(p.size_mm / p.res_mm)
+    surface = np.full((N, N), 10.0)
+    track_px = np.array([[10.0, 40.0], [40.0, 40.0], [70.0, 45.0]])
+    m = poster.strip_mesh(track_px, surface, p)
+    assert m.is_watertight
+    assert m.is_winding_consistent   # watertight alone passes inside-out meshes
+    assert m.volume > 0              # outward normals, not inverted
+    zmin, zmax = m.bounds[0][2], m.bounds[1][2]
+    assert abs(zmax - (10.0 + p.proud_mm)) < 1e-6
+    assert abs(zmin - (10.0 - p.groove_d_mm)) < 1e-6
+    # width across a straight section = groove - 2*clearance
+    xs = m.vertices[np.abs(m.vertices[:, 0] - 25 * p.res_mm) < p.res_mm]
+    width = xs[:, 1].max() - xs[:, 1].min()
+    assert abs(width - (p.groove_w_mm - 2 * p.clearance_mm)) < 0.2
+
+
+def test_build_poster_end_to_end(monkeypatch):
+    p = _params()
+    monkeypatch.setattr(poster, "fetch_elevation",
+                        lambda bounds, px: np.tile(np.linspace(0, 500, px), (px, 1)))
+    track = np.array([[47.0, 8.0, 0], [47.2, 8.4, 2000], [47.5, 9.0, 3000]])
+    stl_a, stl_b = poster.build_poster(track, p)
+    assert stl_a[:5] != b"solid" and len(stl_a) > 84   # binary STL
+    assert len(stl_b) > 84

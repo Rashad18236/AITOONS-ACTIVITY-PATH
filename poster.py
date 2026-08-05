@@ -181,3 +181,51 @@ def heightmap_mesh(hm, res_mm):
         faces.append(np.stack([t0, t1, t1 + H * W], 1))
         faces.append(np.stack([t0, t1 + H * W, t0 + H * W], 1))
     return trimesh.Trimesh(V, np.vstack(faces), process=False)
+
+
+def strip_mesh(track_px, surface, p):
+    """Constant-thickness ribbon that seats in the groove and stands proud."""
+    d = np.r_[0, np.cumsum(np.hypot(*np.diff(track_px, axis=0).T))]
+    n = max(int(d[-1]), 8)  # ~1 sample per heightmap pixel
+    t = np.linspace(0, d[-1], n)
+    cx = np.interp(t, d, track_px[:, 0])
+    cy = np.interp(t, d, track_px[:, 1])
+    tang = np.gradient(np.stack([cx, cy], 1), axis=0)
+    tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-12
+    nrm = np.stack([-tang[:, 1], tang[:, 0]], 1)
+    half = (p.groove_w_mm / 2 - p.clearance_mm) / p.res_mm  # px
+    H, W = surface.shape
+    # ponytail: nearest-neighbour surface sampling; bilinear if strip shows steps
+    zc = surface[np.clip(cy.round().astype(int), 0, H - 1),
+                 np.clip(cx.round().astype(int), 0, W - 1)]
+    z_top, z_bot = zc + p.proud_mm, zc - p.groove_d_mm
+    C = np.stack([cx, cy], 1)
+    L, R = C + nrm * half, C - nrm * half
+
+    def mm(q, z):
+        return np.stack([q[:, 0] * p.res_mm, (H - 1 - q[:, 1]) * p.res_mm, z], 1)
+
+    V = np.vstack([mm(L, z_bot), mm(R, z_bot), mm(R, z_top), mm(L, z_top)])
+    f = []
+    for k in range(4):  # 4 sides of the swept rectangle
+        a = np.arange(n - 1) + k * n
+        c = np.arange(n - 1) + ((k + 1) % 4) * n
+        f.append(np.stack([a, a + 1, c + 1], 1))
+        f.append(np.stack([a, c + 1, c], 1))
+    e = n - 1
+    f.append(np.array([[0, n, 2 * n], [0, 2 * n, 3 * n],
+                       [e, e + 2 * n, e + n], [e, e + 3 * n, e + 2 * n]]))
+    # mm() flips y, so the whole ring winds inward — reverse every face once
+    return trimesh.Trimesh(V, np.vstack(f)[:, ::-1], process=False)
+
+
+def build_poster(track, p=Params()):
+    """Track -> (poster_stl_bytes, path_strip_stl_bytes)."""
+    bounds = track_bounds(track, p.margin_pct)
+    N = int(p.size_mm / p.res_mm)
+    fpx = int(p.frame_mm / p.res_mm)
+    elev = fetch_elevation(bounds, N - 2 * fpx)
+    hm, surface, track_px = compose(track, elev, bounds, p)
+    poster_m = heightmap_mesh(hm, p.res_mm)
+    strip_m = strip_mesh(track_px, surface, p)
+    return (poster_m.export(file_type="stl"), strip_m.export(file_type="stl"))
