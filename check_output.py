@@ -79,8 +79,10 @@ def main(argv=None):
         # 4. flat back at z=0 (bounds min is the lowest vertex, so nothing is below it)
         chk("poster flat back", abs(lo[2]) <= 0.01, f"z_min {lo[2]:.4f}mm", "0 +-0.01")
 
-        # 5. peak = base + exaggerated relief, plus the text emboss
-        zmax = p.base_mm + p.relief_mm * p.exaggeration + EMBOSS_MM
+        # 5. peak = base + whichever stands taller, relief or frame ring, plus the
+        # text emboss (text sits on the frame, so it rides the max either way)
+        zmax = (p.base_mm + max(p.relief_mm * p.exaggeration, p.frame_height_mm)
+                + EMBOSS_MM)
         chk("poster max z", hi[2] <= zmax + 0.01, f"{hi[2]:.3f}mm", f"<= {zmax:.3f}mm")
 
         # 6. strip sits in the relief area: poster footprint inset by the frame
