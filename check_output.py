@@ -18,7 +18,7 @@ import trimesh
 from poster import Params
 
 PLATE_MM = 256.0
-EMBOSS_MM = 0.8   # compose() text emboss height
+EMBOSS_MM = 0.8   # compose_parts() text emboss height
 
 
 def _load(path):

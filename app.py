@@ -17,7 +17,9 @@ async def generate(file: UploadFile, params: str = Form("{}")):
     except (ValueError, AttributeError) as e:
         raise HTTPException(400, str(e))
     try:
-        stl_poster, stl_strip = core.build_poster(track, core.Params(**kw))
+        # Task 5 wires the coloured relief bodies through as 3MF; until then the
+        # frame is the "poster" download so the endpoint stays honest.
+        stl_poster, _bodies, stl_strip = core.build_poster(track, core.Params(**kw))
     except Exception as e:  # DEM fetch or meshing failed
         raise HTTPException(502, f"Generation failed: {e}")
     return {"poster": base64.b64encode(stl_poster).decode(),

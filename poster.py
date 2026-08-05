@@ -173,21 +173,53 @@ class Params:
     text_mm: float = 8.0
     res_mm: float = 0.4
     proud_mm: float = 1.0
+    cap_mm: float = 0.6      # colour-cap slab thickness
+    plate_mm: float = 2.0    # relief plate base thickness (groove floor sits above 0)
+    fit_mm: float = 0.2      # gap per side between relief plate and frame ring
+    city_min_km: float = 1.5
 
 
-def compose(track, elev, bounds, p):
-    """One (N,N) heightmap in mm: terrain + frame + text, then groove carved.
+def _grid(p):
+    """(N, M, fpx): full grid px, relief-plate grid px, frame ring width px.
 
-    Returns (hm, surface_before_groove, track_px)."""
+    The fit gap is rounded UP to a whole pixel. int((frame_mm + fit_mm) / res_mm)
+    truncates a 0.2mm gap to zero at every sane resolution (0.2-0.5mm), and the
+    relief plate then comes out exactly the size of the ring opening — an
+    interference fit no FDM printer wins. Rounding up errs loose, which glues."""
     N = int(p.size_mm / p.res_mm)
     fpx = int(p.frame_mm / p.res_mm)
-    hm = np.full((N, N), p.base_mm)
-    e0, e1 = float(elev.min()), float(elev.max())
-    hm[fpx:N - fpx, fpx:N - fpx] += (elev - e0) / max(e1 - e0, 1e-9) \
-        * p.relief_mm * p.exaggeration
+    return N, N - 2 * (fpx + math.ceil(p.fit_mm / p.res_mm)), fpx
+
+
+def _groove_mask(track_px, shape, p):
+    """Boolean groove footprint on a (H,W) grid, from the strip's own offset geometry.
+
+    line(width=) is not a constant perpendicular width (1.42mm at 45° for a nominal
+    2.0mm), so the strip would not seat. Per-segment quads, not one ribbon polygon —
+    a single polygon even-odd fills leaves holes where the track hairpins over itself."""
+    H, W = shape
+    img = Image.new("L", (W, H))
+    d = ImageDraw.Draw(img)
+    C, nrm = _offsets(track_px)
+    half = p.groove_w_mm / 2 / p.res_mm
+    L, R = C + nrm * half, C - nrm * half
+    for i in range(len(C) - 1):
+        d.polygon([tuple(L[i]), tuple(L[i + 1]), tuple(R[i + 1]), tuple(R[i])], fill=255)
+    return np.asarray(img) > 0
+
+
+def compose_parts(track, elev, lc, bounds, p):
+    """Split the poster into its printable pieces, all heights in mm.
+
+    frame (N,N): backplate + raised ring + embossed text — printed alone.
+    green/surface/water/city/track_px: the (M,M) relief plate that drops into the
+    ring, its pre-groove pre-cap top, the two colour-cap vertex masks, and the
+    track in relief-plate pixels."""
+    N, M, fpx = _grid(p)
+    frame = np.full((N, N), p.base_mm)
     ring = np.ones((N, N), bool)
     ring[fpx:N - fpx, fpx:N - fpx] = False
-    hm[ring] = p.base_mm + p.frame_height_mm
+    frame[ring] = p.base_mm + p.frame_height_mm
     if p.text:
         img = Image.new("L", (N, N))
         d = ImageDraw.Draw(img)
@@ -195,27 +227,25 @@ def compose(track, elev, bounds, p):
         w = d.textlength(p.text, font=font)
         d.text(((N - w) / 2, N - fpx + (fpx - p.text_mm / p.res_mm) / 2),
                p.text, fill=255, font=font)
-        hm[np.asarray(img) > 0] += 0.8  # emboss height, mm
-    # project track into heightmap pixels (row 0 = north)
+        frame[np.asarray(img) > 0] += 0.8  # emboss height, mm
+    e0, e1 = float(elev.min()), float(elev.max())
+    surface = p.plate_mm + (elev - e0) / max(e1 - e0, 1e-9) * p.relief_mm * p.exaggeration
+    # project track into relief-plate pixels (row 0 = north)
     x0, y0, x1, y1 = bounds
-    inner = N - 2 * fpx
     xy = np.array([_merc(la, lo) for la, lo, _ in track])
-    tx = (xy[:, 0] - x0) / (x1 - x0) * inner + fpx
-    ty = (y1 - xy[:, 1]) / (y1 - y0) * inner + fpx
-    track_px = np.stack([tx, ty], 1)
-    surface = hm.copy()
-    img = Image.new("L", (N, N))
-    d = ImageDraw.Draw(img)
-    # carve the groove from the strip's own offset geometry: line(width=) is not a
-    # constant perpendicular width (1.42mm at 45° for a nominal 2.0mm), so the strip
-    # would not seat. Per-segment quads, not one ribbon polygon — a single polygon
-    # even-odd fills leaves holes where the track hairpins back over itself.
-    C, nrm = _offsets(track_px)
-    L, R = C + nrm * (p.groove_w_mm / 2 / p.res_mm), C - nrm * (p.groove_w_mm / 2 / p.res_mm)
-    for i in range(len(C) - 1):
-        d.polygon([tuple(L[i]), tuple(L[i + 1]), tuple(R[i + 1]), tuple(R[i])], fill=255)
-    hm[np.asarray(img) > 0] -= p.groove_d_mm
-    return hm, surface, track_px
+    track_px = np.stack([(xy[:, 0] - x0) / (x1 - x0) * M,
+                         (y1 - xy[:, 1]) / (y1 - y0) * M], 1)
+    gmask = _groove_mask(track_px, (M, M), p)
+    # caps are separate slabs: keep them off the groove (the strip goes there) and off
+    # the outer vertex ring, where a slab wall would hang over the plate edge.
+    border = np.zeros((M, M), bool)
+    border[1:-1, 1:-1] = True
+    water = (lc == 1) & ~gmask & border
+    city = (lc == 2) & ~gmask & border
+    green = surface - p.cap_mm * (water | city)
+    green[gmask] -= p.groove_d_mm
+    return dict(frame=frame, green=green, surface=surface,
+                water=water, city=city, track_px=track_px)
 
 
 def _offsets(track_px):
@@ -286,7 +316,7 @@ def masked_slab_mesh(mask, top, thickness, res_mm):
 
 def strip_mesh(track_px, surface, p):
     """Constant-thickness ribbon that seats in the groove and stands proud."""
-    C, nrm = _offsets(track_px)  # same centerline compose() carved the groove from
+    C, nrm = _offsets(track_px)  # same centerline _groove_mask() carved the groove from
     n = len(C)
     cx, cy = C[:, 0], C[:, 1]
     half = (p.groove_w_mm / 2 - p.clearance_mm) / p.res_mm  # px
@@ -315,17 +345,27 @@ def strip_mesh(track_px, surface, p):
 
 
 def build_poster(track, p=Params()):
-    """Track -> (poster_stl_bytes, path_strip_stl_bytes)."""
+    """Track -> (frame_stl, [(mesh, name, hex_colour, slot), ...], path_strip_stl)."""
     # ponytail: reject rather than clamp — a typo'd 2500mm is a mistake to surface,
     # not to silently honour, and N^2 grids OOM the box. Raise the cap if a bigger
     # plate ever shows up.
     if p.size_mm > 256 or p.res_mm < 0.2:
         raise ValueError("size_mm must be <= 256 (plate limit) and res_mm >= 0.2")
+    if p.plate_mm <= p.groove_d_mm:
+        raise ValueError("plate_mm must exceed groove_d_mm — the groove would cut through")
     bounds = track_bounds(track, p.margin_pct)
-    N = int(p.size_mm / p.res_mm)
-    fpx = int(p.frame_mm / p.res_mm)
-    elev = fetch_elevation(bounds, N - 2 * fpx)
-    hm, surface, track_px = compose(track, elev, bounds, p)
-    poster_m = heightmap_mesh(hm, p.res_mm)
-    strip_m = strip_mesh(track_px, surface, p)
-    return (poster_m.export(file_type="stl"), strip_m.export(file_type="stl"))
+    M = _grid(p)[1]
+    # mercator x-span is ground distance only at the equator; scale by cos(mid-lat)
+    km_per_px = ((bounds[2] - bounds[0]) * _R3857 / 1000 / M
+                 * math.cos(math.radians(float(np.mean(track[:, 0])))))
+    elev = fetch_elevation(bounds, M)
+    lc = fetch_landcover(bounds, M, km_per_px, p.city_min_km)
+    parts = compose_parts(track, elev, lc, bounds, p)
+    bodies = [(heightmap_mesh(parts["green"], p.res_mm), "terrain", COLORS["green"], 1)]
+    for key, name, slot in (("water", "water", 2), ("city", "cities", 3)):
+        cap = masked_slab_mesh(parts[key], parts["surface"], p.cap_mm, p.res_mm)
+        if cap is not None:
+            bodies.append((cap, name, COLORS[key], slot))
+    strip = strip_mesh(parts["track_px"], parts["surface"], p)
+    return (heightmap_mesh(parts["frame"], p.res_mm).export(file_type="stl"),
+            bodies, strip.export(file_type="stl"))
