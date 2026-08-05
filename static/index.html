@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Flight Path Poster</title>
+<style>
+  body { font: 14px system-ui; margin: 0; display: flex; height: 100vh; }
+  #panel { width: 300px; padding: 16px; overflow-y: auto; background: #f4f4f4; }
+  #panel label { display: block; margin: 10px 0 2px; color: #444; }
+  #panel input { width: 100%; box-sizing: border-box; }
+  #view { flex: 1; }
+  #view canvas { display: block; }
+  button { margin-top: 14px; width: 100%; padding: 8px; }
+  a.dl { display: block; margin-top: 8px; }
+  #status { margin-top: 10px; color: #a00; white-space: pre-wrap; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="panel">
+  <h3>Flight Path Poster</h3>
+  <label>FR24 track (KML/CSV)</label><input type="file" id="file" accept=".kml,.csv">
+  <label>Text (bottom frame bar)</label><input id="text" placeholder="ZRH → GVA · 12.07.2026">
+  <label>Poster size mm</label><input id="size_mm" type="number" value="250">
+  <label>Max relief mm</label><input id="relief_mm" type="number" value="20">
+  <label>Vertical exaggeration</label><input id="exaggeration" type="number" step="0.1" value="1.5">
+  <label>Margin %</label><input id="margin_pct" type="number" value="15">
+  <label>Groove width mm</label><input id="groove_w_mm" type="number" step="0.1" value="2">
+  <label>Groove depth mm</label><input id="groove_d_mm" type="number" step="0.1" value="1.5">
+  <button id="go">Generate</button>
+  <div id="status"></div>
+  <a class="dl" id="dlPoster" style="display:none">Download poster.stl</a>
+  <a class="dl" id="dlPath" style="display:none">Download path.stl</a>
+</div>
+<div id="view"></div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+
+const view = document.getElementById('view');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xdddddd);
+const camera = new THREE.PerspectiveCamera(45, 1, 1, 5000);
+camera.position.set(200, -250, 250);
+camera.up.set(0, 0, 1);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+view.appendChild(renderer.domElement);
+const controls = new OrbitControls(camera, renderer.domElement);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x666666, 1.2));
+const dir = new THREE.DirectionalLight(0xffffff, 1.5);
+dir.position.set(1, -1, 2);
+scene.add(dir);
+function resize() {
+  camera.aspect = view.clientWidth / view.clientHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(view.clientWidth, view.clientHeight);
+}
+window.addEventListener('resize', resize); resize();
+(function loop() { requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+
+let meshes = [];
+function show(b64, color) {
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const geo = new STLLoader().parse(bytes.buffer);
+  geo.computeVertexNormals();
+  const m = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color }));
+  meshes.push(m); scene.add(m);
+  return bytes;
+}
+function dl(el, bytes, name) {
+  if (el.href) URL.revokeObjectURL(el.href);
+  el.href = URL.createObjectURL(new Blob([bytes], { type: 'model/stl' }));
+  el.download = name; el.style.display = 'block';
+}
+
+document.getElementById('go').onclick = async () => {
+  const f = document.getElementById('file').files[0];
+  const status = document.getElementById('status');
+  if (!f) { status.textContent = 'Pick a KML/CSV file first.'; return; }
+  status.textContent = 'Generating… (terrain download + meshing, ~10-30s)';
+  const params = { text: document.getElementById('text').value };
+  for (const id of ['size_mm','relief_mm','exaggeration','margin_pct','groove_w_mm','groove_d_mm']) {
+    const v = parseFloat(document.getElementById(id).value);
+    if (!isNaN(v)) params[id] = v;   // blank field -> server default
+  }
+  const fd = new FormData();
+  fd.append('file', f);
+  fd.append('params', JSON.stringify(params));
+  try {
+    const r = await fetch('/generate', { method: 'POST', body: fd });
+    if (!r.ok) { status.textContent = 'Error: ' + JSON.stringify((await r.json()).detail); return; }
+    const j = await r.json();
+    status.textContent = 'Decoding meshes…';
+    meshes.forEach(m => { scene.remove(m); m.geometry.dispose(); m.material.dispose(); });
+    meshes = [];
+    const pb = show(j.poster, 0xf0f0f0);
+    const sb = show(j.path, 0xcc2222);
+    new THREE.Box3().setFromObject(meshes[0]).getCenter(controls.target);
+    dl(document.getElementById('dlPoster'), pb, 'poster.stl');
+    dl(document.getElementById('dlPath'), sb, 'path.stl');
+    status.textContent = 'Done. Red = glue-in path strip (shown in place).';
+  } catch (e) {
+    status.textContent = 'Request failed: ' + e;
+  }
+};
+</script>
+</body>
+</html>

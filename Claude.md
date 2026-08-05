@@ -25,6 +25,6 @@ uv run uvicorn app:app --reload
 - `static/index.html` — upload form, parameter sliders, three.js preview, downloads
 - `test_poster.py` — self-check: parse sample track, build small mesh, assert watertight + strip fits groove
 
-Key invariant: poster and path strip are both derived from the same heightmap, so they always fit (strip gets 0.15mm glue clearance).
+Key invariant: poster and path strip are both derived from the same heightmap, so they always fit (strip gets 0.30mm glue clearance per side).
 
 Spec: `docs/superpowers/specs/2026-08-05-flight-path-poster-design.md`

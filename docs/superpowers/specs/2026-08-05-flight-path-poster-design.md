@@ -49,7 +49,7 @@ Run: `uv run uvicorn app:app` → `http://localhost:8000`. Each generate is stat
    Printed lying on its side or with supports — implementer picks what prints cleanest → `path.stl`.
 6. **Return** both STLs; browser previews with three.js and offers downloads.
 
-Key invariant: both meshes derive from one heightmap → guaranteed fit (0.15mm clearance/side).
+Key invariant: both meshes derive from one heightmap → guaranteed fit (0.30mm clearance/side).
 
 ## Parameters (UI sliders/fields, defaults)
 
@@ -62,7 +62,7 @@ Key invariant: both meshes derive from one heightmap → guaranteed fit (0.15mm 
 | Bbox margin | 15 % |
 | Frame width | 12 mm |
 | Groove width / depth | 2 mm / 1.5 mm |
-| Strip clearance | 0.15 mm |
+| Strip clearance | 0.30 mm |
 | Text + text size | "" / 8 mm |
 
 ## Error handling
