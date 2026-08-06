@@ -112,6 +112,7 @@ def test_resolve_at_250_is_the_legacy_defaults():
     assert p.text_mm == 8.0
     assert p.groove_w_mm == 2.0
     assert p.proud_mm == 1.0
+    assert p.snow_min_mm == 3.0
 
 
 def test_resolve_scales_and_floors_at_80mm():
@@ -122,9 +123,11 @@ def test_resolve_scales_and_floors_at_80mm():
     assert p.text_mm == 3.0             # 2.56 -> floor
     assert p.groove_w_mm == 1.2         # 0.64 -> floor
     assert p.proud_mm == 0.4            # 0.32 -> floor
-    # absolute params are untouched by size
+    assert p.snow_min_mm == 1.5          # 0.96 -> floor
+    # absolute params are untouched by size (printer properties, not visual scale)
     assert (p.base_mm, p.plate_mm, p.cap_mm, p.clearance_mm, p.fit_mm, p.res_mm,
-            p.snow_line_m) == (4.0, 2.0, 0.6, 0.30, 0.2, 0.4, 2000.0)
+            p.snow_line_m, p.layer_mm, p.smooth_px) == (4.0, 2.0, 0.6, 0.30, 0.2, 0.4,
+                                                        2000.0, 0.2, 2.0)
 
 
 def test_resolve_passes_explicit_values_through_and_is_idempotent():
@@ -232,6 +235,49 @@ def test_compose_parts_shapes_and_caps():
     assert not (w & c).any()
 
 
+# --- layer snapping + DEM smoothing ------------------------------------------
+
+def test_surface_snaps_to_layer_multiples():
+    """Every terrain height lands on a layer boundary, so the slicer emits whole
+    uniform layers instead of ragged single-layer islands."""
+    p, N, fpx, elev, track, bounds = _synthetic()
+    M = _mpx(p)
+    rng = np.random.default_rng(3)
+    noisy = poster._smooth(elev + rng.normal(0, 3.0, (M, M)), p.smooth_px)
+    s = poster.compose_parts(track, noisy, np.zeros((M, M), np.uint8), bounds, p)["surface"]
+    assert np.abs(s / p.layer_mm - np.round(s / p.layer_mm)).max() < 1e-9
+    assert len(np.unique(s.round(9))) > 5              # a real hill keeps its levels
+    off = poster.compose_parts(track, noisy, np.zeros((M, M), np.uint8), bounds,
+                               _params(layer_mm=0.0))["surface"]
+    assert np.abs(off / p.layer_mm - np.round(off / p.layer_mm)).max() > 1e-3  # 0 = opt out
+
+
+def test_sub_layer_noise_collapses_to_a_flat_plane():
+    """DEM noise smaller than a layer must not survive as scattered islands, while
+    the surrounding relief keeps every level it had."""
+    p, N, fpx, elev, track, bounds = _synthetic()
+    M = _mpx(p)
+    e = elev.copy()
+    e[5:20, 5:20] = 500.0                              # a flat plateau in the ramp...
+    rng = np.random.default_rng(0)
+    noisy = e + rng.normal(0, 3.0, (M, M))             # ...under ~0.09mm of wobble
+    lc = np.zeros((M, M), np.uint8)
+    raw = poster.compose_parts(track, noisy, lc, bounds, _params(layer_mm=0.0))["surface"]
+    got = poster.compose_parts(track, poster._smooth(noisy, p.smooth_px), lc, bounds,
+                               p)["surface"]
+    box = (slice(8, 17), slice(8, 17))                 # well inside the plateau
+    assert len(np.unique(raw[box].round(9))) > 50      # every pixel its own level
+    assert len(np.unique(got[box].round(9))) <= 2      # one plane (two at a boundary)
+    assert len(np.unique(got.round(9))) > 5            # the ramp is not flattened
+
+
+def test_smooth_is_an_identity_at_zero():
+    e = np.arange(25.0).reshape(5, 5)
+    assert (poster._smooth(e, 0.0) == e).all()
+    assert poster._smooth(e, 2.0).shape == e.shape
+    assert abs(poster._smooth(e, 2.0).mean() - e.mean()) < 1.0   # edge-clamped, no drift
+
+
 def _groove_widths(p):
     """Contiguous perpendicular carved width, in mm, at every station along a 90° arc."""
     M = _mpx(p)
@@ -270,7 +316,7 @@ def test_strip_seats_in_groove_at_every_angle():
         p = _params(res_mm=res)
         w, parts = _groove_widths(p)
         # ...and it seats on the slot floor exactly, not on the terrain under it
-        strip = poster.strip_mesh(parts["track_px"], parts["surface"], p)
+        strip = poster.strip_mesh(parts["track_px"], parts["alt_mm"], parts["surface"], p)
         assert abs(strip.bounds[0][2] - poster.SLOT_FLOOR_MM) < 1e-6
         assert (parts["green"][parts["surface"] > parts["green"]] ==
                 poster.SLOT_FLOOR_MM).all()
@@ -315,7 +361,7 @@ def test_strip_mesh_geometry():
     M = _mpx(p)
     surface = np.full((M, M), p.plate_mm + 8.0)            # relief top, plate_mm z-base
     track_px = np.array([[10.0, 40.0], [40.0, 40.0], [55.0, 45.0]])
-    m = poster.strip_mesh(track_px, surface, p)
+    m = poster.strip_mesh(track_px, np.zeros(3), surface, p)   # ground-level flight
     assert m.is_watertight
     assert m.is_winding_consistent   # watertight alone passes inside-out meshes
     assert m.volume > 0              # outward normals, not inverted
@@ -328,23 +374,68 @@ def test_strip_mesh_geometry():
     assert abs(width - (p.groove_w_mm - 2 * p.clearance_mm)) < 0.2
 
 
-def test_strip_is_a_level_wall_over_varying_terrain():
-    """Full-height level line: the strip is one constant rectangle in cross-section,
-    from the slot floor to proud of the *highest* terrain the track crosses — it does
-    not follow the terrain any more, so every z is one of exactly two values."""
+def _strip_tops(m, track_px):
+    """Per-station top z of a strip mesh (vertex block 3 of 4: L_bot R_bot R_top L_top)."""
+    n = len(poster._offsets(track_px)[0])
+    return m.vertices[2 * n:3 * n, 2]
+
+
+def _sampled_surface(surface, track_px):
+    C = poster._offsets(track_px)[0]
+    H, W = surface.shape
+    return surface[np.clip(C[:, 1].round().astype(int), 0, H - 1),
+                   np.clip(C[:, 0].round().astype(int), 0, W - 1)]
+
+
+def test_strip_follows_the_flight_altitude_over_flat_terrain():
+    """The wall is the flight profile: a steady climb over level ground rises with
+    it, layer-snapped (so a staircase, never a dip), and clears the terrain."""
     p = _params()
     M = _mpx(p)
-    surface = p.plate_mm + np.tile(np.linspace(0, 12.0, M), (M, 1))   # W-E ramp
-    track_px = np.array([[5.0, 30.0], [30.0, 30.0], [55.0, 45.0]])
-    m = poster.strip_mesh(track_px, surface, p)
+    surface = np.full((M, M), p.plate_mm + 2.0)
+    track_px = np.stack([np.linspace(5, M - 6, 40), np.full(40, M // 2.0)], 1)
+    alt = np.linspace(p.plate_mm + 1.0, p.plate_mm + 20.0, 40)          # the climb
+    m = poster.strip_mesh(track_px, alt, surface, p)
     assert m.is_watertight and m.is_winding_consistent and m.volume > 0
-    z = np.unique(m.vertices[:, 2].round(6))
-    assert len(z) == 2, f"strip cross-section is not constant: {z}"
-    sampled = surface[np.clip(poster._offsets(track_px)[0][:, 1].round().astype(int), 0, M - 1),
-                      np.clip(poster._offsets(track_px)[0][:, 0].round().astype(int), 0, M - 1)]
-    assert abs(z[0] - poster.SLOT_FLOOR_MM) < 1e-6
-    assert abs(z[1] - (sampled.max() + p.proud_mm)) < 1e-6
-    assert z[1] > sampled.max()                            # clears the highest crossing
+    top = _strip_tops(m, track_px)
+    assert (np.diff(top) >= -1e-9).all()                   # never sinks along the climb
+    assert top[-1] - top[0] > 15.0                         # and really does climb
+    assert (top > surface[0, 0]).all()                     # above terrain everywhere
+    assert abs(m.bounds[0][2] - poster.SLOT_FLOOR_MM) < 1e-6
+    assert np.abs(top / p.layer_mm - np.round(top / p.layer_mm)).max() < 1e-9
+
+
+def test_strip_clamps_onto_a_peak_the_flight_crosses_below():
+    """A low level flight over a ramp: where the terrain outclimbs the aircraft the
+    wall rides terrain + proud instead of sinking into the relief."""
+    p = _params()
+    M = _mpx(p)
+    surface = p.plate_mm + np.tile(np.linspace(0, 12.0, M), (M, 1))     # W-E ramp
+    track_px = np.stack([np.linspace(5, M - 6, 40), np.full(40, M // 2.0)], 1)
+    alt = np.full(40, p.plate_mm + 1.0)                                 # level, low
+    m = poster.strip_mesh(track_px, alt, surface, p)
+    assert m.is_watertight and m.is_winding_consistent and m.volume > 0
+    top, zc = _strip_tops(m, track_px), _sampled_surface(surface, track_px)
+    assert (alt[0] < zc + p.proud_mm).all()                # the clamp really engages
+    want = np.round((zc + p.proud_mm) / p.layer_mm) * p.layer_mm
+    assert np.abs(top - want).max() < 1e-9                 # == surface + proud, snapped
+    assert (top > zc).all()                                # never sinks into the terrain
+    assert len(np.unique(top.round(6))) > 2                # and it is no longer level
+
+
+def test_compose_parts_maps_altitude_through_the_terrain_scale():
+    """Flight altitude rides the same vertical scale as the relief, so a flight
+    above the highest terrain visibly stands above it."""
+    p, N, fpx, elev, track, bounds = _synthetic()          # terrain 0-1000m, flight 0-3000m
+    M = _mpx(p)
+    parts = poster.compose_parts(track, elev, np.zeros((M, M), np.uint8), bounds, p)
+    alt = parts["alt_mm"]
+    assert alt.shape == (len(track),)
+    e0, e1 = float(elev.min()), float(elev.max())
+    want = p.plate_mm + (track[:, 2] - e0) / (e1 - e0) * p.relief_mm * p.exaggeration
+    assert np.allclose(alt, want)
+    assert alt[0] == p.plate_mm                            # on the deck = plate level
+    assert alt[-1] > parts["surface"].max()                # 3000m clears 1000m terrain
 
 
 TRACK3 = np.array([[47.0, 8.0, 0], [47.2, 8.4, 2000], [47.5, 9.0, 3000]])
@@ -768,6 +859,24 @@ def test_snow_speckle_is_opened_away(monkeypatch):
     monkeypatch.setattr(poster, "fetch_water_mask", lambda b, px: np.zeros((px, px), bool))
     _, bodies, _ = poster.build_poster(TRACK3, _params())
     assert [b[1] for b in bodies] == ["terrain"]
+
+
+def test_snow_mask_merges_ridges_into_massifs_and_drops_specks():
+    """Grey caps print as coherent massifs: closing at the minimum printed blob width
+    bridges ridge slivers, the following opening removes what stayed thin."""
+    p = _params(res_mm=0.5, snow_min_mm=3.0)               # k = 7px = 3.5mm
+    e = np.zeros((60, 60))
+    e[12:48, 12:15] = 3000.0                               # ridge A, 1.5mm wide
+    e[12:48, 19:22] = 3000.0                               # ridge B, 2mm away
+    e[12:15, 40:43] = 3000.0                               # an isolated 1.5mm speck
+    e[30:40, 35:45] = 3000.0                               # a genuine 5mm massif
+    m = poster._snow_mask(e, p)
+    assert m[30, 15:19].all()                              # the 2mm gap is bridged...
+    assert m[12:48, 12:22].all()                           # ...both ridges, one region
+    assert not m[12:15, 40:43].any()                       # the speck is gone
+    assert m[32:38, 37:43].all()                           # the massif survives intact
+    old = poster._opened(e >= p.snow_line_m, 3)            # what Task 7 produced
+    assert not old[30, 16] and old[13, 41]                 # split ridges, speck kept
 
 
 def test_water_beats_snow(monkeypatch):

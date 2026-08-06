@@ -151,6 +151,45 @@ def _opened(mask, k):
     return np.asarray(img) > 0
 
 
+def _closed(mask, k):
+    """Morphological closing: dilate then erode — the mirror of _opened.
+
+    Bridges gaps narrower than k, so neighbouring ridge slivers become one massif."""
+    img = Image.fromarray(mask.astype(np.uint8) * 255)
+    img = img.filter(ImageFilter.MaxFilter(k)).filter(ImageFilter.MinFilter(k))
+    return np.asarray(img) > 0
+
+
+def _snow_mask(elev, p):
+    """Grey caps: threshold, then close+open at the smallest printable blob width.
+
+    Closing first merges the ridge slivers a bare threshold leaves scattered; the
+    opening then drops whatever is still thinner than snow_min_mm. Opening alone
+    (Task 7) kept every sliver, and cell-based slabs turned 1px slivers into dots."""
+    k = max(3, int(round(p.snow_min_mm / p.res_mm)) | 1)   # odd, PIL rank filters want it
+    return _opened(_closed(elev >= p.snow_line_m, k), k)
+
+
+def _smooth(a, px):
+    """Blur `a` by a separable box mean of radius `px` px, edges clamped.
+
+    PIL's GaussianBlur has no mode-F path (ValueError: image has wrong mode), and
+    DEM noise only needs to drop below one layer height, so a box blur it is.
+    ponytail: one pass per axis; run it three times for a real gaussian if the
+    box's ringing ever shows up in the print."""
+    r = int(round(px))
+    if r < 1:
+        return a
+    w = 2 * r + 1
+
+    def rows(x):     # running mean along axis 1, over an edge-replicated pad
+        c = np.cumsum(np.pad(x.astype(float), ((0, 0), (r, r)), "edge"), axis=1)
+        c = np.pad(c, ((0, 0), (1, 0)))                    # leading zero: C[k]=sum(P[:k])
+        return (c[:, w:] - c[:, :-w]) / w
+
+    return rows(rows(a).T).T
+
+
 # Water comes from OSM vector polygons via Overpass (free, no key): rasterised at
 # the poster's own resolution it gives crisp shorelines, where a low-zoom raster
 # tile gave 100m stair-steps. Two public mirrors, either one will do.
@@ -286,13 +325,18 @@ class Params:
     plate_mm: float = 2.0    # relief plate base thickness (slot floor sits above 0)
     fit_mm: float = 0.2      # gap per side between relief plate and frame ring
     snow_line_m: float = 2000.0   # grey caps above this DEM elevation
+    snow_min_mm: float | None = None   # smallest printed grey blob (auto, scaled)
+    layer_mm: float = 0.2    # slicer layer height; terrain snaps to it (0 = don't snap)
+    smooth_px: float = 2.0   # DEM blur radius in pixels, kills sub-layer noise (0 = off)
 
 
 # Visual params: None means "auto" — base value at 250mm, scaled by size, floored so
 # it still prints. Everything else in Params is absolute (stiffness, FDM tolerance,
-# real-world metres) and must not move with the poster size.  {field: (base@250, floor)}
+# real-world metres, printer layer height) and must not move with the poster size.
+# {field: (base@250, floor)}
 _SCALED = {"frame_mm": (12.0, 4.0), "relief_mm": (20.0, 5.0), "frame_height_mm": (10.0, 3.0),
-           "text_mm": (8.0, 3.0), "groove_w_mm": (2.0, 1.2), "proud_mm": (1.0, 0.4)}
+           "text_mm": (8.0, 3.0), "groove_w_mm": (2.0, 1.2), "proud_mm": (1.0, 0.4),
+           "snow_min_mm": (3.0, 1.5)}
 
 
 def resolve(p: Params) -> Params:
@@ -338,12 +382,17 @@ def _groove_mask(track_px, shape, p):
 def compose_parts(track, elev, lc, bounds, p):
     """Split the poster into its printable pieces, all heights in mm.
 
+    `elev` arrives already smoothed (build_poster blurs once and shares the array
+    with the snow threshold, so nothing gets blurred twice).
+
     frame (N,N): backplate + raised ring, flat — printed alone.
     text_mask (N,N): the glyph pixels, printed as their own white body on top of
     the ring (empty when no text was asked for).
     green/surface/water/snow/track_px: the (M,M) relief plate that drops into the
     ring, its pre-slot pre-cap top, the two colour-cap vertex masks, and the
-    track in relief-plate pixels."""
+    track in relief-plate pixels.
+    alt_mm: flight altitude per original track point, on the same vertical scale
+    as `surface`, for the path wall."""
     N, M, fpx = _grid(p)
     frame = np.full((N, N), p.base_mm)
     ring = np.ones((N, N), bool)
@@ -359,7 +408,14 @@ def compose_parts(track, elev, lc, bounds, p):
                p.text, fill=255, font=font)
         text_mask = np.asarray(img) > 0
     e0, e1 = float(elev.min()), float(elev.max())
-    surface = p.plate_mm + (elev - e0) / max(e1 - e0, 1e-9) * p.relief_mm * p.exaggeration
+    to_mm = lambda m: p.plate_mm + (m - e0) / max(e1 - e0, 1e-9) * p.relief_mm * p.exaggeration
+    surface = to_mm(elev)
+    if p.layer_mm > 0:
+        # Snap the terrain to whole slicer layers, before the caps and the slot are
+        # cut, so those keep their exact offsets. Sub-layer DEM wobble otherwise
+        # slices into scattered single-layer islands all over the flat ground.
+        surface = np.round(surface / p.layer_mm) * p.layer_mm
+    alt_mm = to_mm(np.asarray(track, float)[:, 2])   # same scale: the flight rides the relief
     # project track into relief-plate pixels (row 0 = north)
     x0, y0, x1, y1 = bounds
     xy = np.array([_merc(la, lo) for la, lo, _ in track])
@@ -375,7 +431,7 @@ def compose_parts(track, elev, lc, bounds, p):
     green = surface - p.cap_mm * (water | snow)
     green[gmask] = SLOT_FLOOR_MM        # full-depth slot, constant floor
     return dict(frame=frame, text_mask=text_mask, green=green, surface=surface,
-                water=water, snow=snow, track_px=track_px)
+                water=water, snow=snow, track_px=track_px, alt_mm=alt_mm)
 
 
 def _offsets(track_px):
@@ -465,9 +521,14 @@ def masked_slab_mesh(mask, top, thickness, res_mm):
     return trimesh.Trimesh(np.vstack([vt, vb]), np.array(F), process=False)
 
 
-def strip_mesh(track_px, surface, p):
-    """Level full-height wall: constant rectangle in cross-section, swept along the
-    track from the slot floor to proud of the highest terrain the track crosses."""
+def strip_mesh(track_px, alt_mm, surface, p):
+    """Altitude-following wall: constant width, swept along the track from the flat
+    slot floor up to the flight altitude, clamped to proud of the terrain below it.
+
+    `alt_mm` is per original track point (compose_parts' own scale) and is resampled
+    onto the same arc-length stations as the centerline. Where the aircraft flew
+    below the terrain the poster shows (or the altitude is a missing 0), the clamp
+    takes over and the wall rides terrain + proud_mm — it never sinks into the relief."""
     C, nrm = _offsets(track_px)  # same centerline _groove_mask() carved the slot from
     n = len(C)
     cx, cy = C[:, 0], C[:, 1]
@@ -476,12 +537,17 @@ def strip_mesh(track_px, surface, p):
     # ponytail: nearest-neighbour surface sampling; bilinear if the top looks off
     zc = surface[np.clip(cy.round().astype(int), 0, H - 1),
                  np.clip(cx.round().astype(int), 0, W - 1)]
-    z_top, z_bot = float(zc.max()) + p.proud_mm, SLOT_FLOOR_MM
+    # altitude onto _offsets' stations: same cumulative distance, same station count
+    d = np.r_[0, np.cumsum(np.hypot(*np.diff(track_px, axis=0).T))]
+    alt = np.interp(np.linspace(0, d[-1], n), d, np.asarray(alt_mm, float))
+    z_top, z_bot = np.maximum(alt, zc + p.proud_mm), SLOT_FLOOR_MM
+    if p.layer_mm > 0:
+        z_top = np.round(z_top / p.layer_mm) * p.layer_mm
     L, R = C + nrm * half, C - nrm * half
 
     def mm(q, z):
         return np.stack([q[:, 0] * p.res_mm, (H - 1 - q[:, 1]) * p.res_mm,
-                         np.full(len(q), z)], 1)
+                         np.broadcast_to(z, (len(q),)).astype(float)], 1)
 
     V = np.vstack([mm(L, z_bot), mm(R, z_bot), mm(R, z_top), mm(L, z_top)])
     f = []
@@ -513,9 +579,11 @@ def build_poster(track, p=Params()):
                              f"thickness ({p.plate_mm}mm)")
     bounds = track_bounds(track, p.margin_pct)
     M = _grid(p)[1]
-    elev = fetch_elevation(bounds, M)
+    # smoothed once here and shared: the snow threshold and the relief surface must
+    # see the same terrain, and blurring twice would wash the mountains out
+    elev = _smooth(fetch_elevation(bounds, M), p.smooth_px)
     lc = np.zeros((M, M), np.uint8)
-    lc[_opened(elev >= p.snow_line_m, 3)] = 2        # drop 1px DEM spikes
+    lc[_snow_mask(elev, p)] = 2
     try:   # water last: high Alpine lakes sit above the snow line and stay blue
         lc[fetch_water_mask(bounds, M)] = 1
     except Exception as e:
@@ -531,7 +599,7 @@ def build_poster(track, p=Params()):
     text = masked_slab_mesh(parts["text_mask"], parts["frame"] + 0.8, 0.8, p.res_mm)
     if text is not None:
         frame_bodies.append((text, "text", COLORS["text"], 2))
-    strip = strip_mesh(parts["track_px"], parts["surface"], p)
+    strip = strip_mesh(parts["track_px"], parts["alt_mm"], parts["surface"], p)
     return frame_bodies, bodies, strip.export(file_type="stl")
 
 

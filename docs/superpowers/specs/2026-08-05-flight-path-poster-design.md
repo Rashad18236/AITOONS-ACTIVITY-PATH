@@ -251,3 +251,45 @@ UI: the scaled numeric inputs (`relief_mm`, `groove_w_mm`) ship blank with
 and can no longer read it off a blank field, `/generate` returns a fourth key,
 `"resolved"` (`asdict` of the resolved `Params`), and the JS insets the relief plate and
 strip from that instead of from the form (`res_mm`/`fit_mm` constants deleted with it).
+
+# Addendum 2026-08-06d: print quality + altitude path (approved)
+
+Three print defects, one addendum.
+
+**Ragged layer lines.** DEM noise wobbles the terrain by ~0.08mm against a 0.2mm layer,
+so the slicer scattered single-layer islands over near-flat ground. The DEM is now
+blurred once (`smooth_px` = 2px, separable box mean — PIL's `GaussianBlur` rejects mode
+`F`) and the resulting `surface` is rounded to whole `layer_mm` (0.2, `0` disables)
+*before* the caps and the slot are cut, so those keep their exact offsets. `plate_mm` 2.0,
+`cap_mm` 0.6, `SLOT_FLOOR_MM` 1.0, `base_mm` 4.0, `frame_height_mm` 10.0 and the 0.8mm
+text are already 0.2 multiples, so the frame needs no snapping. Both params are absolute
+(printer properties, not visual scale); an unaligned `layer_mm` is the user's call, no guard.
+
+**Speckled grey.** `_opened(elev >= snow_line_m, 3)` kept every ridge sliver, and the
+cell-based cap slab turned 1px slivers into dots. `_snow_mask` now closes *then* opens at
+`k = max(3, round(snow_min_mm / res_mm) | 1)`: the closing merges neighbouring ridges into
+one massif, the opening drops whatever is still thinner than the minimum printed blob.
+`snow_min_mm` is scaled (base 3.0 @250mm, floor 1.5). The threshold reads the *smoothed*
+elevation — `build_poster` blurs once and hands the same array to `compose_parts`, so
+nothing is blurred twice.
+
+**Level path wall.** Altitude was parsed and thrown away. `compose_parts` now also returns
+`alt_mm`, the per-track-point altitude mapped through the same `e0/e1 -> relief_mm *
+exaggeration` scale as the terrain, and `strip_mesh(track_px, alt_mm, surface, p)`
+resamples it onto the centerline's own arc-length stations. Per station
+`z_top = max(alt, surface + proud_mm)`, snapped to `layer_mm`; `z_bot` stays the constant
+`SLOT_FLOOR_MM`. The clamp means the wall never sinks into the relief — where the flight
+crossed below the terrain the poster shows (or the altitude is a missing 0, ~2.7% of a
+real FR24 file) it simply rides terrain + proud. Only the z arrays vary; the offsets and
+the face/winding scheme are untouched.
+
+`check_output.py`: the old "strip top is proud *and level*" ceiling is dropped — the top
+now follows an altitude no exported mesh carries, and a high flight over low terrain
+legitimately towers over the relief. In its place, every terrain and strip z must be a
+multiple of `layer_mm` (3MF `%.3f` -> 1e-6, binary STL float32 -> 1e-4).
+
+| Param | Kind | Default | Floor |
+|---|---|---|---|
+| `snow_min_mm` | scaled | 3.0 @250mm | 1.5 |
+| `layer_mm` | absolute | 0.2 (0 = no snapping) | — |
+| `smooth_px` | absolute | 2.0 (0 = no blur) | — |

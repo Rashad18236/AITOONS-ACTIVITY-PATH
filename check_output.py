@@ -18,6 +18,7 @@ by test_relief_plate_clears_the_frame_ring.
 """
 import argparse, json, sys
 from dataclasses import fields
+import numpy as np
 import trimesh
 from poster import SLOT_FLOOR_MM, Params, _grid, read_3mf, resolve
 
@@ -164,14 +165,25 @@ def main(argv=None):
                 f"[{slo[i]:.2f}, {shi[i]:.2f}]mm",
                 f"in [{rlo[i]:.2f}, {rhi[i]:.2f}]mm +-0.5")
 
-        # 10. strip is a level wall seated on the constant slot floor: bottom exactly
-        # SLOT_FLOOR_MM, top proud of the highest terrain the track crosses (which is
-        # at most the highest point of the whole relief).
-        z_hi = max(m.bounds[1][2] for _, m in bodies) + p.proud_mm + 0.01
+        # 10. strip seats on the constant slot floor and stands proud of it. Its top
+        # follows the *flight altitude* now, which no exported mesh carries — a high
+        # flight over low terrain legitimately towers over the relief — so the old
+        # "top <= relief top + proud" ceiling is gone. Rule 11 below covers the
+        # regression it used to catch (that the top is a real, snapped z, not junk).
         chk("strip seats on slot floor", abs(slo[2] - SLOT_FLOOR_MM) <= 0.01,
             f"{slo[2]:.3f}mm", f"{SLOT_FLOOR_MM:.2f}mm +-0.01")
-        chk("strip top is proud and level", slo[2] + p.proud_mm < shi[2] <= z_hi,
-            f"{shi[2]:.3f}mm", f"in ({slo[2] + p.proud_mm:.3f}, {z_hi:.3f}]mm")
+        chk("strip top is proud of the floor", shi[2] > slo[2] + p.proud_mm,
+            f"{shi[2]:.3f}mm", f"> {slo[2] + p.proud_mm:.3f}mm")
+
+        # 11. layer snapping: terrain and strip z land on whole slicer layers, so flat
+        # ground slices as uniform layers instead of ragged single-layer islands.
+        # Tolerances are the file formats': 3MF writes %.3f, binary STL is float32.
+        if p.layer_mm > 0:
+            for label, m, tol in (("terrain", terrain, 1e-6), ("strip", strip, 1e-4)):
+                z = m.vertices[:, 2] / p.layer_mm
+                off = float(np.abs(z - np.round(z)).max()) * p.layer_mm
+                chk(f"{label} z on layer multiples", off <= tol,
+                    f"max off {off:.1e}mm", f"multiple of {p.layer_mm}mm +-{tol:g}")
 
     wn = max(len(r[1]) for r in rows)
     wg = max(len(r[2]) for r in rows)
