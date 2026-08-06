@@ -121,3 +121,18 @@ Supersedes the single-poster output. Three deliverables per generate:
 - check_output.py extends to the trio: frame footprint/watertight, relief bodies
   round-tripped from the 3MF (also validates the writer), caps within relief bounds,
   strip vs relief surface.
+- Land-cover fallback (added 2026-08-05, Terrascope WMS down ~30h): on ANY exception
+  from the WorldCover WMS, `fetch_landcover` prints one line and falls back to OSM
+  standard-style raster tiles (`https://tile.openstreetmap.org/{z}/{x}/{y}.png`) via
+  the tile-mosaic core now shared with the DEM (`_tile_mosaic`). WorldCover stays
+  primary — no behaviour change while it is up. `classify_landcover_osm` matches
+  water #AAD3DF ±10 and landuse=residential ±9 around #D8D8D8 (osm-carto darkens that
+  fill as it zooms out: #E0DFDF at z≥13, ~#D2D2D2 at z11), then resamples NEAREST —
+  bilinear would blend palette colours into no class at all. Unlike WorldCover this is
+  a rendering, not a survey: roads and labels are painted over the fills, so both
+  classes get a closing pass (cities close at half the city kernel) or motorway
+  casings shatter a city below the opening kernel. OSM tile policy compliance:
+  identifying User-Agent `FlightPathPoster/1.0 (local single-user 3D-print tool)`,
+  zoom floored at 10 (below it osm-carto draws no residential at all, so there are no
+  cities to find) and capped at 13, with a hard ~8×8-tile budget per fetch that clamps
+  that floor — a wide track must not become a four-figure tile download.

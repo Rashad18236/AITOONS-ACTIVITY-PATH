@@ -1,5 +1,9 @@
+import io
+
 import numpy as np
 import pytest
+from PIL import Image
+
 import poster
 
 KML = """<?xml version="1.0"?><kml xmlns:gx="http://www.google.com/kml/ext/2.2">
@@ -435,3 +439,112 @@ def test_3mf_roundtrip():
     assert np.allclose(got[0][1], a.vertices, atol=1e-3)
     cfg = z.read("Metadata/model_settings.config").decode()
     assert 'value="1"' in cfg and 'value="2"' in cfg
+
+
+def test_classify_landcover_osm_closes_label_holes():
+    """OSM draws lake names and roads over water — a 1px line must not split the lake."""
+    rgb = np.full((30, 30, 3), (242, 239, 233), np.uint8)   # OSM land background
+    rgb[5:25, 5:25] = (170, 211, 223)                       # lake
+    rgb[14, 5:25] = (255, 255, 255)                         # a "label" line through it
+    rgb[2, 2] = (170, 211, 223)                             # 1px pond -> speckle, removed
+    lc = poster.classify_landcover_osm(rgb, km_per_px=0.5, city_min_km=1.5)
+    assert (lc[6:24, 6:24] == 1).all()                      # hole closed, lake intact
+    assert lc[2, 2] == 0 and lc[0, 0] == 0
+
+
+def test_classify_landcover_osm_city_survives_road_casings():
+    """OSM paints roads over the residential fill; a city cut into sub-kernel crumbs
+    by them must still classify as one city (this is what killed the live Zug run)."""
+    rgb = np.full((60, 60, 3), (242, 239, 233), np.uint8)
+    rgb[10:50, 10:50] = (210, 210, 209)             # 40px built-up area, z11 shade
+    for o in (20, 30, 40):                          # white road casings slicing it up
+        rgb[o:o + 3, 10:50] = (254, 254, 254)
+        rgb[10:50, o:o + 3] = (254, 254, 254)
+    # 40px city, 15px kernel: the crumbs between roads are only ~10px, so the
+    # opening alone would erase all of it
+    lc = poster.classify_landcover_osm(rgb, km_per_px=0.1, city_min_km=1.5)
+    assert (lc == 2).sum() > 900                    # ~the whole block, roads healed
+    assert (lc[12:48, 12:48] == 2).all()
+
+
+def test_classify_landcover_osm_city_threshold_scales():
+    rgb = np.full((40, 40, 3), (242, 239, 233), np.uint8)
+    rgb[10:14, 10:14] = (224, 223, 223)                     # 4px-wide village
+    assert (poster.classify_landcover_osm(rgb, 0.1, 1.5) == 2).sum() == 0   # needs ~15px
+    assert (poster.classify_landcover_osm(rgb, 1.0, 1.5) == 2).sum() > 0    # kernel floors at 3
+
+
+def test_classify_landcover_osm_city_tolerance_is_tight():
+    """The residential-grey window must not swallow the other neutral greys."""
+    rgb = np.full((30, 30, 3), (242, 239, 233), np.uint8)   # land background
+    rgb[5:25, 5:25] = (170, 211, 223)                       # big lake (grey-blue)
+    lc = poster.classify_landcover_osm(rgb, km_per_px=1.0, city_min_km=1.5)
+    assert (lc == 2).sum() == 0 and lc[15, 15] == 1
+    for grey in ((217, 208, 201), (221, 221, 232), (238, 238, 238), (254, 254, 254)):
+        rgb = np.full((30, 30, 3), grey, np.uint8)          # buildings, pedestrian,
+        assert (poster.classify_landcover_osm(               # parking, road casing
+            rgb, 1.0, 1.5) == 2).sum() == 0, grey
+
+
+def test_classify_landcover_osm_city_across_zooms():
+    """osm-carto darkens landuse=residential as it zooms out; both shades are cities."""
+    for grey in ((224, 223, 223), (221, 221, 220), (210, 210, 209), (208, 208, 208)):
+        rgb = np.full((30, 30, 3), (242, 239, 233), np.uint8)
+        rgb[5:25, 5:25] = grey
+        assert (poster.classify_landcover_osm(rgb, 1.0, 1.5) == 2).sum() > 0, grey
+
+
+def test_fetch_landcover_falls_back_to_osm(monkeypatch, capsys):
+    def boom(url, headers=None):
+        raise RuntimeError("WMS down")
+    monkeypatch.setattr(poster, "_get", boom)
+    grid = np.full((8, 8), 1, np.uint8)
+    monkeypatch.setattr(poster, "_fetch_landcover_osm", lambda *a: grid)
+    out = poster.fetch_landcover((0.1, 0.2, 0.11, 0.21), 8, 0.5, 1.5)
+    assert (out == grid).all()
+    assert "OSM" in capsys.readouterr().out
+
+
+def test_fetch_landcover_osm_sends_user_agent(monkeypatch):
+    """OSM tile policy requires an identifying User-Agent."""
+    seen = []
+    png = io.BytesIO()
+    Image.new("RGB", (256, 256), (170, 211, 223)).save(png, "PNG")
+    monkeypatch.setattr(poster, "_get",
+                        lambda url, headers=None: seen.append((url, headers)) or png.getvalue())
+    lc = poster._fetch_landcover_osm((0.1, 0.2, 0.101, 0.201), 16, 1.0, 1.5)
+    assert lc.shape == (16, 16) and (lc == 1).all()
+    url, headers = seen[0]
+    assert url.startswith("https://tile.openstreetmap.org/")
+    assert "FlightPathPoster" in headers["User-Agent"]
+    assert 10 <= int(url.split("/")[-3]) <= 13      # z10 floor (cities), z13 cap (policy)
+
+
+def test_tile_mosaic_zoom_floor_respects_tile_budget(monkeypatch):
+    """min_zoom must not turn a wide track into a four-figure tile download."""
+    seen = []
+    png = io.BytesIO()
+    Image.new("RGB", (256, 256), (0, 0, 0)).save(png, "PNG")
+    monkeypatch.setattr(poster, "_get",
+                        lambda url, headers=None: seen.append(url) or png.getvalue())
+    # ~1 radian wide (transatlantic): the z10 floor alone would be ~26000 tiles
+    poster._tile_mosaic((0.0, 0.9, 1.0, 1.9), 238, poster.OSM_TILE_URL, None,
+                        **poster.OSM_ZOOM)
+    assert len(seen) <= 64, len(seen)          # budget wins over the floor
+    assert int(seen[0].split("/")[-3]) < 10     # ...and it does so by dropping below z10
+
+
+def test_tile_budget_never_downgrades_elevation(monkeypatch):
+    """The tile budget added for the OSM zoom floor must not silently coarsen the
+    DEM: at the largest legal grid (256mm / 0.2mm) it must still pick the fit zoom."""
+    import math
+    seen = []
+    png = io.BytesIO()
+    Image.new("RGB", (256, 256), (128, 0, 0)).save(png, "PNG")
+    monkeypatch.setattr(poster, "_get",
+                        lambda url, headers=None: seen.append(url) or png.getvalue())
+    for span in (0.0005, 0.005, 0.05, 0.5):
+        seen.clear()
+        poster.fetch_elevation((0.1, 0.9, 0.1 + span, 0.9 + span), 1280)
+        fit = math.ceil(math.log2(1280 * 2 * math.pi / (span * 256)))
+        assert int(seen[0].split("/")[-3]) == min(12, fit), (span, seen[0])

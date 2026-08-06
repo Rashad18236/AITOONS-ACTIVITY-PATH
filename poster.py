@@ -88,10 +88,10 @@ def _tile_px(x, y, z):
     return (x + math.pi) / (2 * math.pi) * n, (math.pi - y) / (2 * math.pi) * n
 
 
-def _get(url):
+def _get(url, headers=None):
     for attempt in (1, 2):  # one retry, then raise (spec: 502 upstream)
         try:
-            r = requests.get(url, timeout=20)
+            r = requests.get(url, timeout=20, headers=headers)
             r.raise_for_status()
             return r.content
         except Exception:
@@ -99,10 +99,20 @@ def _get(url):
                 raise
 
 
-def fetch_elevation(bounds, px_out):
-    """Terrarium mosaic for bounds, cropped and resampled to (px_out, px_out) meters."""
+def _tile_mosaic(bounds, px_out, url_tmpl, headers=None, max_zoom=12, min_zoom=1):
+    """Slippy-map tiles covering bounds, stitched and cropped -> (H,W,3) uint8 RGB.
+
+    Native tile resolution, NOT resampled to px_out — px_out only picks the zoom.
+    Callers resample themselves: elevation must decode to float metres first
+    (bilinear on terrarium RGB is nonsense), palettes must resample NEAREST."""
     x0, y0, x1, y1 = bounds
-    z = min(12, max(1, math.ceil(math.log2(px_out * 2 * math.pi / ((x1 - x0) * 256)))))
+    fit = math.ceil(math.log2(px_out * 2 * math.pi / ((x1 - x0) * 256)))  # ~1 tile px out
+    # min_zoom exists so a rendered style actually draws the features we classify;
+    # left alone it would answer a wide track with a four-figure tile download, so
+    # cap it at ~8x8 tiles. It clamps min_zoom and NOT the final zoom on purpose:
+    # applied to `fit` its floor()-vs-ceil() rounding would quietly coarsen the DEM.
+    budget = math.floor(math.log2(7 * 2 * math.pi / (x1 - x0)))
+    z = max(1, min(max_zoom, max(fit, min(min_zoom, budget))))
     pxL, pyB = _tile_px(x0, y0, z)   # west, south  (bottom of image)
     pxR, pyT = _tile_px(x1, y1, z)   # east, north  (top of image)
     tx0, tx1 = int(pxL // 256), int(pxR // 256)
@@ -110,15 +120,19 @@ def fetch_elevation(bounds, px_out):
     mosaic = np.zeros(((ty1 - ty0 + 1) * 256, (tx1 - tx0 + 1) * 256, 3), np.uint8)
     for ty in range(ty0, ty1 + 1):
         for tx in range(tx0, tx1 + 1):
-            img = Image.open(io.BytesIO(_get(TILE_URL.format(z=z, x=tx, y=ty))))
+            img = Image.open(io.BytesIO(_get(url_tmpl.format(z=z, x=tx, y=ty), headers)))
             mosaic[(ty - ty0) * 256:(ty - ty0 + 1) * 256,
                    (tx - tx0) * 256:(tx - tx0 + 1) * 256] = np.asarray(img.convert("RGB"))
-    elev = decode_terrarium(mosaic)
     # ponytail: integer-pixel crop (<1 tile-px misalignment), subpixel crop if seams show
     a, c = int(pxL - tx0 * 256), int(pxR - tx0 * 256)
     b, d = int(pyT - ty0 * 256), int(pyB - ty0 * 256)
-    crop = elev[b:max(d, b + 2), a:max(c, a + 2)].astype(np.float32)
-    return np.asarray(Image.fromarray(crop, "F").resize((px_out, px_out), Image.BILINEAR))
+    return mosaic[b:max(d, b + 2), a:max(c, a + 2)]
+
+
+def fetch_elevation(bounds, px_out):
+    """Terrarium mosaic for bounds, cropped and resampled to (px_out, px_out) meters."""
+    elev = decode_terrarium(_tile_mosaic(bounds, px_out, TILE_URL)).astype(np.float32)
+    return np.asarray(Image.fromarray(elev, "F").resize((px_out, px_out), Image.BILINEAR))
 
 
 WMS_URL = ("https://services.terrascope.be/wms/v2?SERVICE=WMS&VERSION=1.3.0"
@@ -136,6 +150,11 @@ def _opened(mask, k):
     return np.asarray(img) > 0
 
 
+def _closed(mask, k):
+    """Morphological closing: fills gaps up to k px wide, keeping the outer extent."""
+    return ~_opened(~mask, k)
+
+
 def classify_landcover(rgb, km_per_px, city_min_km):
     """WorldCover RGB -> codes: 0 green, 1 water, 2 big-city."""
     def near(target):
@@ -149,12 +168,63 @@ def classify_landcover(rgb, km_per_px, city_min_km):
     return lc
 
 
+# Fallback source: OSM standard-style raster tiles. Their palette is a cartographic
+# style, not a survey — coarser and road/label-contaminated — so WorldCover stays
+# primary. OSM tile policy requires an identifying User-Agent and forbids bulk use;
+# one generate pulls at most 64 tiles (_tile_mosaic's budget), a browser's worth.
+OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+OSM_HEADERS = {"User-Agent": "FlightPathPoster/1.0 (local single-user 3D-print tool)"}
+# z10 is where osm-carto starts drawing landuse=residential — below it the image
+# holds no cities to find, whatever the poster's own resolution. z13 is where the
+# palette stops changing and extra tiles buy nothing.
+OSM_ZOOM = dict(min_zoom=10, max_zoom=13)
+
+
+def classify_landcover_osm(rgb, km_per_px, city_min_km):
+    """OSM standard-style tile RGB -> codes: 0 green, 1 water, 2 big-city.
+
+    Unlike WorldCover this is a map rendering, not a survey: roads and labels are
+    painted OVER the land-cover fills at a fixed pixel width, so both classes need
+    a closing pass to repair what the cartography cut out of them."""
+    def near(target, tol):
+        return (np.abs(rgb.astype(int) - target).max(axis=2) <= tol)
+    # open drops 1px speckle; close repairs the label and bridge lines over lakes,
+    # which would otherwise punch holes straight through the water cap
+    water = _closed(_opened(near((170, 211, 223), 10), 3), 3)
+    k = max(3, int(round(city_min_km / km_per_px)) | 1)         # odd, >=3
+    # osm-carto darkens landuse=residential as it zooms out: #e0dfdf at z>=13,
+    # ~#d2d2d2 at z11 (measured). One window over that band, kept tight — buildings
+    # (#d9d0c9) and pedestrian areas (#ddddE8) are ~15 away and must stay out.
+    # Close first at half the city kernel: rendered motorway casings are hundreds of
+    # ground-metres wide at these zooms and shatter a city into sub-kernel crumbs.
+    city = _opened(_closed(near((216, 216, 216), 9), max(3, k // 2 | 1)), k)
+    lc = np.zeros(rgb.shape[:2], np.uint8)
+    lc[water] = 1
+    lc[city & ~water] = 2
+    return lc
+
+
+def _fetch_landcover_osm(bounds, px_out, km_per_px, city_min_km):
+    """OSM-tile land-cover codes, same contract as fetch_landcover."""
+    rgb = _tile_mosaic(bounds, px_out, OSM_TILE_URL, OSM_HEADERS, **OSM_ZOOM)
+    # NEAREST, never bilinear: blended palette colours match no class at all
+    rgb = np.asarray(Image.fromarray(rgb).resize((px_out, px_out), Image.NEAREST))
+    return classify_landcover_osm(rgb, km_per_px, city_min_km)
+
+
 def fetch_landcover(bounds, px_out, km_per_px, city_min_km):
-    """WorldCover land-cover codes for bounds, (px_out, px_out), row 0 = north."""
-    x0, y0, x1, y1 = (v * _R3857 for v in bounds)   # merc radians -> EPSG:3857 meters
-    url = WMS_URL.format(x0=x0, y0=y0, x1=x1, y1=y1, w=px_out, h=px_out)
-    img = Image.open(io.BytesIO(_get(url))).convert("RGB")
-    return classify_landcover(np.asarray(img), km_per_px, city_min_km)
+    """WorldCover land-cover codes for bounds, (px_out, px_out), row 0 = north.
+
+    Falls back to OSM tiles when the WMS is unreachable — a coarser poster beats
+    no poster, and the WMS has had multi-day outages."""
+    try:
+        x0, y0, x1, y1 = (v * _R3857 for v in bounds)   # merc radians -> EPSG:3857 meters
+        url = WMS_URL.format(x0=x0, y0=y0, x1=x1, y1=y1, w=px_out, h=px_out)
+        img = Image.open(io.BytesIO(_get(url))).convert("RGB")
+        return classify_landcover(np.asarray(img), km_per_px, city_min_km)
+    except Exception as e:
+        print(f"land cover: WorldCover WMS unavailable ({e}) — falling back to OSM tiles")
+        return _fetch_landcover_osm(bounds, px_out, km_per_px, city_min_km)
 
 
 @dataclass
