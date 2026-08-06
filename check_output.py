@@ -166,14 +166,17 @@ def main(argv=None):
                 f"in [{rlo[i]:.2f}, {rhi[i]:.2f}]mm +-0.5")
 
         # 10. strip seats on the constant slot floor and stands proud of it. Its top
-        # follows the *flight altitude* now, which no exported mesh carries — a high
-        # flight over low terrain legitimately towers over the relief — so the old
-        # "top <= relief top + proud" ceiling is gone. Rule 11 below covers the
-        # regression it used to catch (that the top is a real, snapped z, not junk).
+        # follows the *flight altitude* now, so it is no longer bounded by the terrain
+        # the track happens to cross — but strip_mesh caps it at the relief's own
+        # ceiling (a full-scale peak plus proud_mm), and that bound catches the unit
+        # mixup a raw altitude would produce (12000m over 500m terrain -> 722mm).
+        ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm
         chk("strip seats on slot floor", abs(slo[2] - SLOT_FLOOR_MM) <= 0.01,
             f"{slo[2]:.3f}mm", f"{SLOT_FLOOR_MM:.2f}mm +-0.01")
         chk("strip top is proud of the floor", shi[2] > slo[2] + p.proud_mm,
             f"{shi[2]:.3f}mm", f"> {slo[2] + p.proud_mm:.3f}mm")
+        chk("strip top under the relief ceiling", shi[2] <= ceiling + 0.01,
+            f"{shi[2]:.3f}mm", f"<= {ceiling:.2f}mm (plate + relief*exag + proud)")
 
         # 11. layer snapping: terrain and strip z land on whole slicer layers, so flat
         # ground slices as uniform layers instead of ragged single-layer islands.

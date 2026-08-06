@@ -371,7 +371,7 @@ def _groove_mask(track_px, shape, p):
     H, W = shape
     img = Image.new("L", (W, H))
     d = ImageDraw.Draw(img)
-    C, nrm = _offsets(track_px)
+    C, nrm = _offsets(track_px)[:2]
     half = p.groove_w_mm / 2 / p.res_mm
     L, R = C + nrm * half, C - nrm * half
     for i in range(len(C) - 1):
@@ -435,13 +435,17 @@ def compose_parts(track, elev, lc, bounds, p):
 
 
 def _offsets(track_px):
-    """Resample the centerline to ~1 sample/pixel -> (C, unit normals), pixel space."""
+    """Resample the centerline to ~1 sample/pixel -> (C, unit normals, d, t), pixel space.
+
+    d is the input points' cumulative distance and t the resampled stations, handed
+    back so a caller can carry a per-point quantity (altitude) onto the same
+    stations with the same np.interp — no second, drift-prone copy of this maths."""
     d = np.r_[0, np.cumsum(np.hypot(*np.diff(track_px, axis=0).T))]
     t = np.linspace(0, d[-1], max(int(d[-1]), 8))
     C = np.stack([np.interp(t, d, track_px[:, 0]), np.interp(t, d, track_px[:, 1])], 1)
     tang = np.gradient(C, axis=0)
     tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-12
-    return C, np.stack([-tang[:, 1], tang[:, 0]], 1)
+    return C, np.stack([-tang[:, 1], tang[:, 0]], 1), d, t
 
 
 def _grid_faces(idx):
@@ -528,8 +532,13 @@ def strip_mesh(track_px, alt_mm, surface, p):
     `alt_mm` is per original track point (compose_parts' own scale) and is resampled
     onto the same arc-length stations as the centerline. Where the aircraft flew
     below the terrain the poster shows (or the altitude is a missing 0), the clamp
-    takes over and the wall rides terrain + proud_mm — it never sinks into the relief."""
-    C, nrm = _offsets(track_px)  # same centerline _groove_mask() carved the slot from
+    takes over and the wall rides terrain + proud_mm — it never sinks into the relief.
+
+    The wall is capped at the relief's own ceiling (a full-scale peak plus proud_mm):
+    an airliner at 12000m over 500m terrain maps to a 722mm wall, which is not a
+    poster. Above the ceiling the flight simply rides a level line over the highest
+    ground the relief can show."""
+    C, nrm, d, t = _offsets(track_px)  # same centerline _groove_mask() carved the slot from
     n = len(C)
     cx, cy = C[:, 0], C[:, 1]
     half = (p.groove_w_mm / 2 - p.clearance_mm) / p.res_mm  # px
@@ -537,10 +546,14 @@ def strip_mesh(track_px, alt_mm, surface, p):
     # ponytail: nearest-neighbour surface sampling; bilinear if the top looks off
     zc = surface[np.clip(cy.round().astype(int), 0, H - 1),
                  np.clip(cx.round().astype(int), 0, W - 1)]
-    # altitude onto _offsets' stations: same cumulative distance, same station count
-    d = np.r_[0, np.cumsum(np.hypot(*np.diff(track_px, axis=0).T))]
-    alt = np.interp(np.linspace(0, d[-1], n), d, np.asarray(alt_mm, float))
-    z_top, z_bot = np.maximum(alt, zc + p.proud_mm), SLOT_FLOOR_MM
+    alt = np.interp(t, d, np.asarray(alt_mm, float))   # altitude onto the same stations
+    ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm
+    if p.layer_mm > 0:   # a layer-aligned cap keeps the snap below it (round is monotone)
+        ceiling = math.floor(ceiling / p.layer_mm + 1e-9) * p.layer_mm
+    if (over := alt > ceiling).any():
+        print(f"path: flight above the relief ceiling on {over.mean() * 100:.0f}% of the "
+              f"track — wall capped at {ceiling:.2f}mm")
+    z_top, z_bot = np.minimum(np.maximum(alt, zc + p.proud_mm), ceiling), SLOT_FLOOR_MM
     if p.layer_mm > 0:
         z_top = np.round(z_top / p.layer_mm) * p.layer_mm
     L, R = C + nrm * half, C - nrm * half

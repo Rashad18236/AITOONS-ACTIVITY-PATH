@@ -288,7 +288,7 @@ def _groove_widths(p):
     elev = np.tile(np.linspace(0, 1000, M), (M, 1))
     parts = poster.compose_parts(trk, elev, np.zeros((M, M), np.uint8), bounds, p)
     groove = (parts["surface"] - parts["green"]) > 0
-    C, nrm = poster._offsets(parts["track_px"])
+    C, nrm = poster._offsets(parts["track_px"])[:2]
     half = (p.groove_w_mm / 2 - p.clearance_mm) / p.res_mm   # strip half-width, px
     step = np.arange(0, 3 * half, 0.25)                      # march out from centreline
 
@@ -436,6 +436,26 @@ def test_compose_parts_maps_altitude_through_the_terrain_scale():
     assert np.allclose(alt, want)
     assert alt[0] == p.plate_mm                            # on the deck = plate level
     assert alt[-1] > parts["surface"].max()                # 3000m clears 1000m terrain
+
+
+def test_strip_is_capped_at_the_relief_ceiling(capsys):
+    """An airliner would print a 722mm wall: 12000m over 500m terrain runs straight
+    off the poster. Above the relief's own ceiling the wall goes level instead."""
+    p, N, fpx, _, _, bounds = _synthetic()                 # bounds of the same track
+    M = _mpx(p)
+    elev = np.tile(np.linspace(0, 500, M), (M, 1))         # 500m of terrain...
+    track = np.array([[47.0, 8.0, 0.0], [47.5, 9.0, 12000.0]])   # ...under a jet
+    parts = poster.compose_parts(track, elev, np.zeros((M, M), np.uint8), bounds, p)
+    assert abs(parts["alt_mm"].max() - 722.0) < 1e-6       # the raw, unprintable height
+    m = poster.strip_mesh(parts["track_px"], parts["alt_mm"], parts["surface"], p)
+    assert m.is_watertight and m.is_winding_consistent and m.volume > 0
+    top = _strip_tops(m, parts["track_px"])
+    ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm      # 33.0mm
+    assert abs(top.max() - ceiling) < 1e-9                 # capped, not 722mm
+    assert np.abs(top / p.layer_mm - np.round(top / p.layer_mm)).max() < 1e-9
+    assert "ceiling" in capsys.readouterr().out            # and it says so, once
+    # (a flight below the ceiling is untouched — test_strip_follows_the_flight_
+    # altitude_over_flat_terrain tops out at 22.0mm against the same 33.0mm cap)
 
 
 TRACK3 = np.array([[47.0, 8.0, 0], [47.2, 8.4, 2000], [47.5, 9.0, 3000]])
