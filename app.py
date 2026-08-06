@@ -1,6 +1,6 @@
 """Flight Path Poster — local web app. Run: uv run uvicorn app:app"""
 import base64, json
-from dataclasses import fields
+from dataclasses import asdict, fields
 from fastapi import FastAPI, Form, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 import poster as core
@@ -17,12 +17,14 @@ async def generate(file: UploadFile, params: str = Form("{}")):
     except (ValueError, AttributeError) as e:
         raise HTTPException(400, str(e))
     try:
-        frame_bodies, bodies, path_stl = core.build_poster(track, core.Params(**kw))
+        p = core.resolve(core.Params(**kw))   # blank fields auto-scale; preview needs the values
+        frame_bodies, bodies, path_stl = core.build_poster(track, p)
         frame_3mf, relief_3mf = core.write_3mf(frame_bodies), core.write_3mf(bodies)
     except Exception as e:  # DEM/land-cover fetch or meshing failed
         raise HTTPException(502, f"Generation failed: {e}")
     b64 = lambda d: base64.b64encode(d).decode()
-    return {"frame": b64(frame_3mf), "relief": b64(relief_3mf), "path": b64(path_stl)}
+    return {"frame": b64(frame_3mf), "relief": b64(relief_3mf), "path": b64(path_stl),
+            "resolved": asdict(p)}
 
 
 app.mount("/", StaticFiles(directory="static", html=True))

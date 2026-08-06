@@ -28,4 +28,6 @@ uv run uvicorn app:app --reload
 
 Key invariant: every body comes off the same heightmap, so they always fit. The relief plate glues into the frame ring (fit clearance ceil-rounded up to a whole pixel, ≥0.2mm per side — rounding down gives an interference fit); the strip glues into the slot with 0.30mm per side. The slot is carved to a constant `SLOT_FLOOR_MM = 1.0` floor (depth varies with terrain, the floor does not), and the strip is a level wall from that floor to `proud_mm` above the highest terrain the track crosses.
 
+Visual params (`frame_mm`, `relief_mm`, `frame_height_mm`, `text_mm`, `groove_w_mm`, `proud_mm`) default to `None` = auto: `poster.resolve(p)` scales them from their 250mm base by `size_mm` and floors them for printability, so an 80mm poster keeps the 250mm look. `build_poster` and `check_output.py` both resolve first; `/generate` returns the resolved dict for the preview.
+
 Spec: `docs/superpowers/specs/2026-08-05-flight-path-poster-design.md`

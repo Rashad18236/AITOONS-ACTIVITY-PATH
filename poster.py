@@ -1,6 +1,6 @@
 """Flight Path Poster core: track -> heightmap -> printable meshes."""
 import csv, io, json, math, re, urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import numpy as np
 import requests
 import trimesh
@@ -271,21 +271,39 @@ def fetch_water_mask(bounds, px_out):
 class Params:
     size_mm: float = 250.0
     base_mm: float = 4.0
-    relief_mm: float = 20.0
+    relief_mm: float | None = None
     exaggeration: float = 1.5
     margin_pct: float = 15.0
-    frame_mm: float = 12.0
-    frame_height_mm: float = 10.0
-    groove_w_mm: float = 2.0   # slot width; its depth is derived, see SLOT_FLOOR_MM
+    frame_mm: float | None = None
+    frame_height_mm: float | None = None
+    groove_w_mm: float | None = None  # slot width; its depth is derived, see SLOT_FLOOR_MM
     clearance_mm: float = 0.30  # per side; FDM PLA seating margin (rasterisation ±1px + elephant-foot)
     text: str = ""
-    text_mm: float = 8.0
+    text_mm: float | None = None
     res_mm: float = 0.4
-    proud_mm: float = 1.0
+    proud_mm: float | None = None
     cap_mm: float = 0.6      # colour-cap slab thickness
     plate_mm: float = 2.0    # relief plate base thickness (slot floor sits above 0)
     fit_mm: float = 0.2      # gap per side between relief plate and frame ring
     snow_line_m: float = 2000.0   # grey caps above this DEM elevation
+
+
+# Visual params: None means "auto" — base value at 250mm, scaled by size, floored so
+# it still prints. Everything else in Params is absolute (stiffness, FDM tolerance,
+# real-world metres) and must not move with the poster size.  {field: (base@250, floor)}
+_SCALED = {"frame_mm": (12.0, 4.0), "relief_mm": (20.0, 5.0), "frame_height_mm": (10.0, 3.0),
+           "text_mm": (8.0, 3.0), "groove_w_mm": (2.0, 1.2), "proud_mm": (1.0, 0.4)}
+
+
+def resolve(p: Params) -> Params:
+    """Params with every auto (None) field filled in — the only place that happens."""
+    p = replace(p, **{k: max(floor, round(base * p.size_mm / 250, 2))
+                      for k, (base, floor) in _SCALED.items() if getattr(p, k) is None})
+    core = p.groove_w_mm - 2 * p.clearance_mm
+    if core < 0.4:   # what is left of the strip between the two clearance gaps
+        raise ValueError(f"groove_w_mm ({p.groove_w_mm}mm) leaves a {core:.2f}mm strip "
+                         f"core after {p.clearance_mm}mm clearance per side; needs >= 0.4mm")
+    return p
 
 
 def _grid(p):
@@ -483,6 +501,7 @@ def build_poster(track, p=Params()):
     """Track -> (frame_bodies, relief_bodies, path_strip_stl).
 
     Both body lists are [(mesh, name, hex_colour, extruder_slot), ...] for write_3mf."""
+    p = resolve(p)   # auto (None) visual params -> concrete mm; everything below is mm
     # ponytail: reject rather than clamp — a typo'd 2500mm is a mistake to surface,
     # not to silently honour, and N^2 grids OOM the box. Raise the cap if a bigger
     # plate ever shows up.

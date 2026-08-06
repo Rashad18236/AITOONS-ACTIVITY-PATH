@@ -27,11 +27,13 @@
   <label>FR24 track (KML/CSV)</label><input type="file" id="file" accept=".kml,.csv">
   <label>Text (bottom frame bar)</label><input id="text" placeholder="ZRH → GVA · 12.07.2026">
   <label>Poster size mm</label><input id="size_mm" type="number" value="250">
-  <label>Max relief mm</label><input id="relief_mm" type="number" value="20">
+  <label>Max relief mm</label><input id="relief_mm" type="number" placeholder="auto">
   <label>Vertical exaggeration</label><input id="exaggeration" type="number" step="0.1" value="1.5">
   <label>Margin %</label><input id="margin_pct" type="number" value="15">
-  <label>Path slot width mm</label><input id="groove_w_mm" type="number" step="0.1" value="2">
+  <label>Path slot width mm</label><input id="groove_w_mm" type="number" step="0.1" placeholder="auto">
   <label>Grey caps above [m]</label><input id="snow_line_m" type="number" step="100" value="2000">
+  <p style="font-size:11px;opacity:.7;margin:4px 0">"auto" fields scale with the poster
+  size (12mm frame / 20mm relief / 2mm slot at 250mm), floored so they still print.</p>
   <button id="go">Generate</button>
   <div id="status"></div>
   <a class="dl" id="dlFrame" style="display:none">Download frame.3mf</a>
@@ -72,7 +74,6 @@ const COLORS = { frame: 0x222222, text: 0xffffff,
 const RELIEF_ORDER = [0x4caf50, 0x2196f3, 0x9e9e9e];
 const FRAME_ORDER = [0x222222, 0xffffff];
 const STRIP_COLOR = 0xcc2222;
-const RES_MM = 0.4, FIT_MM = 0.2;   // Params.res_mm / Params.fit_mm server defaults
 
 let objects = [];
 function b64bytes(b64) { return Uint8Array.from(atob(b64), c => c.charCodeAt(0)); }
@@ -131,9 +132,10 @@ document.getElementById('go').onclick = async () => {
     const fb = b64bytes(j.frame), rb = b64bytes(j.relief), sb = b64bytes(j.path);
     // relief plate and strip are meshed in plate-local coords: lift them onto the
     // backplate and inset by the ring plus the fit gap (rounded up to a pixel, as _grid does)
-    const fitCeil = Math.ceil(FIT_MM / RES_MM) * RES_MM;
-    const inset = (params.frame_mm ?? 12) + fitCeil;
-    const at = [inset, inset, params.base_mm ?? 4];
+    const R = j.resolved;   // server-resolved params: blank "auto" fields already filled in
+    const fitCeil = Math.ceil(R.fit_mm / R.res_mm) * R.res_mm;
+    const inset = R.frame_mm + fitCeil;
+    const at = [inset, inset, R.base_mm];
     const frame = place(threeMFGroup(fb, FRAME_ORDER), [0, 0, 0]);
     place(threeMFGroup(rb, RELIEF_ORDER), at);
     place(stlMesh(sb, STRIP_COLOR), at);

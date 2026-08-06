@@ -1,5 +1,7 @@
 import io
+import json
 import os
+from dataclasses import asdict
 
 import numpy as np
 import pytest
@@ -93,7 +95,52 @@ def test_decode_terrarium():
 
 
 def _params(**kw):
-    return poster.Params(**{"size_mm": 40.0, "frame_mm": 4.0, "res_mm": 0.5, **kw})
+    """Test params: every scaled field pinned to its 250mm base, so these tests
+    measure geometry, not the auto-scaling (which resolve() is tested for below)."""
+    return poster.Params(**{"size_mm": 40.0, "frame_mm": 4.0, "res_mm": 0.5,
+                            "relief_mm": 20.0, "frame_height_mm": 10.0, "text_mm": 8.0,
+                            "groove_w_mm": 2.0, "proud_mm": 1.0, **kw})
+
+
+def test_resolve_at_250_is_the_legacy_defaults():
+    """Backwards compat pin: the auto values at the reference size are exactly the
+    concrete defaults every earlier print was made with."""
+    p = poster.resolve(poster.Params(size_mm=250))
+    assert p.frame_mm == 12.0
+    assert p.relief_mm == 20.0
+    assert p.frame_height_mm == 10.0
+    assert p.text_mm == 8.0
+    assert p.groove_w_mm == 2.0
+    assert p.proud_mm == 1.0
+
+
+def test_resolve_scales_and_floors_at_80mm():
+    p = poster.resolve(poster.Params(size_mm=80))
+    assert p.frame_mm == 4.0            # 3.84 -> floor
+    assert p.relief_mm == 6.4           # 20 * 80/250, above its 5.0 floor
+    assert p.frame_height_mm == 3.2     # 10 * 80/250, above its 3.0 floor
+    assert p.text_mm == 3.0             # 2.56 -> floor
+    assert p.groove_w_mm == 1.2         # 0.64 -> floor
+    assert p.proud_mm == 0.4            # 0.32 -> floor
+    # absolute params are untouched by size
+    assert (p.base_mm, p.plate_mm, p.cap_mm, p.clearance_mm, p.fit_mm, p.res_mm,
+            p.snow_line_m) == (4.0, 2.0, 0.6, 0.30, 0.2, 0.4, 2000.0)
+
+
+def test_resolve_passes_explicit_values_through_and_is_idempotent():
+    p = poster.resolve(poster.Params(size_mm=80, frame_mm=25.0, groove_w_mm=3.0))
+    assert p.frame_mm == 25.0 and p.groove_w_mm == 3.0
+    assert p.relief_mm == 6.4                      # the rest still auto
+    assert poster.resolve(p) == p
+
+
+def test_resolve_rejects_a_slot_too_narrow_to_print():
+    """clearance eats groove_w from both sides; what is left must still be a
+    printable strip core, or the path snaps off the spool."""
+    with pytest.raises(ValueError, match="groove_w_mm"):
+        poster.resolve(poster.Params(size_mm=250, groove_w_mm=0.8))
+    with pytest.raises(ValueError, match="groove_w_mm"):   # wide gap, same squeeze
+        poster.resolve(poster.Params(size_mm=250, groove_w_mm=1.2, clearance_mm=0.5))
 
 
 def _mpx(p):
@@ -379,12 +426,33 @@ def test_generate_endpoint(monkeypatch):
     assert r.status_code == 200
     import base64
     j = r.json()
-    assert set(j) == {"frame", "relief", "path"}
+    assert set(j) == {"frame", "relief", "path", "resolved"}
+    assert j["resolved"]["frame_mm"] == 4 and j["resolved"]["text"] == "ZRH-GVA"
     frame, relief, path = (base64.b64decode(j[k]) for k in ("frame", "relief", "path"))
     assert path[:5] != b"solid" and len(path) > 84
     assert frame[:2] == b"PK" and relief[:2] == b"PK"      # both 3MFs are zips
     assert [b[0] for b in poster.read_3mf(frame)] == ["frame", "text"]
     assert [b[0] for b in poster.read_3mf(relief)] == ["terrain", "water"]
+
+
+def test_generate_endpoint_auto_scales_at_80mm(monkeypatch):
+    """Empty scaled params at 80mm: the ring really is the resolved 4mm, not 12mm,
+    and the response carries the resolved values for the preview's assembly maths."""
+    from fastapi.testclient import TestClient
+    import app as appmod
+    _fake_fetches(monkeypatch)
+    r = TestClient(appmod.app).post(
+        "/generate", files={"file": ("f.kml", KML.encode())},
+        data={"params": '{"size_mm": 80, "res_mm": 0.5}'})
+    assert r.status_code == 200
+    j = r.json()
+    assert j["resolved"]["frame_mm"] == 4.0 and j["resolved"]["relief_mm"] == 6.4
+    import base64
+    V = poster.read_3mf(base64.b64decode(j["relief"]))[0][1]
+    ext = V[:, 0].max() - V[:, 0].min()
+    # 80 - 2*(4.0 ring + 0.5 ceil'd fit) = 71, less one grid pixel = 70.5.
+    # At the old fixed 12mm ring this would be 54.5.
+    assert abs(ext - 70.5) < 0.5
 
 
 def test_generate_bad_file():
@@ -479,7 +547,7 @@ def test_check_output_passes_on_freshly_built_files(monkeypatch, tmp_path, text)
     (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
     (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
     (tmp_path / "path.stl").write_bytes(path_stl)
-    params = f'{{"size_mm": 40, "frame_mm": 4, "res_mm": 0.5, "text": "{text}"}}'
+    params = json.dumps(asdict(p))   # the checker is handed exactly what was built
     assert check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
                               str(tmp_path / "path.stl"), "--params", params]) == 0
 
@@ -495,8 +563,7 @@ def test_check_output_flags_a_missing_text_body(monkeypatch, tmp_path, capsys):
     (tmp_path / "path.stl").write_bytes(path_stl)
     rc = check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
                             str(tmp_path / "path.stl"),
-                            "--params", '{"size_mm": 40, "frame_mm": 4, '
-                                        '"res_mm": 0.5, "text": "HB-EZE"}'])
+                            "--params", json.dumps(asdict(_params(text="HB-EZE")))])
     assert rc == 1 and "text body" in capsys.readouterr().out
 
 

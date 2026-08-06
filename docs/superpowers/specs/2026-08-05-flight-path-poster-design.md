@@ -215,3 +215,39 @@ It is now its own body in its own filament, at the same height as before.
   `--params text`?" hint is gone with it. Two new rules: a text body present **iff**
   `--params` carries non-empty text, and its z range == `[ring_top, ring_top + 0.8]`
   ±0.01. Usage is `check_output.py frame.3mf relief.3mf path.stl [--params ...]`.
+
+# Addendum 2026-08-06c: visual parameters auto-scale with poster size (approved)
+
+An 80mm poster used to print with the 250mm parameters: a 12mm frame ate 15% of the
+plate per side (vs 5% at 250mm), the 2mm slot looked 3x fatter relative to the terrain,
+and a 20mm relief on an 80mm plate was a tower. Visual parameters now scale with
+`size_mm`; physical/print parameters stay absolute.
+
+`Params`' six visual fields default to `None` ("auto"). `resolve(p) -> Params` (pure,
+`dataclasses.replace`) fills each `None` with `max(floor, round(base * size_mm / 250, 2))`
+and passes explicit values through untouched. `build_poster`'s first line is
+`p = resolve(p)`, so every internal helper still sees concrete mm; `check_output.py`
+resolves identically, so a checker run with the same `--params` computes the same
+expectations. `resolve` is idempotent.
+
+| Param | Kind | Base @250mm | Floor | Why the floor |
+|---|---|---|---|---|
+| `frame_mm` | scaled | 12 | 4.0 | ring must survive handling and hold the plate |
+| `relief_mm` | scaled | 20 | 5.0 | terrain must stay readable |
+| `frame_height_mm` | scaled | 10 | 3.0 | ring must still read as a frame |
+| `text_mm` | scaled | 8 | 3.0 | glyph strokes need >=2px cells at res 0.4 |
+| `groove_w_mm` | scaled | 2 | 1.2 | strip must print and not snap |
+| `proud_mm` | scaled | 1.0 | 0.4 | line must clear the terrain visibly |
+| `size_mm`, `margin_pct`, `exaggeration` | absolute | — | — | driver / already relative |
+| `base_mm` 4, `plate_mm` 2, `cap_mm` 0.6, `clearance_mm` 0.30, `fit_mm` 0.2, `res_mm` 0.4, `snow_line_m` 2000 | absolute | — | — | stiffness / FDM tolerance / real-world metres |
+
+`resolve` also asserts the strip core survives the clearance gaps:
+`groove_w_mm - 2*clearance_mm >= 0.4`, else `ValueError`. The 1.2mm floor clears it at
+the default 0.30mm clearance; the guard exists for explicit narrow overrides.
+
+UI: the scaled numeric inputs (`relief_mm`, `groove_w_mm`) ship blank with
+`placeholder="auto"` — the existing "blank field is not posted" loop already means
+`None` server-side. Because the preview's assembly translation needs the frame width
+and can no longer read it off a blank field, `/generate` returns a fourth key,
+`"resolved"` (`asdict` of the resolved `Params`), and the JS insets the relief plate and
+strip from that instead of from the form (`res_mm`/`fit_mm` constants deleted with it).

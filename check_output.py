@@ -19,7 +19,7 @@ by test_relief_plate_clears_the_frame_ring.
 import argparse, json, sys
 from dataclasses import fields
 import trimesh
-from poster import SLOT_FLOOR_MM, Params, _grid, read_3mf
+from poster import SLOT_FLOOR_MM, Params, _grid, read_3mf, resolve
 
 PLATE_MM = 256.0
 TEXT_MM = 0.8     # build_poster() white text body thickness
@@ -56,7 +56,8 @@ def main(argv=None):
     ap.add_argument("--params", default="{}", help="JSON overrides, Params field names")
     a = ap.parse_args(argv)
     allowed = {f.name for f in fields(Params)}
-    p = Params(**{k: v for k, v in json.loads(a.params).items() if k in allowed})
+    # same resolve() the generator ran: omitted visual params auto-scale with size_mm
+    p = resolve(Params(**{k: v for k, v in json.loads(a.params).items() if k in allowed}))
 
     rows = []
 
