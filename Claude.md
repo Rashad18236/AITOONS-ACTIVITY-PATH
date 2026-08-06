@@ -1,8 +1,8 @@
 # Flight Path Poster
 
 Local web tool that turns a FlightRadar24 track export (KML/CSV) into three 3D-printable files:
-`frame.stl` (black backplate + ring + embossed text), `relief.3mf` (multi-body green terrain /
-blue water / grey high-alpine caps, one AMS slot each) and `path.stl` (the flight-path strip:
+`frame.3mf` (black backplate + ring, white text as its own body), `relief.3mf` (multi-body
+green terrain / blue water / grey high-alpine caps, one AMS slot each) and `path.stl` (the flight-path strip:
 a level red wall standing in a constant-floor slot).
 
 ## Rules
@@ -22,7 +22,7 @@ uv run uvicorn app:app --reload
 ## Architecture
 
 - `app.py` — FastAPI: upload/generate routes, serves `static/`
-- `poster.py` — core: parse track → fetch DEM (AWS Terrain Tiles, terrarium, no key) + water polygons (OSM via Overpass) → compose 2D heightmaps (frame+text, green/water/snow relief, groove) → mesh to `frame.stl` + `relief.3mf` + `path.stl`
+- `poster.py` — core: parse track → fetch DEM (AWS Terrain Tiles, terrarium, no key) + water polygons (OSM via Overpass) → compose 2D heightmaps (frame + text mask, green/water/snow relief, slot) → mesh to `frame.3mf` + `relief.3mf` + `path.stl`
 - `static/index.html` — upload form, parameter sliders, three.js preview, downloads
 - `test_poster.py` — self-check: parse sample track, build small mesh, assert watertight + strip fits groove
 

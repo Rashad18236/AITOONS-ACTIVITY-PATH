@@ -188,3 +188,27 @@ drop both when convenient.
 `check_output.py`'s single "strip z range" rule became two: bottom == `SLOT_FLOOR_MM`
 ±0.01, and top above `bottom + proud_mm` and no higher than the tallest relief body
 + `proud_mm`.
+
+# Addendum 2026-08-06b: frame text printed white (approved)
+
+The 0.8mm text emboss was black-on-black — the frame's own filament — and unreadable.
+It is now its own body in its own filament, at the same height as before.
+
+- `compose_parts` no longer adds the emboss to the frame heightmap; it returns a
+  `text_mask` (N,N bool) of the rendered glyph pixels, empty when no text was asked for.
+- `build_poster` returns `frame_bodies`, a body list like the relief's:
+  `[(frame_mesh, "frame", COLORS["frame"], 1)]` plus, when text is present,
+  `(masked_slab_mesh(text_mask, frame_hm + 0.8, 0.8, res_mm), "text", COLORS["text"], 2)`.
+  New `COLORS["text"] = "#FFFFFF"`. The glyphs stand exactly 0.8mm proud of the ring, as
+  before, but on extruder 2.
+- `write_3mf` already took any body list, so the first deliverable becomes **`frame.3mf`**
+  (black + white, extruders 1/2). The `/generate` response key stays `"frame"`; its bytes
+  are a 3MF now. UI: the download is `frame.3mf` (`model/3mf`) and the preview loads it
+  with the same 3MF group loader, whose colour map gained `frame`/`text` and whose
+  index-order fallback is now passed in per file (`FRAME_ORDER` / `RELIEF_ORDER`).
+- `check_output.py` reads the frame as a 3MF: frame body watertight/winding/volume,
+  footprint == `size_mm` and ≤256mm, flat back, and ring height == `base_mm +
+  frame_height_mm` ±0.01 **exactly** — no emboss allowance, so the old "did you forget
+  `--params text`?" hint is gone with it. Two new rules: a text body present **iff**
+  `--params` carries non-empty text, and its z range == `[ring_top, ring_top + 0.8]`
+  ±0.01. Usage is `check_output.py frame.3mf relief.3mf path.stl [--params ...]`.

@@ -17,12 +17,12 @@ async def generate(file: UploadFile, params: str = Form("{}")):
     except (ValueError, AttributeError) as e:
         raise HTTPException(400, str(e))
     try:
-        frame_stl, bodies, path_stl = core.build_poster(track, core.Params(**kw))
-        relief_3mf = core.write_3mf(bodies)
+        frame_bodies, bodies, path_stl = core.build_poster(track, core.Params(**kw))
+        frame_3mf, relief_3mf = core.write_3mf(frame_bodies), core.write_3mf(bodies)
     except Exception as e:  # DEM/land-cover fetch or meshing failed
         raise HTTPException(502, f"Generation failed: {e}")
     b64 = lambda d: base64.b64encode(d).decode()
-    return {"frame": b64(frame_stl), "relief": b64(relief_3mf), "path": b64(path_stl)}
+    return {"frame": b64(frame_3mf), "relief": b64(relief_3mf), "path": b64(path_stl)}
 
 
 app.mount("/", StaticFiles(directory="static", html=True))

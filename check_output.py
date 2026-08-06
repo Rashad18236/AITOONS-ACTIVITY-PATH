@@ -1,9 +1,10 @@
 """Check generated files against the Flight Path Poster spec.
 
-    uv run python check_output.py frame.stl relief.3mf path.stl
-    uv run python check_output.py frame.stl relief.3mf path.stl --params '{"size_mm":200}'
+    uv run python check_output.py frame.3mf relief.3mf path.stl
+    uv run python check_output.py frame.3mf relief.3mf path.stl --params '{"size_mm":200}'
 
-frame.stl and path.stl are binary STLs, relief.3mf is the multi-body coloured 3MF.
+frame.3mf (black frame + white text) and relief.3mf (green/blue/grey) are multi-body
+coloured 3MFs; path.stl is a binary STL.
 --params takes the same JSON override format as the app: Params field names only,
 unknown keys dropped. Exit 0 if every rule passes, 1 otherwise.
 
@@ -21,7 +22,7 @@ import trimesh
 from poster import SLOT_FLOOR_MM, Params, _grid, read_3mf
 
 PLATE_MM = 256.0
-EMBOSS_MM = 0.8   # compose_parts() text emboss height
+TEXT_MM = 0.8     # build_poster() white text body thickness
 
 
 def _load(path):
@@ -35,21 +36,21 @@ def _load(path):
     return m
 
 
-def _load_3mf(path):
+def _load_3mf(path, first):
     """3MF -> [(name, Trimesh), ...] in build order, or raise."""
     with open(path, "rb") as f:
         data = f.read()
     if data[:2] != b"PK":
         raise ValueError("not a zip, expected 3MF")
     bodies = [(n, trimesh.Trimesh(V, F, process=False)) for n, V, F in read_3mf(data)]
-    if not bodies or bodies[0][0] != "terrain":
-        raise ValueError(f"expected a 'terrain' body first, got {[b[0] for b in bodies]}")
+    if not bodies or bodies[0][0] != first:
+        raise ValueError(f"expected a '{first}' body first, got {[b[0] for b in bodies]}")
     return bodies
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("frame_stl")
+    ap.add_argument("frame_3mf")
     ap.add_argument("relief_3mf")
     ap.add_argument("path_stl")
     ap.add_argument("--params", default="{}", help="JSON overrides, Params field names")
@@ -63,31 +64,35 @@ def main(argv=None):
         rows.append((bool(ok), name, str(got), str(want)))
 
     # 1. all three files load
-    frame = strip = None
-    bodies = []
-    for label, path, load in (("frame", a.frame_stl, _load),
-                              ("strip", a.path_stl, _load),
-                              ("relief", a.relief_3mf, _load_3mf)):
+    strip = None
+    bodies = frame_bodies = []
+    for label, path, load in (("strip", a.path_stl, _load),
+                              ("frame", a.frame_3mf, lambda q: _load_3mf(q, "frame")),
+                              ("relief", a.relief_3mf, lambda q: _load_3mf(q, "terrain"))):
         try:
             got = load(path)
-            if label == "relief":
-                bodies = got
-                chk("relief loads", True, ", ".join(n for n, _ in got), "3MF, terrain first")
+            if label == "strip":
+                strip = got
+                chk("strip loads", True, f"{len(got.faces)} faces", "binary STL")
             else:
+                names = ", ".join(n for n, _ in got)
                 if label == "frame":
-                    frame = got
+                    frame_bodies = got
                 else:
-                    strip = got
-                chk(f"{label} loads", True, f"{len(got.faces)} faces", "binary STL")
+                    bodies = got
+                chk(f"{label} loads", True, names, f"3MF, {got[0][0]} first")
         except Exception as e:
             chk(f"{label} loads", False, f"{type(e).__name__}: {e}", "loadable")
 
-    if frame is not None and strip is not None and bodies:
+    if frame_bodies and strip is not None and bodies:
+        frame = frame_bodies[0][1]
+        text = dict(frame_bodies[1:]).get("text")
         terrain = bodies[0][1]
         caps = bodies[1:]
 
-        # 2. printable solids (caps included — each is its own object in the 3MF)
+        # 2. printable solids (every body is its own object in a 3MF)
         solids = [("frame", frame), ("strip", strip), ("terrain", terrain)]
+        solids += [(f"body {n}", m) for n, m in frame_bodies[1:]]
         solids += [(f"cap {n}", m) for n, m in caps]
         for label, m in solids:
             chk(f"{label} watertight", m.is_watertight, m.is_watertight, True)
@@ -112,18 +117,22 @@ def main(argv=None):
         # 4. flat back at z=0 (bounds min is the lowest vertex, so nothing is below it)
         chk("frame flat back", abs(lo[2]) <= 0.01, f"z_min {lo[2]:.4f}mm", "0 +-0.01")
 
-        # 5. ring height: base + frame_height, plus the text emboss if text was asked for
+        # 5. ring height: base + frame_height, flat — the text is a separate body now
         ring = p.base_mm + p.frame_height_mm
-        want = f"{ring:.2f}mm +-0.01" + (f" (+{EMBOSS_MM}mm emboss)" if p.text else "")
-        # the emboss is not recoverable from the mesh, so an exact EMBOSS_MM overshoot
-        # on a no-text run is almost always a forgotten --params text, not a bad print
-        if not p.text and abs(hi[2] - ring - EMBOSS_MM) <= 0.01:
-            want += "  (hint: if generated with text, pass the same text in --params)"
-        chk("frame ring height",
-            ring - 0.01 <= hi[2] <= ring + (EMBOSS_MM if p.text else 0) + 0.01,
-            f"{hi[2]:.3f}mm", want)
+        chk("frame ring height", abs(hi[2] - ring) <= 0.01,
+            f"{hi[2]:.3f}mm", f"{ring:.2f}mm +-0.01")
 
-        # 6. relief plate footprint == the ring opening less the fit gap. Taken from
+        # 6. white text body: present iff text was asked for, sitting on the ring
+        chk("text body present", (text is not None) == bool(p.text),
+            "yes" if text is not None else "no", "yes" if p.text else "no")
+        if text is not None:
+            tlo, thi = text.bounds
+            chk("text body z range",
+                abs(tlo[2] - ring) <= 0.01 and abs(thi[2] - ring - TEXT_MM) <= 0.01,
+                f"[{tlo[2]:.3f}, {thi[2]:.3f}]mm",
+                f"[{ring:.2f}, {ring + TEXT_MM:.2f}]mm +-0.01")
+
+        # 7. relief plate footprint == the ring opening less the fit gap. Taken from
         # _grid(), not re-derived: frame_mm/res_mm truncates (12/0.4 -> 29 px, not 30),
         # so a params-only formula is off by a pixel or two before anything is wrong.
         M = _grid(p)[1]
@@ -134,7 +143,7 @@ def main(argv=None):
                 f"{ext:.2f}mm", f"{want:.2f}mm +-0.5 (size-2*frame-2*fit, gridded)")
         chk("relief flat back", abs(rlo[2]) <= 0.01, f"z_min {rlo[2]:.4f}mm", "0 +-0.01")
 
-        # 7. caps sit on the terrain: inside its footprint, and no higher than the
+        # 8. caps sit on the terrain: inside its footprint, and no higher than the
         # terrain top plus cap_mm (the terrain is carved down by exactly cap_mm
         # under a cap, so surface = terrain + cap_mm there — that bound is tight)
         cap_hi = rhi[2] + p.cap_mm + 0.01
@@ -147,14 +156,14 @@ def main(argv=None):
             chk(f"cap {name} z range", clo[2] >= rlo[2] - 0.01 and chi[2] <= cap_hi,
                 f"[{clo[2]:.3f}, {chi[2]:.3f}]mm", f"in [{rlo[2]:.3f}, {cap_hi:.3f}]mm")
 
-        # 8. strip stays inside the relief plate it drops into (same local frame)
+        # 9. strip stays inside the relief plate it drops into (same local frame)
         for i, axis in enumerate("xy"):
             chk(f"strip inside relief {axis}",
                 slo[i] >= rlo[i] - 0.5 and shi[i] <= rhi[i] + 0.5,
                 f"[{slo[i]:.2f}, {shi[i]:.2f}]mm",
                 f"in [{rlo[i]:.2f}, {rhi[i]:.2f}]mm +-0.5")
 
-        # 9. strip is a level wall seated on the constant slot floor: bottom exactly
+        # 10. strip is a level wall seated on the constant slot floor: bottom exactly
         # SLOT_FLOOR_MM, top proud of the highest terrain the track crosses (which is
         # at most the highest point of the whole relief).
         z_hi = max(m.bounds[1][2] for _, m in bodies) + p.proud_mm + 0.01

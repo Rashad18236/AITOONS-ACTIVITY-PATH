@@ -237,13 +237,18 @@ def test_strip_seats_in_groove_at_every_angle():
             f"res={res}: groove pinches to {w.min():.2f}mm, nominal {p.groove_w_mm}mm"
 
 
-def test_compose_parts_text_embossed():
+def test_compose_parts_text_is_a_mask_not_an_emboss():
+    """Text is printed white as its own body, so the frame heightmap stays flat —
+    the glyph pixels come back as a mask instead."""
     p, N, fpx, elev, track, bounds = _synthetic()
     M = _mpx(p)
-    p2 = _params(text="TEST", text_mm=3.0)
-    frame = poster.compose_parts(track, elev, np.zeros((M, M), np.uint8), bounds, p2)["frame"]
-    bar = frame[N - fpx:, :]
-    assert bar.max() > p.base_mm + p.frame_height_mm       # something raised on bottom bar
+    lc = np.zeros((M, M), np.uint8)
+    parts = poster.compose_parts(track, elev, lc, bounds, _params(text="TEST", text_mm=3.0))
+    frame, tm = parts["frame"], parts["text_mask"]
+    assert frame.max() == p.base_mm + p.frame_height_mm    # ring is flat, nothing embossed
+    assert tm.shape == (N, N) and tm.dtype == bool
+    assert tm.any() and tm[:N - fpx, :].sum() == 0         # glyphs live on the bottom bar
+    assert not poster.compose_parts(track, elev, lc, bounds, _params())["text_mask"].any()
 
 
 def test_heightmap_mesh_watertight():
@@ -307,13 +312,33 @@ def _fake_fetches(monkeypatch, water=False, elev_top=500.0):
 
 def test_build_poster_v2(monkeypatch):
     _fake_fetches(monkeypatch)
-    frame_stl, bodies, path_stl = poster.build_poster(TRACK3, _params())
-    assert frame_stl[:5] != b"solid" and len(frame_stl) > 84   # binary STL
+    frame_bodies, bodies, path_stl = poster.build_poster(TRACK3, _params())
+    assert [b[1] for b in frame_bodies] == ["frame"]            # no text asked for
+    assert frame_bodies[0][2] == poster.COLORS["frame"] and frame_bodies[0][3] == 1
+    assert frame_bodies[0][0].is_watertight and frame_bodies[0][0].volume > 0
     names = [b[1] for b in bodies]
     assert names == ["terrain"]                  # dry, below the snow line -> no caps
     assert bodies[0][2] == poster.COLORS["green"] and bodies[0][3] == 1
     assert bodies[0][0].is_watertight and bodies[0][0].volume > 0
     assert path_stl[:5] != b"solid" and len(path_stl) > 84
+
+
+def test_build_poster_text_is_its_own_white_body(monkeypatch):
+    """Text prints white on the black frame: a second body sitting exactly 0.8mm
+    proud of the ring, not an emboss in the frame's own filament."""
+    _fake_fetches(monkeypatch)
+    p = _params(text="HB-EZE")
+    frame_bodies, _, _ = poster.build_poster(TRACK3, p)
+    assert [b[1] for b in frame_bodies] == ["frame", "text"]
+    text = frame_bodies[1]
+    assert text[2] == poster.COLORS["text"] == "#FFFFFF" and text[3] == 2
+    m = text[0]
+    assert m.is_watertight and m.is_winding_consistent and m.volume > 0
+    ring = p.base_mm + p.frame_height_mm
+    assert abs(m.bounds[0][2] - ring) < 1e-6                   # sits on the ring...
+    assert abs(m.bounds[1][2] - (ring + 0.8)) < 1e-6           # ...0.8mm proud, as before
+    frame = frame_bodies[0][0]
+    assert abs(frame.bounds[1][2] - ring) < 1e-6               # frame itself stays flat
 
 
 def test_build_poster_emits_water_cap(monkeypatch):
@@ -356,9 +381,9 @@ def test_generate_endpoint(monkeypatch):
     j = r.json()
     assert set(j) == {"frame", "relief", "path"}
     frame, relief, path = (base64.b64decode(j[k]) for k in ("frame", "relief", "path"))
-    assert frame[:5] != b"solid" and len(frame) > 84       # binary STL
     assert path[:5] != b"solid" and len(path) > 84
-    assert relief[:2] == b"PK"                             # 3MF is a zip
+    assert frame[:2] == b"PK" and relief[:2] == b"PK"      # both 3MFs are zips
+    assert [b[0] for b in poster.read_3mf(frame)] == ["frame", "text"]
     assert [b[0] for b in poster.read_3mf(relief)] == ["terrain", "water"]
 
 
@@ -444,19 +469,35 @@ def test_3mf_roundtrip():
 
 
 
-def test_check_output_passes_on_freshly_built_files(monkeypatch, tmp_path):
-    """The shipped checker agrees with the shipped builder — in particular that the
-    strip really does bottom out on the constant slot floor."""
+@pytest.mark.parametrize("text", ["HB-EZE", ""])
+def test_check_output_passes_on_freshly_built_files(monkeypatch, tmp_path, text):
+    """The shipped checker agrees with the shipped builder, text body or not."""
     import check_output
     _fake_fetches(monkeypatch, water=True)
-    frame_stl, bodies, path_stl = poster.build_poster(TRACK3, _params(text="HB-EZE"))
-    (tmp_path / "frame.stl").write_bytes(frame_stl)
+    p = _params(text=text)
+    frame_bodies, bodies, path_stl = poster.build_poster(TRACK3, p)
+    (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
     (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
     (tmp_path / "path.stl").write_bytes(path_stl)
-    assert check_output.main([str(tmp_path / "frame.stl"), str(tmp_path / "relief.3mf"),
-                              str(tmp_path / "path.stl"), "--params",
-                              '{"size_mm": 40, "frame_mm": 4, "res_mm": 0.5, '
-                              '"text": "HB-EZE"}']) == 0
+    params = f'{{"size_mm": 40, "frame_mm": 4, "res_mm": 0.5, "text": "{text}"}}'
+    assert check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
+                              str(tmp_path / "path.stl"), "--params", params]) == 0
+
+
+def test_check_output_flags_a_missing_text_body(monkeypatch, tmp_path, capsys):
+    """Text asked for but no white body in the frame 3MF is a real failure now,
+    not a hint — the body is recoverable from the mesh, unlike the old emboss."""
+    import check_output
+    _fake_fetches(monkeypatch)
+    frame_bodies, bodies, path_stl = poster.build_poster(TRACK3, _params())   # no text
+    (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
+    (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
+    (tmp_path / "path.stl").write_bytes(path_stl)
+    rc = check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
+                            str(tmp_path / "path.stl"),
+                            "--params", '{"size_mm": 40, "frame_mm": 4, '
+                                        '"res_mm": 0.5, "text": "HB-EZE"}'])
+    assert rc == 1 and "text body" in capsys.readouterr().out
 
 
 def test_elevation_always_uses_the_fit_zoom(monkeypatch):

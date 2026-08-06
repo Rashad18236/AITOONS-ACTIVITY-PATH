@@ -135,8 +135,8 @@ def fetch_elevation(bounds, px_out):
     return np.asarray(Image.fromarray(elev, "F").resize((px_out, px_out), Image.BILINEAR))
 
 
-COLORS = {"frame": "#222222", "green": "#4CAF50", "water": "#2196F3",
-          "snow": "#9E9E9E", "strip": "#CC2222"}
+COLORS = {"frame": "#222222", "text": "#FFFFFF", "green": "#4CAF50",
+          "water": "#2196F3", "snow": "#9E9E9E", "strip": "#CC2222"}
 
 # Constant z the slot is carved down to, so the level strip seats on a flat floor
 # whatever terrain it crosses. Keeps the relief plate connected under the slot;
@@ -321,7 +321,9 @@ def _groove_mask(track_px, shape, p):
 def compose_parts(track, elev, lc, bounds, p):
     """Split the poster into its printable pieces, all heights in mm.
 
-    frame (N,N): backplate + raised ring + embossed text — printed alone.
+    frame (N,N): backplate + raised ring, flat — printed alone.
+    text_mask (N,N): the glyph pixels, printed as their own white body on top of
+    the ring (empty when no text was asked for).
     green/surface/water/snow/track_px: the (M,M) relief plate that drops into the
     ring, its pre-slot pre-cap top, the two colour-cap vertex masks, and the
     track in relief-plate pixels."""
@@ -330,6 +332,7 @@ def compose_parts(track, elev, lc, bounds, p):
     ring = np.ones((N, N), bool)
     ring[fpx:N - fpx, fpx:N - fpx] = False
     frame[ring] = p.base_mm + p.frame_height_mm
+    text_mask = np.zeros((N, N), bool)
     if p.text:
         img = Image.new("L", (N, N))
         d = ImageDraw.Draw(img)
@@ -337,7 +340,7 @@ def compose_parts(track, elev, lc, bounds, p):
         w = d.textlength(p.text, font=font)
         d.text(((N - w) / 2, N - fpx + (fpx - p.text_mm / p.res_mm) / 2),
                p.text, fill=255, font=font)
-        frame[np.asarray(img) > 0] += 0.8  # emboss height, mm
+        text_mask = np.asarray(img) > 0
     e0, e1 = float(elev.min()), float(elev.max())
     surface = p.plate_mm + (elev - e0) / max(e1 - e0, 1e-9) * p.relief_mm * p.exaggeration
     # project track into relief-plate pixels (row 0 = north)
@@ -354,7 +357,7 @@ def compose_parts(track, elev, lc, bounds, p):
     snow = (lc == 2) & ~gmask & border
     green = surface - p.cap_mm * (water | snow)
     green[gmask] = SLOT_FLOOR_MM        # full-depth slot, constant floor
-    return dict(frame=frame, green=green, surface=surface,
+    return dict(frame=frame, text_mask=text_mask, green=green, surface=surface,
                 water=water, snow=snow, track_px=track_px)
 
 
@@ -478,7 +481,9 @@ def strip_mesh(track_px, surface, p):
 
 
 def build_poster(track, p=Params()):
-    """Track -> (frame_stl, [(mesh, name, hex_colour, slot), ...], path_strip_stl)."""
+    """Track -> (frame_bodies, relief_bodies, path_strip_stl).
+
+    Both body lists are [(mesh, name, hex_colour, extruder_slot), ...] for write_3mf."""
     # ponytail: reject rather than clamp — a typo'd 2500mm is a mistake to surface,
     # not to silently honour, and N^2 grids OOM the box. Raise the cap if a bigger
     # plate ever shows up.
@@ -503,9 +508,13 @@ def build_poster(track, p=Params()):
         cap = masked_slab_mesh(parts[key], parts["surface"], p.cap_mm, p.res_mm)
         if cap is not None:
             bodies.append((cap, name, COLORS[key], slot))
+    frame_bodies = [(heightmap_mesh(parts["frame"], p.res_mm), "frame", COLORS["frame"], 1)]
+    # text is its own white body standing 0.8mm proud of the ring, printed in slot 2
+    text = masked_slab_mesh(parts["text_mask"], parts["frame"] + 0.8, 0.8, p.res_mm)
+    if text is not None:
+        frame_bodies.append((text, "text", COLORS["text"], 2))
     strip = strip_mesh(parts["track_px"], parts["surface"], p)
-    return (heightmap_mesh(parts["frame"], p.res_mm).export(file_type="stl"),
-            bodies, strip.export(file_type="stl"))
+    return frame_bodies, bodies, strip.export(file_type="stl")
 
 
 def write_3mf(bodies):
