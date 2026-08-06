@@ -357,8 +357,8 @@ def test_build_poster_rejects_oversized_grid():
         poster.build_poster(track, _params(size_mm=2500.0))   # typo, not a request
     with pytest.raises(ValueError):
         poster.build_poster(track, _params(res_mm=0.01))
-    with pytest.raises(ValueError):   # groove would cut clean through the relief plate
-        poster.build_poster(track, _params(plate_mm=1.0, groove_d_mm=1.5))
+    with pytest.raises(ValueError):   # slot floor would reach the back of the relief plate
+        poster.build_poster(track, _params(plate_mm=1.0))
 
 
 def test_build_poster_rejects_cap_thicker_than_plate(monkeypatch):

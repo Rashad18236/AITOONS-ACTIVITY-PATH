@@ -181,9 +181,12 @@ subtracting `groove_d_mm`, so the slot's **depth** varies with the terrain while
 `plate_mm > groove_d_mm` guard. Cap masks still exclude the slot, and the width fit
 (`groove_w_mm − 2·clearance_mm`) is unchanged, so the seat invariant holds as before.
 
-Consequence, accepted: `Params.groove_d_mm` (and its "Groove depth mm" UI slider) no
-longer has any effect — slot depth is derived now. Left in place rather than removed;
-drop both when convenient.
+Consequence: `Params.groove_d_mm` had no effect once slot depth became derived, so the
+field, its "Groove depth mm" UI slider and the slider's id-loop entry are **deleted**.
+The surviving `groove_w_mm` is relabelled "Path slot width mm" in the UI. The
+`plate_mm` guard pair is now `SLOT_FLOOR_MM` and `cap_mm` — both must be strictly less
+than the plate thickness, for the same reason as before (the slot must not reach the
+back of the plate, and a colour cap must not push the terrain negative).
 
 `check_output.py`'s single "strip z range" rule became two: bottom == `SLOT_FLOOR_MM`
 ±0.01, and top above `bottom + proud_mm` and no higher than the tallest relief body

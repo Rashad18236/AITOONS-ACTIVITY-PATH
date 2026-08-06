@@ -276,15 +276,14 @@ class Params:
     margin_pct: float = 15.0
     frame_mm: float = 12.0
     frame_height_mm: float = 10.0
-    groove_w_mm: float = 2.0
-    groove_d_mm: float = 1.5
+    groove_w_mm: float = 2.0   # slot width; its depth is derived, see SLOT_FLOOR_MM
     clearance_mm: float = 0.30  # per side; FDM PLA seating margin (rasterisation ±1px + elephant-foot)
     text: str = ""
     text_mm: float = 8.0
     res_mm: float = 0.4
     proud_mm: float = 1.0
     cap_mm: float = 0.6      # colour-cap slab thickness
-    plate_mm: float = 2.0    # relief plate base thickness (groove floor sits above 0)
+    plate_mm: float = 2.0    # relief plate base thickness (slot floor sits above 0)
     fit_mm: float = 0.2      # gap per side between relief plate and frame ring
     snow_line_m: float = 2000.0   # grey caps above this DEM elevation
 

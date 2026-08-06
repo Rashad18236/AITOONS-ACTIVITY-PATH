@@ -24,7 +24,7 @@ uv run uvicorn app:app --reload
 - `app.py` — FastAPI: upload/generate routes, serves `static/`
 - `poster.py` — core: parse track → fetch DEM (AWS Terrain Tiles, terrarium, no key) + water polygons (OSM via Overpass) → compose 2D heightmaps (frame + text mask, green/water/snow relief, slot) → mesh to `frame.3mf` + `relief.3mf` + `path.stl`
 - `static/index.html` — upload form, parameter sliders, three.js preview, downloads
-- `test_poster.py` — self-check: parse sample track, build small mesh, assert watertight + strip fits groove
+- `test_poster.py` — self-check: parse sample track, build small mesh, assert watertight + strip fits slot
 
 Key invariant: every body comes off the same heightmap, so they always fit. The relief plate glues into the frame ring (fit clearance ceil-rounded up to a whole pixel, ≥0.2mm per side — rounding down gives an interference fit); the strip glues into the slot with 0.30mm per side. The slot is carved to a constant `SLOT_FLOOR_MM = 1.0` floor (depth varies with terrain, the floor does not), and the strip is a level wall from that floor to `proud_mm` above the highest terrain the track crosses.
 
