@@ -619,14 +619,18 @@ def build_poster(track, p=Params()):
 def write_3mf(bodies):
     """[(mesh, name, "#RRGGBB", extruder_slot), ...] -> 3MF zip bytes.
 
-    Core-spec 3MF (one <object> per body, <basematerials> for the display colour)
-    plus Bambu's Metadata/model_settings.config, which maps each object to a
-    filament slot. Written by hand: trimesh's 3MF support is export-only via
-    lib3mf and carries neither per-object colour nor the Bambu config."""
+    ONE build item: the bodies are components of a single container object, the
+    standard 3MF/Bambu multi-part form. One <item> per body made Bambu Studio treat
+    them as N independent models, drop each to the bed and auto-arrange — which
+    destroys the co-registration every body is meshed to share.
+    Per-body <basematerials> stay for the display colour in non-Bambu viewers;
+    the filament slots live in Bambu's Metadata/model_settings.config, per <part>
+    (the old object-level extruder key left the slots unassigned). Written by hand:
+    trimesh's 3MF support is export-only via lib3mf and carries neither."""
     import zipfile
     # ponytail: f-string per vertex/triangle — ~2M lines and a few seconds at default
     # res. Swap in np.savetxt or a binary extension only if generation time hurts.
-    objs, items, cfg = [], [], ['<?xml version="1.0" encoding="UTF-8"?>\n<config>']
+    objs, comps, parts = [], [], []
     for oid, (m, name, color, slot) in enumerate(bodies, 1):
         vs = "".join(f'<vertex x="{v[0]:.3f}" y="{v[1]:.3f}" z="{v[2]:.3f}"/>' for v in m.vertices)
         ts = "".join(f'<triangle v1="{f[0]}" v2="{f[1]}" v3="{f[2]}"/>' for f in m.faces)
@@ -634,14 +638,23 @@ def write_3mf(bodies):
             f'<basematerials id="{oid + 100}"><base name="{name}" displaycolor="{color}FF"/></basematerials>'
             f'<object id="{oid}" name="{name}" type="model" pid="{oid + 100}" pindex="0">'
             f'<mesh><vertices>{vs}</vertices><triangles>{ts}</triangles></mesh></object>')
-        items.append(f'<item objectid="{oid}" printable="1"/>')
-        cfg.append(f'<object id="{oid}"><metadata key="name" value="{name}"/>'
-                   f'<metadata key="extruder" value="{slot}"/></object>')
-    cfg.append('</config>')
+        # identity transform: the bodies are already meshed in one shared world frame
+        comps.append(f'<component objectid="{oid}" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>')
+        parts.append(f'<part id="{oid}" subtype="normal_part">'
+                     f'<metadata key="name" value="{name}"/>'
+                     f'<metadata key="extruder" value="{slot}"/></part>')
+    cid = len(bodies) + 1
+    top = bodies[0][1] if bodies else "model"
+    objs.append(f'<object id="{cid}" name="{top}" type="model">'
+                f'<components>{"".join(comps)}</components></object>')
+    cfg = ('<?xml version="1.0" encoding="UTF-8"?>\n<config>\n'
+           f'<object id="{cid}"><metadata key="name" value="{top}"/>{"".join(parts)}</object>\n'
+           '</config>')
     model = ('<?xml version="1.0" encoding="UTF-8"?>'
              '<model unit="millimeter" xml:lang="en-US" '
              'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
-             f'<resources>{"".join(objs)}</resources><build>{"".join(items)}</build></model>')
+             f'<resources>{"".join(objs)}</resources>'
+             f'<build><item objectid="{cid}" printable="1"/></build></model>')
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("[Content_Types].xml",
@@ -656,7 +669,7 @@ def write_3mf(bodies):
             '<Relationship Target="/3D/3dmodel.model" Id="rel-1" '
             'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>')
         z.writestr("3D/3dmodel.model", model)
-        z.writestr("Metadata/model_settings.config", "\n".join(cfg))
+        z.writestr("Metadata/model_settings.config", cfg)
     return buf.getvalue()
 
 
@@ -665,14 +678,19 @@ def read_3mf(data):
 
     Reads what write_3mf writes, for tests and check_output.py."""
     import zipfile
-    # ponytail: regex over XML — we generated it, single namespace, no <components>
+    # ponytail: split over XML — we generated it, single namespace, objects don't nest.
+    # The mesh-less container object write_3mf appends has no <vertices> and drops out.
     z = zipfile.ZipFile(io.BytesIO(data))
     xml = z.read("3D/3dmodel.model").decode()
     out = []
-    for om in re.finditer(r'<object[^>]*name="([^"]*)"[^>]*>.*?<vertices>(.*?)</vertices>'
-                          r'<triangles>(.*?)</triangles>', xml, re.S):
-        name, vs, ts = om.groups()
-        V = np.array(re.findall(r'x="([^"]+)" y="([^"]+)" z="([^"]+)"', vs), float)
-        F = np.array(re.findall(r'v1="(\d+)" v2="(\d+)" v3="(\d+)"', ts), int)
-        out.append((name, V, F))
+    for chunk in xml.split("<object ")[1:]:
+        obj = chunk.split("</object>", 1)[0]
+        name = re.search(r'name="([^"]*)"', obj)
+        vs = re.search(r"<vertices>(.*?)</vertices>", obj, re.S)
+        ts = re.search(r"<triangles>(.*?)</triangles>", obj, re.S)
+        if not (name and vs and ts):
+            continue
+        V = np.array(re.findall(r'x="([^"]+)" y="([^"]+)" z="([^"]+)"', vs.group(1)), float)
+        F = np.array(re.findall(r'v1="(\d+)" v2="(\d+)" v3="(\d+)"', ts.group(1)), int)
+        out.append((name.group(1), V, F))
     return out

@@ -640,6 +640,106 @@ def test_3mf_roundtrip():
     assert 'value="1"' in cfg and 'value="2"' in cfg
 
 
+CORE_NS = {"m": "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"}
+
+
+def _three_body_3mf():
+    import zipfile, io as _io
+    meshes = [poster.heightmap_mesh(np.full((4, 4), 2.0), 1.0),
+              poster.heightmap_mesh(np.full((3, 3), 1.0), 1.0),
+              poster.heightmap_mesh(np.full((3, 3), 3.0), 1.0)]
+    bodies = list(zip(meshes, ["terrain", "water", "snow"],
+                      ["#4CAF50", "#2196F3", "#9E9E9E"], [1, 2, 3]))
+    return bodies, zipfile.ZipFile(_io.BytesIO(poster.write_3mf(bodies)))
+
+
+def test_3mf_is_one_multi_part_object():
+    """Bambu Studio drops every <item> to the bed and auto-arranges it, so N items
+    means N scattered bodies and the co-registration is destroyed. Exactly one item,
+    pointing at a container object that holds every body as an identity component."""
+    import xml.etree.ElementTree as ET
+    bodies, z = _three_body_3mf()
+    root = ET.fromstring(z.read("3D/3dmodel.model"))
+
+    items = root.findall("m:build/m:item", CORE_NS)
+    assert len(items) == 1, [i.get("objectid") for i in items]
+    objs = {o.get("id"): o for o in root.findall("m:resources/m:object", CORE_NS)}
+    assert sorted(objs, key=int) == ["1", "2", "3", "4"]
+    cid = items[0].get("objectid")
+    assert cid == "4"                                   # container is n+1, after the bodies
+
+    container = objs[cid]
+    assert container.get("type") == "model" and container.find("m:mesh", CORE_NS) is None
+    comps = container.findall("m:components/m:component", CORE_NS)
+    assert [c.get("objectid") for c in comps] == ["1", "2", "3"]   # every body, exactly once
+    for c in comps:      # bodies already share the world origin — nothing to transform
+        assert c.get("transform") == "1 0 0 0 1 0 0 0 1 0 0 0"
+    for oid in ("1", "2", "3"):
+        assert objs[oid].get("type") == "model"
+        assert objs[oid].find("m:mesh", CORE_NS) is not None
+    # display colours stay per body, so non-Bambu viewers still show them
+    assert len(root.findall("m:resources/m:basematerials", CORE_NS)) == 3
+
+
+def test_3mf_config_maps_every_part_to_its_extruder():
+    """The old object-level extruder key left the slots unassigned in Bambu; a
+    multi-part object carries them per <part>, and each part is a real object id."""
+    import xml.etree.ElementTree as ET
+    bodies, z = _three_body_3mf()
+    ids = {o.get("id") for o in
+           ET.fromstring(z.read("3D/3dmodel.model")).findall("m:resources/m:object", CORE_NS)}
+    cfg = ET.fromstring(z.read("Metadata/model_settings.config"))
+    objs = cfg.findall("object")
+    assert len(objs) == 1 and objs[0].get("id") == "4"
+    assert objs[0].find('metadata[@key="name"]') is not None
+    parts = objs[0].findall("part")
+    assert [pt.get("id") for pt in parts] == ["1", "2", "3"]
+    assert all(pt.get("id") in ids for pt in parts)          # no dangling part -> object ref
+    assert all(pt.get("subtype") == "normal_part" for pt in parts)
+    assert [(pt.find('metadata[@key="name"]').get("value"),
+             pt.find('metadata[@key="extruder"]').get("value")) for pt in parts] == \
+        [("terrain", "1"), ("water", "2"), ("snow", "3")]
+
+
+def test_3mf_roundtrip_skips_the_container():
+    """read_3mf feeds the tests and check_output.py: the mesh-less container must
+    not show up as a body, and body order must survive."""
+    bodies, _ = _three_body_3mf()
+    got = poster.read_3mf(poster.write_3mf([b for b in bodies]))
+    assert [g[0] for g in got] == ["terrain", "water", "snow"]
+    for (m, name, _, _), (_, V, F) in zip(bodies, got):
+        assert np.allclose(V, m.vertices, atol=1e-3) and (F == m.faces).all()
+
+
+def _text_body(**kw):
+    """The shipped 250mm text case, without paying for a whole build_poster."""
+    p = poster.resolve(poster.Params(size_mm=250.0, text="HB-EZE", **kw))
+    M = poster._grid(p)[1]
+    track = np.array([[47.0, 8.0, 0.0], [47.5, 9.0, 3000.0]])
+    parts = poster.compose_parts(track, np.zeros((M, M), np.float32),
+                                 np.zeros((M, M), np.uint8),
+                                 poster.track_bounds(track, p.margin_pct), p)
+    return p, parts, poster.masked_slab_mesh(parts["text_mask"], parts["frame"] + 0.8,
+                                             0.8, p.res_mm)
+
+
+def test_frame_text_meshes_into_readable_glyphs():
+    """Regression: load_default's ~1px strokes never filled a whole 4-corner cell,
+    so masked_slab_mesh ate the glyphs and left 840 vertices of slivers. A real
+    TrueType face plus a 1px dilation makes every glyph pixel cell-interior."""
+    p, parts, text = _text_body()
+    assert text is not None
+    assert len(text.vertices) >= 5000, f"only {len(text.vertices)} verts — still slivers"
+    assert text.is_watertight and text.is_winding_consistent and text.volume > 0
+    # constant-thickness slab: volume / thickness IS the meshed footprint area
+    mask_area = parts["text_mask"].sum() * p.res_mm ** 2
+    assert text.volume / 0.8 >= 0.8 * mask_area, \
+        f"meshed {text.volume / 0.8:.1f}mm2 of a {mask_area:.1f}mm2 mask"
+    # z semantics unchanged: bottom on the ring top, 0.8mm proud
+    ring = p.base_mm + p.frame_height_mm
+    assert abs(text.bounds[0][2] - ring) < 1e-6
+    assert abs(text.bounds[1][2] - (ring + 0.8)) < 1e-6
+    assert parts["frame"].max() == ring                       # ring still flat
 
 
 
