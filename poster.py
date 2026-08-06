@@ -160,6 +160,27 @@ def _closed(mask, k):
     return np.asarray(img) > 0
 
 
+# A real face, in fallback order. load_default() is a bitmap font whose strokes are
+# ~1px wide at res 0.4 — masked_slab_mesh needs all four corners of a cell, so those
+# glyphs mesh as slivers or vanish. No new dependency, no bundled font: use what the
+# box has, and fall back to the bitmap if it has nothing.
+FONT_PATHS = ("/System/Library/Fonts/Helvetica.ttc",
+              "/System/Library/Fonts/Supplemental/Arial.ttf",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+              "/usr/share/fonts/dejavu/DejaVuSans.ttf")
+
+
+def _font(px):
+    for path in FONT_PATHS:
+        try:
+            f = ImageFont.truetype(path, px)
+            f.getlength("M")   # Helvetica.ttc raises "division by zero" below ~8px
+            return f
+        except Exception:
+            pass
+    return ImageFont.load_default(size=px)
+
+
 def _snow_mask(elev, p):
     """Grey caps: threshold, then close+open at the smallest printable blob width.
 
@@ -402,11 +423,26 @@ def compose_parts(track, elev, lc, bounds, p):
     if p.text:
         img = Image.new("L", (N, N))
         d = ImageDraw.Draw(img)
-        font = ImageFont.load_default(size=max(int(p.text_mm / p.res_mm), 6))
-        w = d.textlength(p.text, font=font)
-        d.text(((N - w) / 2, N - fpx + (fpx - p.text_mm / p.res_mm) / 2),
+        # Target ink height: text_mm, but never taller than the ring band it sits on
+        # (frame_mm can be smaller than text_mm), leaving 2px each side for the
+        # dilation below. fpx >= 8 always (frame_mm floors at 4mm, res_mm caps at 0.5).
+        px = max(min(int(p.text_mm / p.res_mm), fpx - 4), 6)
+        font = _font(px)
+        # Size by measured ink, not em: an em box is ~30% taller than its capitals, so
+        # `px` as the em left 14px-tall glyphs whose strokes the 1px dilation below
+        # fattened shut (B's counters filled). Scaling to a px-tall ink box keeps the
+        # strokes wide enough that the counters survive the dilation.
+        ink = font.getbbox(p.text)
+        if ink[3] > ink[1]:
+            font = _font(max(round(px * px / (ink[3] - ink[1])), 6))
+            ink = font.getbbox(p.text)
+        h = ink[3] - ink[1]
+        d.text(((N - (ink[2] - ink[0])) / 2 - ink[0], N - fpx + (fpx - h) / 2 - ink[1]),
                p.text, fill=255, font=font)
-        text_mask = np.asarray(img) > 0
+        # Dilate 1px: masked_slab_mesh only meshes cells with all four corners set, so
+        # a stroke survives only where every glyph pixel is cell-interior. After a
+        # MaxFilter(3) each original pixel has all 8 neighbours, i.e. four full cells.
+        text_mask = np.asarray(img.filter(ImageFilter.MaxFilter(3))) > 0
     e0, e1 = float(elev.min()), float(elev.max())
     to_mm = lambda m: p.plate_mm + (m - e0) / max(e1 - e0, 1e-9) * p.relief_mm * p.exaggeration
     surface = to_mm(elev)
