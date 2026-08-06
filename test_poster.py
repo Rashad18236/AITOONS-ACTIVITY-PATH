@@ -1,4 +1,5 @@
 import io
+import os
 
 import numpy as np
 import pytest
@@ -153,13 +154,13 @@ def test_compose_parts_shapes_and_caps():
     M = _mpx(p)
     lc = np.zeros((M, M), np.uint8)
     lc[5:15, 5:15] = 1                                     # water square, away from track
-    lc[30:40, 30:40] = 2                                   # city square
+    lc[30:40, 30:40] = 2                                   # snow square
     lc[0, 20:30] = 1                                       # water touching the plate edge
     parts = poster.compose_parts(track, elev, lc, bounds, p)
     assert parts["frame"].shape == (N, N) and parts["green"].shape == (M, M)
     assert parts["frame"][0, 0] == p.base_mm + p.frame_height_mm
     assert parts["green"].min() >= p.plate_mm - p.groove_d_mm - p.cap_mm - 1e-6
-    w, c = parts["water"], parts["city"]
+    w, c = parts["water"], parts["snow"]
     assert w[10, 10] and not w[0, 0]                       # inside square, outside it
     assert not w[0, 25]                                    # 1px border excluded
     assert c[35, 35] and not c[10, 10]
@@ -168,7 +169,7 @@ def test_compose_parts_shapes_and_caps():
     assert abs(parts["surface"][35, 35] - parts["green"][35, 35] - p.cap_mm) < 1e-9
     # groove cells are never cap cells — a cap slab there would fight the strip
     gmask = poster._groove_mask(parts["track_px"], (M, M), p)
-    assert gmask[30:40, 30:40].any()      # the groove really does cross the city square
+    assert gmask[30:40, 30:40].any()      # the groove really does cross the snow square
     assert not (w | c)[gmask].any()
     # so every cell drops by at most one of the two, never both stacked
     drop = parts["surface"] - parts["green"]
@@ -265,11 +266,11 @@ def test_strip_mesh_geometry():
 TRACK3 = np.array([[47.0, 8.0, 0], [47.2, 8.4, 2000], [47.5, 9.0, 3000]])
 
 
-def _fake_fetches(monkeypatch, lc_code=0):
+def _fake_fetches(monkeypatch, water=False, elev_top=500.0):
     monkeypatch.setattr(poster, "fetch_elevation",
-                        lambda b, px: np.tile(np.linspace(0, 500, px), (px, 1)))
-    monkeypatch.setattr(poster, "fetch_landcover",
-                        lambda b, px, k, c: np.full((px, px), lc_code, np.uint8))
+                        lambda b, px: np.tile(np.linspace(0, elev_top, px), (px, 1)))
+    monkeypatch.setattr(poster, "fetch_water_mask",
+                        lambda b, px: np.full((px, px), water, bool))
 
 
 def test_build_poster_v2(monkeypatch):
@@ -277,38 +278,20 @@ def test_build_poster_v2(monkeypatch):
     frame_stl, bodies, path_stl = poster.build_poster(TRACK3, _params())
     assert frame_stl[:5] != b"solid" and len(frame_stl) > 84   # binary STL
     names = [b[1] for b in bodies]
-    assert names == ["terrain"]                  # all-green lc -> caps absent
+    assert names == ["terrain"]                  # dry, below the snow line -> no caps
     assert bodies[0][2] == poster.COLORS["green"] and bodies[0][3] == 1
     assert bodies[0][0].is_watertight and bodies[0][0].volume > 0
     assert path_stl[:5] != b"solid" and len(path_stl) > 84
 
 
 def test_build_poster_emits_water_cap(monkeypatch):
-    _fake_fetches(monkeypatch, lc_code=1)        # whole plate is water
+    _fake_fetches(monkeypatch, water=True)       # whole plate is water
     _, bodies, _ = poster.build_poster(TRACK3, _params())
     assert [b[1] for b in bodies] == ["terrain", "water"]
     cap = bodies[1][0]
     assert bodies[1][2] == poster.COLORS["water"] and bodies[1][3] == 2
     assert cap.is_watertight and cap.is_winding_consistent and cap.volume > 0
 
-
-def test_build_poster_derives_km_per_px(monkeypatch):
-    """km_per_px must come from the bounds, not a constant: same track, half the
-    plate -> ~half the ground size per pixel."""
-    seen = []
-    monkeypatch.setattr(poster, "fetch_elevation",
-                        lambda b, px: np.tile(np.linspace(0, 500, px), (px, 1)))
-    monkeypatch.setattr(poster, "fetch_landcover",
-                        lambda b, px, k, c: seen.append((px, k, c))
-                        or np.zeros((px, px), np.uint8))
-    poster.build_poster(TRACK3, _params())
-    poster.build_poster(TRACK3, _params(size_mm=80.0, frame_mm=8.0))
-    (px_a, km_a, city_a), (px_b, km_b, _) = seen
-    assert city_a == _params().city_min_km
-    ground_km = px_a * km_a                                # plate side in ground km
-    assert abs(px_b * km_b - ground_km) / ground_km < 0.01  # same track -> same ground
-    assert 40 < ground_km < 200                            # ~1 deg lon at 47N, +margin
-    assert abs(km_b - km_a * px_a / px_b) < 1e-9
 
 
 def test_build_poster_rejects_oversized_grid():
@@ -331,7 +314,7 @@ def test_build_poster_rejects_cap_thicker_than_plate(monkeypatch):
 def test_generate_endpoint(monkeypatch):
     from fastapi.testclient import TestClient
     import app as appmod
-    _fake_fetches(monkeypatch, lc_code=1)      # water everywhere -> relief has 2 bodies
+    _fake_fetches(monkeypatch, water=True)     # water everywhere -> relief has 2 bodies
     client = TestClient(appmod.app)
     params = '{"size_mm": 40, "frame_mm": 4, "res_mm": 0.5, "text": "ZRH-GVA"}'
     r = client.post("/generate", files={"file": ("f.kml", KML.encode())},
@@ -366,26 +349,6 @@ def test_generate_bad_params_json():
                        data={"params": "5"}).status_code == 400
 
 
-def test_classify_landcover_palette():
-    rgb = np.zeros((20, 20, 3), np.uint8)          # default -> green(0)
-    rgb[2:8, 2:18] = (0, 100, 200)                 # water bar
-    rgb[12:19, 2:19] = (250, 0, 0)                 # big city block
-    rgb[10, 10] = (0, 100, 200)                    # 1px pond -> speckle, removed
-    rgb[0, 0] = (247, 3, 2)                        # within +-10 of built-up, but 1px -> removed
-    lc = poster.classify_landcover(rgb, km_per_px=0.5, city_min_km=1.5)
-    assert lc[5, 10] == 1                          # water kept
-    assert lc[15, 10] == 2                         # city kept
-    assert lc[10, 10] == 0 and lc[0, 0] == 0       # speckles gone
-    assert lc[1, 1] == 0
-
-
-def test_classify_city_threshold_scales():
-    rgb = np.zeros((40, 40, 3), np.uint8)
-    rgb[10:14, 10:14] = (250, 0, 0)                # 4px-wide town
-    # at 0.1 km/px a 1.5km city needs ~15px -> town removed
-    assert (poster.classify_landcover(rgb, 0.1, 1.5) == 2).sum() == 0
-    # at 1.0 km/px the kernel floors at 3 -> 4px town survives opening
-    assert (poster.classify_landcover(rgb, 1.0, 1.5) == 2).sum() > 0
 
 
 def test_masked_slab_mesh_geometry():
@@ -441,110 +404,219 @@ def test_3mf_roundtrip():
     assert 'value="1"' in cfg and 'value="2"' in cfg
 
 
-def test_classify_landcover_osm_closes_label_holes():
-    """OSM draws lake names and roads over water — a 1px line must not split the lake."""
-    rgb = np.full((30, 30, 3), (242, 239, 233), np.uint8)   # OSM land background
-    rgb[5:25, 5:25] = (170, 211, 223)                       # lake
-    rgb[14, 5:25] = (255, 255, 255)                         # a "label" line through it
-    rgb[2, 2] = (170, 211, 223)                             # 1px pond -> speckle, removed
-    lc = poster.classify_landcover_osm(rgb, km_per_px=0.5, city_min_km=1.5)
-    assert (lc[6:24, 6:24] == 1).all()                      # hole closed, lake intact
-    assert lc[2, 2] == 0 and lc[0, 0] == 0
 
 
-def test_classify_landcover_osm_city_survives_road_casings():
-    """OSM paints roads over the residential fill; a city cut into sub-kernel crumbs
-    by them must still classify as one city (this is what killed the live Zug run)."""
-    rgb = np.full((60, 60, 3), (242, 239, 233), np.uint8)
-    rgb[10:50, 10:50] = (210, 210, 209)             # 40px built-up area, z11 shade
-    for o in (20, 30, 40):                          # white road casings slicing it up
-        rgb[o:o + 3, 10:50] = (254, 254, 254)
-        rgb[10:50, o:o + 3] = (254, 254, 254)
-    # 40px city, 15px kernel: the crumbs between roads are only ~10px, so the
-    # opening alone would erase all of it
-    lc = poster.classify_landcover_osm(rgb, km_per_px=0.1, city_min_km=1.5)
-    assert (lc == 2).sum() > 900                    # ~the whole block, roads healed
-    assert (lc[12:48, 12:48] == 2).all()
 
 
-def test_classify_landcover_osm_city_threshold_scales():
-    rgb = np.full((40, 40, 3), (242, 239, 233), np.uint8)
-    rgb[10:14, 10:14] = (224, 223, 223)                     # 4px-wide village
-    assert (poster.classify_landcover_osm(rgb, 0.1, 1.5) == 2).sum() == 0   # needs ~15px
-    assert (poster.classify_landcover_osm(rgb, 1.0, 1.5) == 2).sum() > 0    # kernel floors at 3
 
 
-def test_classify_landcover_osm_city_tolerance_is_tight():
-    """The residential-grey window must not swallow the other neutral greys."""
-    rgb = np.full((30, 30, 3), (242, 239, 233), np.uint8)   # land background
-    rgb[5:25, 5:25] = (170, 211, 223)                       # big lake (grey-blue)
-    lc = poster.classify_landcover_osm(rgb, km_per_px=1.0, city_min_km=1.5)
-    assert (lc == 2).sum() == 0 and lc[15, 15] == 1
-    for grey in ((217, 208, 201), (221, 221, 232), (238, 238, 238), (254, 254, 254)):
-        rgb = np.full((30, 30, 3), grey, np.uint8)          # buildings, pedestrian,
-        assert (poster.classify_landcover_osm(               # parking, road casing
-            rgb, 1.0, 1.5) == 2).sum() == 0, grey
 
 
-def test_classify_landcover_osm_city_across_zooms():
-    """osm-carto darkens landuse=residential as it zooms out; both shades are cities."""
-    for grey in ((224, 223, 223), (221, 221, 220), (210, 210, 209), (208, 208, 208)):
-        rgb = np.full((30, 30, 3), (242, 239, 233), np.uint8)
-        rgb[5:25, 5:25] = grey
-        assert (poster.classify_landcover_osm(rgb, 1.0, 1.5) == 2).sum() > 0, grey
-
-
-def test_fetch_landcover_falls_back_to_osm(monkeypatch, capsys):
-    def boom(url, headers=None):
-        raise RuntimeError("WMS down")
-    monkeypatch.setattr(poster, "_get", boom)
-    grid = np.full((8, 8), 1, np.uint8)
-    monkeypatch.setattr(poster, "_fetch_landcover_osm", lambda *a: grid)
-    out = poster.fetch_landcover((0.1, 0.2, 0.11, 0.21), 8, 0.5, 1.5)
-    assert (out == grid).all()
-    assert "OSM" in capsys.readouterr().out
-
-
-def test_fetch_landcover_osm_sends_user_agent(monkeypatch):
-    """OSM tile policy requires an identifying User-Agent."""
-    seen = []
-    png = io.BytesIO()
-    Image.new("RGB", (256, 256), (170, 211, 223)).save(png, "PNG")
-    monkeypatch.setattr(poster, "_get",
-                        lambda url, headers=None: seen.append((url, headers)) or png.getvalue())
-    lc = poster._fetch_landcover_osm((0.1, 0.2, 0.101, 0.201), 16, 1.0, 1.5)
-    assert lc.shape == (16, 16) and (lc == 1).all()
-    url, headers = seen[0]
-    assert url.startswith("https://tile.openstreetmap.org/")
-    assert "FlightPathPoster" in headers["User-Agent"]
-    assert 10 <= int(url.split("/")[-3]) <= 13      # z10 floor (cities), z13 cap (policy)
-
-
-def test_tile_mosaic_zoom_floor_respects_tile_budget(monkeypatch):
-    """min_zoom must not turn a wide track into a four-figure tile download."""
-    seen = []
-    png = io.BytesIO()
-    Image.new("RGB", (256, 256), (0, 0, 0)).save(png, "PNG")
-    monkeypatch.setattr(poster, "_get",
-                        lambda url, headers=None: seen.append(url) or png.getvalue())
-    # ~1 radian wide (transatlantic): the z10 floor alone would be ~26000 tiles
-    poster._tile_mosaic((0.0, 0.9, 1.0, 1.9), 238, poster.OSM_TILE_URL, None,
-                        **poster.OSM_ZOOM)
-    assert len(seen) <= 64, len(seen)          # budget wins over the floor
-    assert int(seen[0].split("/")[-3]) < 10     # ...and it does so by dropping below z10
-
-
-def test_tile_budget_never_downgrades_elevation(monkeypatch):
-    """The tile budget added for the OSM zoom floor must not silently coarsen the
-    DEM: at the largest legal grid (256mm / 0.2mm) it must still pick the fit zoom."""
+def test_elevation_always_uses_the_fit_zoom(monkeypatch):
+    """_tile_mosaic must never silently coarsen the DEM: over four decades of span,
+    up to the largest legal grid (256mm / 0.2mm), it picks exactly the fit zoom,
+    capped only at max_zoom. Pinned across the drop of the OSM zoom-floor/budget
+    logic — that simplification must not move a single elevation tile."""
     import math
     seen = []
     png = io.BytesIO()
     Image.new("RGB", (256, 256), (128, 0, 0)).save(png, "PNG")
     monkeypatch.setattr(poster, "_get",
-                        lambda url, headers=None: seen.append(url) or png.getvalue())
+                        lambda url, **kw: seen.append(url) or png.getvalue())
     for span in (0.0005, 0.005, 0.05, 0.5):
         seen.clear()
         poster.fetch_elevation((0.1, 0.9, 0.1 + span, 0.9 + span), 1280)
         fit = math.ceil(math.log2(1280 * 2 * math.pi / (span * 256)))
         assert int(seen[0].split("/")[-3]) == min(12, fit), (span, seen[0])
+
+
+# --- vector water (Overpass) -------------------------------------------------
+
+def _wbounds(lat0, lon0, lat1, lon1):
+    """Mercator bounds tuple for a lat/lon box (x0, y0, x1, y1)."""
+    x0, y0 = poster._merc(lat0, lon0)
+    x1, y1 = poster._merc(lat1, lon1)
+    return x0, y0, x1, y1
+
+
+def _rc(bounds, lat, lon, n):
+    """(row, col) of a lat/lon inside an n*n mask over bounds; row 0 = north."""
+    x, y = poster._merc(lat, lon)
+    x0, y0, x1, y1 = bounds
+    return int((y1 - y) / (y1 - y0) * n), int((x - x0) / (x1 - x0) * n)
+
+
+def _ring(lat0, lon0, lat1, lon1):
+    return [(lat0, lon0), (lat0, lon1), (lat1, lon1), (lat1, lon0), (lat0, lon0)]
+
+
+def _way(coords, **kw):
+    return dict(type="way", geometry=[{"lat": la, "lon": lo} for la, lo in coords], **kw)
+
+
+def _rel(members):
+    """members: [(role, coords), ...]"""
+    return dict(type="relation", members=[
+        dict(type="way", role=role, geometry=[{"lat": la, "lon": lo} for la, lo in c])
+        for role, c in members])
+
+
+B = _wbounds(47.0, 8.0, 47.1, 8.1)      # ~7.5 km box; at 100 px, 1 px ~ 75 m
+
+
+def test_water_mask_fills_a_closed_way():
+    m = poster._water_mask_from_elements([_way(_ring(47.02, 8.02, 47.08, 8.08))], B, 100)
+    assert m.shape == (100, 100) and m.dtype == bool
+    assert m[_rc(B, 47.05, 8.05, 100)]                     # inside the lake
+    assert not m[_rc(B, 47.005, 8.005, 100)]               # outside it
+    assert 0.25 < m.mean() < 0.45                          # ~0.6 x 0.6 of the box
+
+
+def test_stitch_rings_joins_reversed_fragments():
+    a = [(47.02, 8.02), (47.02, 8.08), (47.08, 8.08)]
+    b = [(47.02, 8.02), (47.08, 8.02), (47.08, 8.08)]      # same ring, wound backwards
+    rings, broken = poster._stitch_rings([a, b])
+    assert broken == 0 and len(rings) == 1
+    r = rings[0]
+    assert r[0] == r[-1] and len(r) == 5                   # closed, no duplicated joints
+
+
+def test_water_mask_relation_outer_split_with_island():
+    """Real multipolygon shape: outer split across two ways (one reversed), plus an
+    inner ring that must be punched back out of the fill."""
+    rel = _rel([("outer", [(47.02, 8.02), (47.02, 8.08), (47.08, 8.08)]),
+                ("outer", [(47.02, 8.02), (47.08, 8.02), (47.08, 8.08)]),
+                ("inner", _ring(47.04, 8.04, 47.06, 8.06))])
+    m = poster._water_mask_from_elements([rel], B, 100)
+    assert m[_rc(B, 47.03, 8.03, 100)]                     # lake body
+    assert not m[_rc(B, 47.05, 8.05, 100)]                 # island hole
+    assert not m[_rc(B, 47.005, 8.005, 100)]               # dry land outside
+
+
+def test_water_mask_role_empty_counts_as_outer():
+    rel = _rel([("", _ring(47.02, 8.02, 47.08, 8.08))])
+    assert poster._water_mask_from_elements([rel], B, 100)[_rc(B, 47.05, 8.05, 100)]
+
+
+def test_water_mask_broken_ring_warns_and_keeps_the_rest(capsys):
+    """An unclosed outer chain is skipped with one warning; every other polygon
+    in the same response still gets painted."""
+    broken = _rel([("outer", [(47.02, 8.02), (47.02, 8.08)]),      # a bare open chain
+                   ("outer", [(47.03, 8.03), (47.04, 8.04)])])     # not touching it
+    good = _way(_ring(47.05, 8.05, 47.09, 8.09))
+    m = poster._water_mask_from_elements([broken, good], B, 100)
+    assert m[_rc(B, 47.07, 8.07, 100)]                     # the good lake survived
+    assert not m[_rc(B, 47.025, 8.025, 100)]               # the broken chain painted nothing
+    out = capsys.readouterr().out
+    assert "water" in out and "2" in out                   # one line, both chains counted
+
+
+def test_water_mask_clips_a_polygon_crossing_the_bbox():
+    """Overpass does not clip geometry to the bbox — the rasteriser must."""
+    m = poster._water_mask_from_elements([_way(_ring(46.5, 7.5, 47.05, 8.05))], B, 100)
+    assert m[_rc(B, 47.01, 8.01, 100)]                     # the part inside is painted
+    assert not m[_rc(B, 47.09, 8.09, 100)]                 # the far corner stays dry
+    assert 0.15 < m.mean() < 0.4                           # ~half the box, not all of it
+
+
+def test_water_mask_skips_sub_pixel_ponds():
+    pond = _way(_ring(47.05, 8.05, 47.052, 8.052))         # ~2 px across -> ~5 px2
+    lake = _way(_ring(47.05, 8.05, 47.06, 8.06))           # ~11 px across -> ~120 px2
+    assert not poster._water_mask_from_elements([pond], B, 100).any()
+    assert poster._water_mask_from_elements([lake], B, 100).any()
+
+
+def test_fetch_water_mask_uses_the_mirror_when_the_first_fails(monkeypatch, capsys):
+    calls = []
+
+    def fake_get(url, timeout=20):
+        calls.append((url, timeout))
+        if len(calls) == 1:
+            raise RuntimeError("overpass busy")
+        return b'{"elements": []}'
+
+    monkeypatch.setattr(poster, "_get", fake_get)
+    m = poster.fetch_water_mask(B, 16)
+    assert m.shape == (16, 16) and not m.any()
+    assert len(calls) == 2
+    assert calls[0][0].startswith(poster.OVERPASS_URLS[0])
+    assert calls[1][0].startswith(poster.OVERPASS_URLS[1])
+    assert calls[0][1] == 180                               # Overpass is slow, not 20s
+    assert "natural" in calls[0][0] and "8.1" in calls[0][0]  # query + bbox in the URL
+    assert "mirror" in capsys.readouterr().out.lower()
+
+
+def test_fetch_water_mask_skips_transoceanic_spans(monkeypatch, capsys):
+    monkeypatch.setattr(poster, "_get",
+                        lambda *a, **k: pytest.fail("must not query Overpass"))
+    m = poster.fetch_water_mask(_wbounds(40.0, -70.0, 50.0, 10.0), 32)
+    assert m.shape == (32, 32) and not m.any()
+    assert "water" in capsys.readouterr().out.lower()
+
+
+def test_build_poster_soft_fails_to_terrain_when_overpass_is_down(monkeypatch, capsys):
+    monkeypatch.setattr(poster, "fetch_elevation",
+                        lambda b, px: np.tile(np.linspace(0, 500, px), (px, 1)))
+
+    def boom(url, timeout=20):
+        raise RuntimeError("overpass down")
+
+    monkeypatch.setattr(poster, "_get", boom)
+    _, bodies, _ = poster.build_poster(TRACK3, _params())
+    assert [b[1] for b in bodies] == ["terrain"]           # a water-less poster, not a 502
+    assert "water" in capsys.readouterr().out.lower()
+
+
+def test_get_sends_an_identifying_user_agent(monkeypatch):
+    """overpass-api.de answers requests' default User-Agent with a bare 406."""
+    seen = {}
+
+    class R:
+        content = b"x"
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(poster.requests, "get",
+                        lambda url, **kw: seen.update(kw) or R())
+    assert poster._get("https://example.invalid/x") == b"x"
+    assert "FlightPathPoster" in seen["headers"]["User-Agent"]
+
+
+@pytest.mark.skipif(not os.environ.get("LIVE"), reason="hits the live Overpass API")
+def test_live_lake_zug_water_mask():
+    m = poster.fetch_water_mask(_wbounds(47.08, 8.42, 47.20, 8.55), 256)
+    assert 0.05 < m.mean() < 0.6, m.mean()
+
+
+# --- elevation snow caps -----------------------------------------------------
+
+def test_build_poster_snow_caps_above_the_snow_line(monkeypatch):
+    _fake_fetches(monkeypatch, elev_top=4000.0)            # W-E ramp through 2000 m
+    _, bodies, _ = poster.build_poster(TRACK3, _params())
+    assert [b[1] for b in bodies] == ["terrain", "snow"]
+    cap = bodies[1][0]
+    assert bodies[1][2] == poster.COLORS["snow"] and bodies[1][3] == 3
+    assert cap.is_watertight and cap.is_winding_consistent and cap.volume > 0
+    # ...and the threshold is the parameter, not a constant
+    _, bodies, _ = poster.build_poster(TRACK3, _params(snow_line_m=5000.0))
+    assert [b[1] for b in bodies] == ["terrain"]
+
+
+def test_snow_speckle_is_opened_away(monkeypatch):
+    def elev(b, px):
+        e = np.full((px, px), 500.0)
+        e[px // 2, px // 2] = 3000.0                       # a single spiky DEM pixel
+        return e
+
+    monkeypatch.setattr(poster, "fetch_elevation", elev)
+    monkeypatch.setattr(poster, "fetch_water_mask", lambda b, px: np.zeros((px, px), bool))
+    _, bodies, _ = poster.build_poster(TRACK3, _params())
+    assert [b[1] for b in bodies] == ["terrain"]
+
+
+def test_water_beats_snow(monkeypatch):
+    """High Alpine lakes sit above the snow line — they must still be blue."""
+    _fake_fetches(monkeypatch, water=True, elev_top=4000.0)
+    _, bodies, _ = poster.build_poster(TRACK3, _params())
+    assert [b[1] for b in bodies] == ["terrain", "water"]

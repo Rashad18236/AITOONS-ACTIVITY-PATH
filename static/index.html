@@ -32,6 +32,7 @@
   <label>Margin %</label><input id="margin_pct" type="number" value="15">
   <label>Groove width mm</label><input id="groove_w_mm" type="number" step="0.1" value="2">
   <label>Groove depth mm</label><input id="groove_d_mm" type="number" step="0.1" max="1.9" value="1.5">
+  <label>Grey caps above [m]</label><input id="snow_line_m" type="number" step="100" value="2000">
   <button id="go">Generate</button>
   <div id="status"></div>
   <a class="dl" id="dlFrame" style="display:none">Download frame.stl</a>
@@ -67,7 +68,7 @@ window.addEventListener('resize', resize); resize();
 (function loop() { requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
 
 // poster.COLORS, by 3MF body name. Order is the fallback if 3MFLoader drops the names.
-const COLORS = { terrain: 0x4caf50, water: 0x2196f3, cities: 0x9e9e9e };
+const COLORS = { terrain: 0x4caf50, water: 0x2196f3, snow: 0x9e9e9e };
 const BODY_ORDER = [0x4caf50, 0x2196f3, 0x9e9e9e];
 const FRAME_COLOR = 0x222222, STRIP_COLOR = 0xcc2222;
 const RES_MM = 0.4, FIT_MM = 0.2;   // Params.res_mm / Params.fit_mm server defaults
@@ -113,7 +114,7 @@ document.getElementById('go').onclick = async () => {
   if (!f) { status.textContent = 'Pick a KML/CSV file first.'; return; }
   status.textContent = 'Generating… (terrain download + meshing, ~10-30s)';
   const params = { text: document.getElementById('text').value };
-  for (const id of ['size_mm','relief_mm','exaggeration','margin_pct','groove_w_mm','groove_d_mm']) {
+  for (const id of ['size_mm','relief_mm','exaggeration','margin_pct','groove_w_mm','groove_d_mm','snow_line_m']) {
     const v = parseFloat(document.getElementById(id).value);
     if (!isNaN(v)) params[id] = v;   // blank field -> server default
   }

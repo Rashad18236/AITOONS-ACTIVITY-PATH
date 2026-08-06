@@ -1,5 +1,5 @@
 """Flight Path Poster core: track -> heightmap -> printable meshes."""
-import csv, io, math, re
+import csv, io, json, math, re, urllib.parse
 from dataclasses import dataclass
 import numpy as np
 import requests
@@ -88,10 +88,15 @@ def _tile_px(x, y, z):
     return (x + math.pi) / (2 * math.pi) * n, (math.pi - y) / (2 * math.pi) * n
 
 
-def _get(url, headers=None):
+# Identifying User-Agent on every request: overpass-api.de answers python-requests'
+# default UA with a bare 406, and it is what public-tile policies ask for anyway.
+UA = {"User-Agent": "FlightPathPoster/1.0 (local single-user 3D-print tool)"}
+
+
+def _get(url, timeout=20):
     for attempt in (1, 2):  # one retry, then raise (spec: 502 upstream)
         try:
-            r = requests.get(url, timeout=20, headers=headers)
+            r = requests.get(url, timeout=timeout, headers=UA)
             r.raise_for_status()
             return r.content
         except Exception:
@@ -99,20 +104,15 @@ def _get(url, headers=None):
                 raise
 
 
-def _tile_mosaic(bounds, px_out, url_tmpl, headers=None, max_zoom=12, min_zoom=1):
+def _tile_mosaic(bounds, px_out, url_tmpl, max_zoom=12):
     """Slippy-map tiles covering bounds, stitched and cropped -> (H,W,3) uint8 RGB.
 
     Native tile resolution, NOT resampled to px_out — px_out only picks the zoom.
-    Callers resample themselves: elevation must decode to float metres first
-    (bilinear on terrarium RGB is nonsense), palettes must resample NEAREST."""
+    The caller resamples: elevation must decode to float metres first, because
+    bilinear on terrarium RGB is nonsense."""
     x0, y0, x1, y1 = bounds
     fit = math.ceil(math.log2(px_out * 2 * math.pi / ((x1 - x0) * 256)))  # ~1 tile px out
-    # min_zoom exists so a rendered style actually draws the features we classify;
-    # left alone it would answer a wide track with a four-figure tile download, so
-    # cap it at ~8x8 tiles. It clamps min_zoom and NOT the final zoom on purpose:
-    # applied to `fit` its floor()-vs-ceil() rounding would quietly coarsen the DEM.
-    budget = math.floor(math.log2(7 * 2 * math.pi / (x1 - x0)))
-    z = max(1, min(max_zoom, max(fit, min(min_zoom, budget))))
+    z = max(1, min(max_zoom, fit))
     pxL, pyB = _tile_px(x0, y0, z)   # west, south  (bottom of image)
     pxR, pyT = _tile_px(x1, y1, z)   # east, north  (top of image)
     tx0, tx1 = int(pxL // 256), int(pxR // 256)
@@ -120,7 +120,7 @@ def _tile_mosaic(bounds, px_out, url_tmpl, headers=None, max_zoom=12, min_zoom=1
     mosaic = np.zeros(((ty1 - ty0 + 1) * 256, (tx1 - tx0 + 1) * 256, 3), np.uint8)
     for ty in range(ty0, ty1 + 1):
         for tx in range(tx0, tx1 + 1):
-            img = Image.open(io.BytesIO(_get(url_tmpl.format(z=z, x=tx, y=ty), headers)))
+            img = Image.open(io.BytesIO(_get(url_tmpl.format(z=z, x=tx, y=ty))))
             mosaic[(ty - ty0) * 256:(ty - ty0 + 1) * 256,
                    (tx - tx0) * 256:(tx - tx0 + 1) * 256] = np.asarray(img.convert("RGB"))
     # ponytail: integer-pixel crop (<1 tile-px misalignment), subpixel crop if seams show
@@ -135,12 +135,8 @@ def fetch_elevation(bounds, px_out):
     return np.asarray(Image.fromarray(elev, "F").resize((px_out, px_out), Image.BILINEAR))
 
 
-WMS_URL = ("https://services.terrascope.be/wms/v2?SERVICE=WMS&VERSION=1.3.0"
-           "&REQUEST=GetMap&LAYERS=WORLDCOVER_2021_MAP&STYLES=&FORMAT=image/png"
-           "&CRS=EPSG:3857&BBOX={x0},{y0},{x1},{y1}&WIDTH={w}&HEIGHT={h}")
 COLORS = {"frame": "#222222", "green": "#4CAF50", "water": "#2196F3",
-          "city": "#9E9E9E", "strip": "#CC2222"}
-_R3857 = 6378137.0
+          "snow": "#9E9E9E", "strip": "#CC2222"}
 
 
 def _opened(mask, k):
@@ -150,81 +146,120 @@ def _opened(mask, k):
     return np.asarray(img) > 0
 
 
-def _closed(mask, k):
-    """Morphological closing: fills gaps up to k px wide, keeping the outer extent."""
-    return ~_opened(~mask, k)
+# Water comes from OSM vector polygons via Overpass (free, no key): rasterised at
+# the poster's own resolution it gives crisp shorelines, where a low-zoom raster
+# tile gave 100m stair-steps. Two public mirrors, either one will do.
+OVERPASS_URLS = ("https://overpass-api.de/api/interpreter",
+                 "https://overpass.kumi.systems/api/interpreter")
+# `out geom` embeds every member way's coordinates, so no second node lookup is
+# needed. Overpass does NOT clip geometry to the bbox — the rasteriser does.
+OVERPASS_QL = ('[out:json][timeout:120][maxsize:536870912][bbox:{s},{w},{n},{e}];'
+               '(way["natural"="water"];relation["natural"="water"];'
+               'way["waterway"="riverbank"];relation["waterway"="riverbank"];);'
+               'out geom;')
+MIN_RING_PX2 = 9.0   # ~3x3 px: below this a lake is a printing artefact, not a lake
 
 
-def classify_landcover(rgb, km_per_px, city_min_km):
-    """WorldCover RGB -> codes: 0 green, 1 water, 2 big-city."""
-    def near(target):
-        return (np.abs(rgb.astype(int) - target).max(axis=2) <= 10)
-    water = _opened(near((0, 100, 200)), 3)                     # drop 1px speckle
-    k = max(3, int(round(city_min_km / km_per_px)) | 1)         # odd, >=3
-    city = _opened(near((250, 0, 0)), k)                        # villages vanish
-    lc = np.zeros(rgb.shape[:2], np.uint8)
-    lc[water] = 1
-    lc[city & ~water] = 2
-    return lc
+def _unmerc(x, y):
+    """Pseudo-mercator radians -> (lon, lat) degrees."""
+    return math.degrees(x), math.degrees(math.atan(math.sinh(y)))
 
 
-# Fallback source: OSM standard-style raster tiles. Their palette is a cartographic
-# style, not a survey — coarser and road/label-contaminated — so WorldCover stays
-# primary. OSM tile policy requires an identifying User-Agent and forbids bulk use;
-# one generate pulls at most 64 tiles (_tile_mosaic's budget), a browser's worth.
-OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-OSM_HEADERS = {"User-Agent": "FlightPathPoster/1.0 (local single-user 3D-print tool)"}
-# z10 is where osm-carto starts drawing landuse=residential — below it the image
-# holds no cities to find, whatever the poster's own resolution. z13 is where the
-# palette stops changing and extra tiles buy nothing.
-OSM_ZOOM = dict(min_zoom=10, max_zoom=13)
+def _stitch_rings(segs):
+    """Join way fragments end-to-end into closed rings -> (rings, n_broken).
+
+    A multipolygon relation hands out its outline as unordered, arbitrarily wound
+    way fragments; only their shared endpoints say how they join. Keys are exact
+    (1e-7 deg, OSM's own storage precision) — the same node is bit-identical in
+    every member, so no tolerance is needed and none is wanted (a tolerance would
+    fuse two lakes that happen to touch).
+    ponytail: O(n^2) rescan per chain. Members per relation are tens, not
+    thousands; index by endpoint key if a river network ever makes this hurt."""
+    key = lambda pt: (round(pt[0] * 1e7), round(pt[1] * 1e7))
+    pool = [list(s) for s in segs if len(s) >= 2]
+    rings, broken = [], 0
+    while pool:
+        chain = pool.pop()
+        grew = True
+        while grew and key(chain[0]) != key(chain[-1]):
+            grew = False
+            for i, s in enumerate(pool):
+                if key(s[0]) == key(chain[-1]):
+                    chain = chain + s[1:]
+                elif key(s[-1]) == key(chain[-1]):
+                    chain = chain + s[-2::-1]
+                elif key(s[-1]) == key(chain[0]):
+                    chain = s[:-1] + chain
+                elif key(s[0]) == key(chain[0]):
+                    chain = s[:0:-1] + chain
+                else:
+                    continue
+                pool.pop(i)
+                grew = True
+                break
+        if len(chain) >= 4 and key(chain[0]) == key(chain[-1]):
+            rings.append(chain)
+        else:
+            broken += 1
+    return rings, broken
 
 
-def classify_landcover_osm(rgb, km_per_px, city_min_km):
-    """OSM standard-style tile RGB -> codes: 0 green, 1 water, 2 big-city.
+def _water_mask_from_elements(els, bounds, px_out):
+    """Overpass elements -> bool (px_out, px_out) water mask, row 0 = north."""
+    x0, y0, x1, y1 = bounds
+    img = Image.new("L", (px_out, px_out))
+    draw = ImageDraw.Draw(img)
 
-    Unlike WorldCover this is a map rendering, not a survey: roads and labels are
-    painted OVER the land-cover fills at a fixed pixel width, so both classes need
-    a closing pass to repair what the cartography cut out of them."""
-    def near(target, tol):
-        return (np.abs(rgb.astype(int) - target).max(axis=2) <= tol)
-    # open drops 1px speckle; close repairs the label and bridge lines over lakes,
-    # which would otherwise punch holes straight through the water cap
-    water = _closed(_opened(near((170, 211, 223), 10), 3), 3)
-    k = max(3, int(round(city_min_km / km_per_px)) | 1)         # odd, >=3
-    # osm-carto darkens landuse=residential as it zooms out: #e0dfdf at z>=13,
-    # ~#d2d2d2 at z11 (measured). One window over that band, kept tight — buildings
-    # (#d9d0c9) and pedestrian areas (#ddddE8) are ~15 away and must stay out.
-    # Close first at half the city kernel: rendered motorway casings are hundreds of
-    # ground-metres wide at these zooms and shatter a city into sub-kernel crumbs.
-    city = _opened(_closed(near((216, 216, 216), 9), max(3, k // 2 | 1)), k)
-    lc = np.zeros(rgb.shape[:2], np.uint8)
-    lc[water] = 1
-    lc[city & ~water] = 2
-    return lc
+    def paint(ring, fill):
+        xy = np.array([_merc(la, lo) for la, lo in ring])
+        px = np.stack([(xy[:, 0] - x0) / (x1 - x0) * px_out,
+                       (y1 - xy[:, 1]) / (y1 - y0) * px_out], 1)
+        a, b = px[:, 0], px[:, 1]                      # shoelace, in output pixels
+        if abs(a @ np.roll(b, -1) - b @ np.roll(a, -1)) / 2 < MIN_RING_PX2:
+            return                                     # pond/pool below print resolution
+        draw.polygon([tuple(q) for q in px], fill=fill)  # PIL clips off-canvas itself
+
+    def members(el, roles):
+        return [[(p["lat"], p["lon"]) for p in m.get("geometry") or []]
+                for m in el.get("members", ())
+                if m.get("type") == "way" and m.get("role", "") in roles]
+
+    broken = 0
+    for el in els:
+        if el.get("type") == "way":
+            g = [(p["lat"], p["lon"]) for p in el.get("geometry") or []]
+            if len(g) >= 4 and g[0] == g[-1]:          # standalone closed way = a lake
+                paint(g, 255)
+        elif el.get("type") == "relation":
+            outers, nb_o = _stitch_rings(members(el, ("outer", "")))
+            inners, nb_i = _stitch_rings(members(el, ("inner",)))
+            broken += nb_o + nb_i
+            for r in outers:
+                paint(r, 255)
+            for r in inners:                           # islands, punched back out
+                paint(r, 0)
+    if broken:
+        print(f"water: {broken} unclosed ring(s) in the Overpass response, skipped")
+    return np.asarray(img) > 0
 
 
-def _fetch_landcover_osm(bounds, px_out, km_per_px, city_min_km):
-    """OSM-tile land-cover codes, same contract as fetch_landcover."""
-    rgb = _tile_mosaic(bounds, px_out, OSM_TILE_URL, OSM_HEADERS, **OSM_ZOOM)
-    # NEAREST, never bilinear: blended palette colours match no class at all
-    rgb = np.asarray(Image.fromarray(rgb).resize((px_out, px_out), Image.NEAREST))
-    return classify_landcover_osm(rgb, km_per_px, city_min_km)
-
-
-def fetch_landcover(bounds, px_out, km_per_px, city_min_km):
-    """WorldCover land-cover codes for bounds, (px_out, px_out), row 0 = north.
-
-    Falls back to OSM tiles when the WMS is unreachable — a coarser poster beats
-    no poster, and the WMS has had multi-day outages."""
-    try:
-        x0, y0, x1, y1 = (v * _R3857 for v in bounds)   # merc radians -> EPSG:3857 meters
-        url = WMS_URL.format(x0=x0, y0=y0, x1=x1, y1=y1, w=px_out, h=px_out)
-        img = Image.open(io.BytesIO(_get(url))).convert("RGB")
-        return classify_landcover(np.asarray(img), km_per_px, city_min_km)
-    except Exception as e:
-        print(f"land cover: WorldCover WMS unavailable ({e}) — falling back to OSM tiles")
-        return _fetch_landcover_osm(bounds, px_out, km_per_px, city_min_km)
+def fetch_water_mask(bounds, px_out):
+    """OSM water polygons over bounds -> bool (px_out, px_out), row 0 = north."""
+    w, s = _unmerc(bounds[0], bounds[1])
+    e, n = _unmerc(bounds[2], bounds[3])
+    if e - w > 4.0:   # a transoceanic track; Overpass would time out on the ocean
+        print(f"water: {e - w:.1f}deg bbox is too wide for Overpass — no water drawn")
+        return np.zeros((px_out, px_out), bool)
+    q = OVERPASS_QL.format(s=s, w=w, n=n, e=e)
+    for i, base in enumerate(OVERPASS_URLS):
+        try:
+            data = json.loads(_get(f"{base}?data={urllib.parse.quote(q)}", timeout=180))
+            break
+        except Exception as ex:
+            if i == len(OVERPASS_URLS) - 1:
+                raise
+            print(f"water: {base} failed ({ex}) — trying mirror")
+    return _water_mask_from_elements(data.get("elements", ()), bounds, px_out)
 
 
 @dataclass
@@ -246,7 +281,7 @@ class Params:
     cap_mm: float = 0.6      # colour-cap slab thickness
     plate_mm: float = 2.0    # relief plate base thickness (groove floor sits above 0)
     fit_mm: float = 0.2      # gap per side between relief plate and frame ring
-    city_min_km: float = 1.5
+    snow_line_m: float = 2000.0   # grey caps above this DEM elevation
 
 
 def _grid(p):
@@ -282,7 +317,7 @@ def compose_parts(track, elev, lc, bounds, p):
     """Split the poster into its printable pieces, all heights in mm.
 
     frame (N,N): backplate + raised ring + embossed text — printed alone.
-    green/surface/water/city/track_px: the (M,M) relief plate that drops into the
+    green/surface/water/snow/track_px: the (M,M) relief plate that drops into the
     ring, its pre-groove pre-cap top, the two colour-cap vertex masks, and the
     track in relief-plate pixels."""
     N, M, fpx = _grid(p)
@@ -311,11 +346,11 @@ def compose_parts(track, elev, lc, bounds, p):
     border = np.zeros((M, M), bool)
     border[1:-1, 1:-1] = True
     water = (lc == 1) & ~gmask & border
-    city = (lc == 2) & ~gmask & border
-    green = surface - p.cap_mm * (water | city)
+    snow = (lc == 2) & ~gmask & border
+    green = surface - p.cap_mm * (water | snow)
     green[gmask] -= p.groove_d_mm
     return dict(frame=frame, green=green, surface=surface,
-                water=water, city=city, track_px=track_px)
+                water=water, snow=snow, track_px=track_px)
 
 
 def _offsets(track_px):
@@ -448,14 +483,16 @@ def build_poster(track, p=Params()):
                              f"thickness ({p.plate_mm}mm)")
     bounds = track_bounds(track, p.margin_pct)
     M = _grid(p)[1]
-    # mercator x-span is ground distance only at the equator; scale by cos(mid-lat)
-    km_per_px = ((bounds[2] - bounds[0]) * _R3857 / 1000 / M
-                 * math.cos(math.radians(float(np.mean(track[:, 0])))))
     elev = fetch_elevation(bounds, M)
-    lc = fetch_landcover(bounds, M, km_per_px, p.city_min_km)
+    lc = np.zeros((M, M), np.uint8)
+    lc[_opened(elev >= p.snow_line_m, 3)] = 2        # drop 1px DEM spikes
+    try:   # water last: high Alpine lakes sit above the snow line and stay blue
+        lc[fetch_water_mask(bounds, M)] = 1
+    except Exception as e:
+        print(f"water: Overpass unavailable ({e}) — poster without water")
     parts = compose_parts(track, elev, lc, bounds, p)
     bodies = [(heightmap_mesh(parts["green"], p.res_mm), "terrain", COLORS["green"], 1)]
-    for key, name, slot in (("water", "water", 2), ("city", "cities", 3)):
+    for key, name, slot in (("water", "water", 2), ("snow", "snow", 3)):
         cap = masked_slab_mesh(parts[key], parts["surface"], p.cap_mm, p.res_mm)
         if cap is not None:
             bodies.append((cap, name, COLORS[key], slot))

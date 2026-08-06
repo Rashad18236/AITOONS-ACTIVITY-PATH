@@ -92,16 +92,13 @@ Supersedes the single-poster output. Three deliverables per generate:
 | File | Content | Filament |
 |---|---|---|
 | `frame.stl` | Backplate (base thickness, full footprint) + frame ring + embossed text, one solid | Black |
-| `relief.3mf` | Multi-body, printed in place with AMS: terrain body (green), water caps (blue), big-city caps (grey) | Slots 1/2/3 |
+| `relief.3mf` | Multi-body, printed in place with AMS: terrain body (green), water caps (blue), snow caps (grey) | Slots 1/2/3 |
 | `path.stl` | Glue-in strip, unchanged geometry (sampled from relief surface) | Red / any |
 
 - Relief plate has its own flat back, footprint = size − 2·frame − 2·fit clearance;
   it glues onto the backplate inside the frame ring.
-- Land cover: ESA WorldCover 10m via public Terrascope WMS
-  (`https://services.terrascope.be/wms/v2`, layer `WORLDCOVER_2021_MAP`, EPSG:3857 bbox);
-  classify PNG pixels by legend palette: water #0064C8 → blue, built-up #FA0000 → grey,
-  everything else green. "Big cities only": morphological opening (PIL Min/MaxFilter),
-  kernel sized from `city_min_km` real-world width; small water speckle removed with k=3 opening.
+- Colour classes (see the 2026-08-06 addendum, which supersedes the original
+  WorldCover scheme): blue = OSM water polygons, grey = DEM elevation, green = the rest.
 - Geometry stays heightmap-only: terrain body top is depressed `cap_mm` under cap masks
   and `groove_d_mm` under the groove (groove pixels excluded from cap masks);
   caps are `cap_mm` slabs following the pre-groove surface, meshed by a new
@@ -109,7 +106,7 @@ Supersedes the single-poster output. Three deliverables per generate:
 - 3MF is hand-written (zip+XML, no new deps): standard core objects with display colors
   plus Bambu `Metadata/model_settings.config` mapping each body to extruder 1/2/3.
 - New Params: `cap_mm=0.6`, `plate_mm=2.0` (relief minimum thickness), `fit_mm=0.2`
-  (relief↔frame side clearance), `city_min_km=1.5`. Display colors are constants,
+  (relief↔frame side clearance), `snow_line_m=2000`. Display colors are constants,
   not Params: green #4CAF50, blue #2196F3, grey #9E9E9E, black #222222, red #CC2222.
 - UI: three download links; preview shows frame (black, STLLoader), relief (3MFLoader,
   per-body colors), strip (red) assembled: relief and strip translated by
@@ -121,18 +118,48 @@ Supersedes the single-poster output. Three deliverables per generate:
 - check_output.py extends to the trio: frame footprint/watertight, relief bodies
   round-tripped from the 3MF (also validates the writer), caps within relief bounds,
   strip vs relief surface.
-- Land-cover fallback (added 2026-08-05, Terrascope WMS down ~30h): on ANY exception
-  from the WorldCover WMS, `fetch_landcover` prints one line and falls back to OSM
-  standard-style raster tiles (`https://tile.openstreetmap.org/{z}/{x}/{y}.png`) via
-  the tile-mosaic core now shared with the DEM (`_tile_mosaic`). WorldCover stays
-  primary — no behaviour change while it is up. `classify_landcover_osm` matches
-  water #AAD3DF ±10 and landuse=residential ±9 around #D8D8D8 (osm-carto darkens that
-  fill as it zooms out: #E0DFDF at z≥13, ~#D2D2D2 at z11), then resamples NEAREST —
-  bilinear would blend palette colours into no class at all. Unlike WorldCover this is
-  a rendering, not a survey: roads and labels are painted over the fills, so both
-  classes get a closing pass (cities close at half the city kernel) or motorway
-  casings shatter a city below the opening kernel. OSM tile policy compliance:
-  identifying User-Agent `FlightPathPoster/1.0 (local single-user 3D-print tool)`,
-  zoom floored at 10 (below it osm-carto draws no residential at all, so there are no
-  cities to find) and capped at 13, with a hard ~8×8-tile budget per fetch that clamps
-  that floor — a wide track must not become a four-figure tile download.
+
+# Addendum 2026-08-06: vector water + elevation grey caps (approved)
+
+Supersedes the WorldCover/OSM-raster land-cover scheme entirely — that machinery
+(`fetch_landcover`, `classify_landcover*`, the WMS and OSM-tile constants, the
+`min_zoom`/tile-budget logic in `_tile_mosaic`, `Params.city_min_km`) is deleted.
+Raster land cover produced Minecraft-block shorelines at the zooms a poster-wide
+bbox allows, and grey-for-cities put the poster's only neutral colour on exactly
+the flat parts of an Alpine flight.
+
+- **Water = OSM vector polygons via Overpass** (free, no key, no new dependency).
+  `OVERPASS_QL` asks a bbox for `natural=water` and `waterway=riverbank`, ways and
+  relations, with `out geom` — member coordinates are embedded, so no node lookup.
+  Two mirrors (`overpass-api.de`, `overpass.kumi.systems`) tried in order,
+  `timeout=180` (`_get` grew a timeout kwarg; tiles keep 20s).
+  `_water_mask_from_elements` rasterises straight into a PIL `L` image at the
+  relief grid's own resolution: standalone closed ways filled 255; relations
+  stitched by `_stitch_rings` (exact `round(coord*1e7)` endpoint keys, segments
+  reversed as needed), outers filled 255 then inners punched to 0. Rings under
+  `MIN_RING_PX2` = 9 px² are skipped (pools and farm ponds, ~99.8% of standalone
+  ways in a Swiss bbox). Overpass does **not** clip geometry to the bbox; PIL's
+  polygon rasteriser clips off-canvas coordinates itself, so nothing else has to.
+  Unclosed chains are counted, skipped, and reported in one line.
+  Soft-fail: any Overpass exception in `build_poster` prints one line and yields a
+  water-less poster rather than a 502. Guard: a bbox wider than 4° of longitude
+  (transoceanic) returns zeros without querying — no water speckle is worth an
+  Overpass timeout over an ocean.
+  Out of scope, documented: seas and oceans (coastline is `natural=coastline`
+  ways, not closed polygons — this is an Alpine tool); a bbox lying entirely
+  inside one giant lake; rivers narrower than 2 px, which leave a ~0.6mm capless
+  trench (`_opened(water, 3)` is the one-line fix if it ever shows).
+- **Grey = elevation**, not cities: `lc[_opened(elev >= p.snow_line_m, 3)] = 2` off
+  the DEM already fetched — no second network source. New `Params.snow_line_m=2000.0`,
+  exposed in the UI as "Grey caps above [m]". The k=3 opening drops single-pixel
+  DEM spikes that would otherwise mesh into 0.4mm grey confetti.
+  Water is assigned **after** snow, so a high Alpine lake stays blue.
+- Renames through the stack: `compose_parts` key `city`→`snow`, `COLORS["city"]`→
+  `COLORS["snow"]` (same #9E9E9E), 3MF body name `cities`→`snow` (still slot 3),
+  and the preview's `COLORS` map in `static/index.html`.
+- `_tile_mosaic` keeps only the fit zoom (`z = max(1, min(max_zoom, fit))`); with the
+  OSM caller gone the zoom floor and tile budget had no purpose. Elevation output is
+  unchanged and pinned by `test_elevation_always_uses_the_fit_zoom`. The per-call
+  `headers` kwarg on `_tile_mosaic`/`_get` is gone; instead `_get` now sends a single
+  module-level identifying `UA` on every request — found live, overpass-api.de answers
+  requests' default User-Agent with a bare 406.
