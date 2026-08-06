@@ -18,7 +18,7 @@ by test_relief_plate_clears_the_frame_ring.
 import argparse, json, sys
 from dataclasses import fields
 import trimesh
-from poster import Params, _grid, read_3mf
+from poster import SLOT_FLOOR_MM, Params, _grid, read_3mf
 
 PLATE_MM = 256.0
 EMBOSS_MM = 0.8   # compose_parts() text emboss height
@@ -154,12 +154,14 @@ def main(argv=None):
                 f"[{slo[i]:.2f}, {shi[i]:.2f}]mm",
                 f"in [{rlo[i]:.2f}, {rhi[i]:.2f}]mm +-0.5")
 
-        # 9. strip spans groove floor to proud of the highest relief point. The groove
-        # is cut into the plate, whose top starts at plate_mm — not base_mm any more.
-        z_lo = p.plate_mm - p.groove_d_mm - 0.01
+        # 9. strip is a level wall seated on the constant slot floor: bottom exactly
+        # SLOT_FLOOR_MM, top proud of the highest terrain the track crosses (which is
+        # at most the highest point of the whole relief).
         z_hi = max(m.bounds[1][2] for _, m in bodies) + p.proud_mm + 0.01
-        chk("strip z range", slo[2] >= z_lo and shi[2] <= z_hi,
-            f"[{slo[2]:.3f}, {shi[2]:.3f}]mm", f"in [{z_lo:.3f}, {z_hi:.3f}]mm")
+        chk("strip seats on slot floor", abs(slo[2] - SLOT_FLOOR_MM) <= 0.01,
+            f"{slo[2]:.3f}mm", f"{SLOT_FLOOR_MM:.2f}mm +-0.01")
+        chk("strip top is proud and level", slo[2] + p.proud_mm < shi[2] <= z_hi,
+            f"{shi[2]:.3f}mm", f"in ({slo[2] + p.proud_mm:.3f}, {z_hi:.3f}]mm")
 
     wn = max(len(r[1]) for r in rows)
     wg = max(len(r[2]) for r in rows)

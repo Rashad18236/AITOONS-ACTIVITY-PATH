@@ -163,3 +163,28 @@ the flat parts of an Alpine flight.
   `headers` kwarg on `_tile_mosaic`/`_get` is gone; instead `_get` now sends a single
   module-level identifying `UA` on every request — found live, overpass-api.de answers
   requests' default User-Agent with a bare 406.
+
+# Addendum 2026-08-06a: full-height level flight strip (approved)
+
+The strip used to follow the terrain, sitting `groove_d_mm` into a shallow groove and
+`proud_mm` above it — a red line that disappeared into every ridge it crossed. It is now
+a **level wall**: one constant rectangle in cross-section, swept along the same
+centreline, from `SLOT_FLOOR_MM = 1.0` (new module constant in `poster.py`, not a Param)
+up to `max(surface sampled along the track) + proud_mm`. Both z values are scalars, which
+is a straight simplification of `strip_mesh` — the centreline, `_offsets` and the winding
+scheme are untouched, only the per-station z arrays became constants.
+
+The slot matches: `compose_parts` now carves `green[gmask] = SLOT_FLOOR_MM` instead of
+subtracting `groove_d_mm`, so the slot's **depth** varies with the terrain while its
+**floor** does not. The 1.0mm floor keeps the relief plate connected under the slot;
+`plate_mm` must exceed it, which `build_poster` validates in place of the old
+`plate_mm > groove_d_mm` guard. Cap masks still exclude the slot, and the width fit
+(`groove_w_mm − 2·clearance_mm`) is unchanged, so the seat invariant holds as before.
+
+Consequence, accepted: `Params.groove_d_mm` (and its "Groove depth mm" UI slider) no
+longer has any effect — slot depth is derived now. Left in place rather than removed;
+drop both when convenient.
+
+`check_output.py`'s single "strip z range" rule became two: bottom == `SLOT_FLOOR_MM`
+±0.01, and top above `bottom + proud_mm` and no higher than the tallest relief body
++ `proud_mm`.

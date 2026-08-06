@@ -138,15 +138,23 @@ def test_compose_parts_frame_and_relief_levels():
     assert parts["green"].max() <= p.plate_mm + p.relief_mm * p.exaggeration + 1e-6
 
 
-def test_compose_parts_groove_carved():
+def test_compose_parts_slot_floor_is_constant():
+    """The slot is carved to a constant floor, so the level strip seats on a flat
+    seat regardless of the terrain it crosses (depth varies, floor does not)."""
     p, N, fpx, elev, track, bounds = _synthetic()
     M = _mpx(p)
     parts = poster.compose_parts(track, elev, np.zeros((M, M), np.uint8), bounds, p)
     tpx = parts["track_px"]
     mid = (tpx[0] + tpx[-1]) / 2      # len(tpx)//2 was the endpoint, not the middle
     x, y = int(round(mid[0])), int(round(mid[1]))
-    assert parts["surface"][y, x] - parts["green"][y, x] == p.groove_d_mm  # exactly groove depth
     assert 0 <= x < M and 0 <= y < M                       # track inside the relief plate
+    gmask = poster._groove_mask(tpx, (M, M), p)
+    assert gmask[y, x]
+    assert (parts["green"][gmask] == poster.SLOT_FLOOR_MM).all()
+    assert 0 < poster.SLOT_FLOOR_MM < p.plate_mm           # plate stays connected under it
+    # the elevation ramp means the slot really does vary in depth along the track
+    depth = parts["surface"][gmask] - parts["green"][gmask]
+    assert depth.max() - depth.min() > 1.0
 
 
 def test_compose_parts_shapes_and_caps():
@@ -159,7 +167,7 @@ def test_compose_parts_shapes_and_caps():
     parts = poster.compose_parts(track, elev, lc, bounds, p)
     assert parts["frame"].shape == (N, N) and parts["green"].shape == (M, M)
     assert parts["frame"][0, 0] == p.base_mm + p.frame_height_mm
-    assert parts["green"].min() >= p.plate_mm - p.groove_d_mm - p.cap_mm - 1e-6
+    assert parts["green"].min() >= min(poster.SLOT_FLOOR_MM, p.plate_mm - p.cap_mm) - 1e-6
     w, c = parts["water"], parts["snow"]
     assert w[10, 10] and not w[0, 0]                       # inside square, outside it
     assert not w[0, 25]                                    # 1px border excluded
@@ -171,9 +179,9 @@ def test_compose_parts_shapes_and_caps():
     gmask = poster._groove_mask(parts["track_px"], (M, M), p)
     assert gmask[30:40, 30:40].any()      # the groove really does cross the snow square
     assert not (w | c)[gmask].any()
-    # so every cell drops by at most one of the two, never both stacked
-    drop = parts["surface"] - parts["green"]
-    assert drop.max() <= max(p.groove_d_mm, p.cap_mm) + 1e-9
+    # so outside the slot every cell drops by at most cap_mm, never cap + slot stacked
+    drop = (parts["surface"] - parts["green"])[~gmask]
+    assert drop.max() <= p.cap_mm + 1e-9
     assert not (w & c).any()
 
 
@@ -197,7 +205,7 @@ def _groove_widths(p):
                     q[..., 0].round().astype(int).clip(0, M - 1)]
         return (np.where(ok.all(1), len(step), ok.argmin(1)) - 1) * 0.25
 
-    return (reach(1.0) + reach(-1.0))[2:-2] * p.res_mm       # skip the square ends
+    return (reach(1.0) + reach(-1.0))[2:-2] * p.res_mm, parts   # skip the square ends
 
 
 def test_strip_seats_in_groove_at_every_angle():
@@ -213,7 +221,12 @@ def test_strip_seats_in_groove_at_every_angle():
     single resolution decides this on rasterisation luck rather than mechanism."""
     for res in (0.5, 0.4, 0.25):
         p = _params(res_mm=res)
-        w = _groove_widths(p)
+        w, parts = _groove_widths(p)
+        # ...and it seats on the slot floor exactly, not on the terrain under it
+        strip = poster.strip_mesh(parts["track_px"], parts["surface"], p)
+        assert abs(strip.bounds[0][2] - poster.SLOT_FLOOR_MM) < 1e-6
+        assert (parts["green"][parts["surface"] > parts["green"]] ==
+                poster.SLOT_FLOOR_MM).all()
         assert w.min() >= p.groove_w_mm - 2 * p.clearance_mm, \
             f"res={res}: groove pinches to {w.min():.2f}mm, " \
             f"strip is {p.groove_w_mm - 2 * p.clearance_mm}mm"
@@ -256,11 +269,30 @@ def test_strip_mesh_geometry():
     assert m.volume > 0              # outward normals, not inverted
     zmin, zmax = m.bounds[0][2], m.bounds[1][2]
     assert abs(zmax - (surface[0, 0] + p.proud_mm)) < 1e-6
-    assert abs(zmin - (surface[0, 0] - p.groove_d_mm)) < 1e-6
+    assert abs(zmin - poster.SLOT_FLOOR_MM) < 1e-6
     # width across a straight section = groove - 2*clearance
     xs = m.vertices[np.abs(m.vertices[:, 0] - 25 * p.res_mm) < p.res_mm]
     width = xs[:, 1].max() - xs[:, 1].min()
     assert abs(width - (p.groove_w_mm - 2 * p.clearance_mm)) < 0.2
+
+
+def test_strip_is_a_level_wall_over_varying_terrain():
+    """Full-height level line: the strip is one constant rectangle in cross-section,
+    from the slot floor to proud of the *highest* terrain the track crosses — it does
+    not follow the terrain any more, so every z is one of exactly two values."""
+    p = _params()
+    M = _mpx(p)
+    surface = p.plate_mm + np.tile(np.linspace(0, 12.0, M), (M, 1))   # W-E ramp
+    track_px = np.array([[5.0, 30.0], [30.0, 30.0], [55.0, 45.0]])
+    m = poster.strip_mesh(track_px, surface, p)
+    assert m.is_watertight and m.is_winding_consistent and m.volume > 0
+    z = np.unique(m.vertices[:, 2].round(6))
+    assert len(z) == 2, f"strip cross-section is not constant: {z}"
+    sampled = surface[np.clip(poster._offsets(track_px)[0][:, 1].round().astype(int), 0, M - 1),
+                      np.clip(poster._offsets(track_px)[0][:, 0].round().astype(int), 0, M - 1)]
+    assert abs(z[0] - poster.SLOT_FLOOR_MM) < 1e-6
+    assert abs(z[1] - (sampled.max() + p.proud_mm)) < 1e-6
+    assert z[1] > sampled.max()                            # clears the highest crossing
 
 
 TRACK3 = np.array([[47.0, 8.0, 0], [47.2, 8.4, 2000], [47.5, 9.0, 3000]])
@@ -410,6 +442,21 @@ def test_3mf_roundtrip():
 
 
 
+
+
+def test_check_output_passes_on_freshly_built_files(monkeypatch, tmp_path):
+    """The shipped checker agrees with the shipped builder — in particular that the
+    strip really does bottom out on the constant slot floor."""
+    import check_output
+    _fake_fetches(monkeypatch, water=True)
+    frame_stl, bodies, path_stl = poster.build_poster(TRACK3, _params(text="HB-EZE"))
+    (tmp_path / "frame.stl").write_bytes(frame_stl)
+    (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
+    (tmp_path / "path.stl").write_bytes(path_stl)
+    assert check_output.main([str(tmp_path / "frame.stl"), str(tmp_path / "relief.3mf"),
+                              str(tmp_path / "path.stl"), "--params",
+                              '{"size_mm": 40, "frame_mm": 4, "res_mm": 0.5, '
+                              '"text": "HB-EZE"}']) == 0
 
 
 def test_elevation_always_uses_the_fit_zoom(monkeypatch):

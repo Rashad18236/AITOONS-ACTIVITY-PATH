@@ -138,6 +138,11 @@ def fetch_elevation(bounds, px_out):
 COLORS = {"frame": "#222222", "green": "#4CAF50", "water": "#2196F3",
           "snow": "#9E9E9E", "strip": "#CC2222"}
 
+# Constant z the slot is carved down to, so the level strip seats on a flat floor
+# whatever terrain it crosses. Keeps the relief plate connected under the slot;
+# the slot's *depth* therefore varies with the terrain, its floor does not.
+SLOT_FLOOR_MM = 1.0
+
 
 def _opened(mask, k):
     """Morphological opening via PIL: erode then dilate with a k*k kernel."""
@@ -318,7 +323,7 @@ def compose_parts(track, elev, lc, bounds, p):
 
     frame (N,N): backplate + raised ring + embossed text — printed alone.
     green/surface/water/snow/track_px: the (M,M) relief plate that drops into the
-    ring, its pre-groove pre-cap top, the two colour-cap vertex masks, and the
+    ring, its pre-slot pre-cap top, the two colour-cap vertex masks, and the
     track in relief-plate pixels."""
     N, M, fpx = _grid(p)
     frame = np.full((N, N), p.base_mm)
@@ -348,7 +353,7 @@ def compose_parts(track, elev, lc, bounds, p):
     water = (lc == 1) & ~gmask & border
     snow = (lc == 2) & ~gmask & border
     green = surface - p.cap_mm * (water | snow)
-    green[gmask] -= p.groove_d_mm
+    green[gmask] = SLOT_FLOOR_MM        # full-depth slot, constant floor
     return dict(frame=frame, green=green, surface=surface,
                 water=water, snow=snow, track_px=track_px)
 
@@ -441,20 +446,22 @@ def masked_slab_mesh(mask, top, thickness, res_mm):
 
 
 def strip_mesh(track_px, surface, p):
-    """Constant-thickness ribbon that seats in the groove and stands proud."""
-    C, nrm = _offsets(track_px)  # same centerline _groove_mask() carved the groove from
+    """Level full-height wall: constant rectangle in cross-section, swept along the
+    track from the slot floor to proud of the highest terrain the track crosses."""
+    C, nrm = _offsets(track_px)  # same centerline _groove_mask() carved the slot from
     n = len(C)
     cx, cy = C[:, 0], C[:, 1]
     half = (p.groove_w_mm / 2 - p.clearance_mm) / p.res_mm  # px
     H, W = surface.shape
-    # ponytail: nearest-neighbour surface sampling; bilinear if strip shows steps
+    # ponytail: nearest-neighbour surface sampling; bilinear if the top looks off
     zc = surface[np.clip(cy.round().astype(int), 0, H - 1),
                  np.clip(cx.round().astype(int), 0, W - 1)]
-    z_top, z_bot = zc + p.proud_mm, zc - p.groove_d_mm
+    z_top, z_bot = float(zc.max()) + p.proud_mm, SLOT_FLOOR_MM
     L, R = C + nrm * half, C - nrm * half
 
     def mm(q, z):
-        return np.stack([q[:, 0] * p.res_mm, (H - 1 - q[:, 1]) * p.res_mm, z], 1)
+        return np.stack([q[:, 0] * p.res_mm, (H - 1 - q[:, 1]) * p.res_mm,
+                         np.full(len(q), z)], 1)
 
     V = np.vstack([mm(L, z_bot), mm(R, z_bot), mm(R, z_top), mm(L, z_top)])
     f = []
@@ -477,8 +484,8 @@ def build_poster(track, p=Params()):
     # plate ever shows up.
     if p.size_mm > 256 or p.res_mm < 0.2:
         raise ValueError("size_mm must be <= 256 (plate limit) and res_mm >= 0.2")
-    for label, v in (("groove depth", p.groove_d_mm), ("colour cap", p.cap_mm)):
-        if p.plate_mm <= v:   # groove cuts through / caps push the terrain negative
+    for label, v in (("slot floor", SLOT_FLOOR_MM), ("colour cap", p.cap_mm)):
+        if p.plate_mm <= v:   # slot floor above the plate top / caps push terrain negative
             raise ValueError(f"{label} ({v}mm) must be less than the relief plate "
                              f"thickness ({p.plate_mm}mm)")
     bounds = track_bounds(track, p.margin_pct)

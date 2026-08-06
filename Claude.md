@@ -2,7 +2,8 @@
 
 Local web tool that turns a FlightRadar24 track export (KML/CSV) into three 3D-printable files:
 `frame.stl` (black backplate + ring + embossed text), `relief.3mf` (multi-body green terrain /
-blue water / grey high-alpine caps, one AMS slot each) and `path.stl` (the flight-path strip).
+blue water / grey high-alpine caps, one AMS slot each) and `path.stl` (the flight-path strip:
+a level red wall standing in a constant-floor slot).
 
 ## Rules
 
@@ -25,6 +26,6 @@ uv run uvicorn app:app --reload
 - `static/index.html` — upload form, parameter sliders, three.js preview, downloads
 - `test_poster.py` — self-check: parse sample track, build small mesh, assert watertight + strip fits groove
 
-Key invariant: every body comes off the same heightmap, so they always fit. The relief plate glues into the frame ring (fit clearance ceil-rounded up to a whole pixel, ≥0.2mm per side — rounding down gives an interference fit); the strip glues into the groove with 0.30mm per side.
+Key invariant: every body comes off the same heightmap, so they always fit. The relief plate glues into the frame ring (fit clearance ceil-rounded up to a whole pixel, ≥0.2mm per side — rounding down gives an interference fit); the strip glues into the slot with 0.30mm per side. The slot is carved to a constant `SLOT_FLOOR_MM = 1.0` floor (depth varies with terrain, the floor does not), and the strip is a level wall from that floor to `proud_mm` above the highest terrain the track crosses.
 
 Spec: `docs/superpowers/specs/2026-08-05-flight-path-poster-design.md`
