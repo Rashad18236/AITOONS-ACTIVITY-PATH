@@ -114,10 +114,14 @@ def main(argv=None):
 
         # 5. ring height: base + frame_height, plus the text emboss if text was asked for
         ring = p.base_mm + p.frame_height_mm
+        want = f"{ring:.2f}mm +-0.01" + (f" (+{EMBOSS_MM}mm emboss)" if p.text else "")
+        # the emboss is not recoverable from the mesh, so an exact EMBOSS_MM overshoot
+        # on a no-text run is almost always a forgotten --params text, not a bad print
+        if not p.text and abs(hi[2] - ring - EMBOSS_MM) <= 0.01:
+            want += "  (hint: if generated with text, pass the same text in --params)"
         chk("frame ring height",
             ring - 0.01 <= hi[2] <= ring + (EMBOSS_MM if p.text else 0) + 0.01,
-            f"{hi[2]:.3f}mm",
-            f"{ring:.2f}mm +-0.01" + (f" (+{EMBOSS_MM}mm emboss)" if p.text else ""))
+            f"{hi[2]:.3f}mm", want)
 
         # 6. relief plate footprint == the ring opening less the fit gap. Taken from
         # _grid(), not re-derived: frame_mm/res_mm truncates (12/0.4 -> 29 px, not 30),
