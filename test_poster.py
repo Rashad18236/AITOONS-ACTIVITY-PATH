@@ -114,7 +114,7 @@ def _synthetic():
     p = _params()
     N = int(p.size_mm / p.res_mm)              # 80
     fpx = int(p.frame_mm / p.res_mm)           # 8
-    M = _mpx(p)                                # 64
+    M = _mpx(p)                                # 62
     elev = np.tile(np.linspace(0, 1000, M), (M, 1))  # E-W gradient
     track = np.array([[47.0, 8.0, 0], [47.5, 9.0, 3000]])
     bounds = poster.track_bounds(track, p.margin_pct)
@@ -315,6 +315,13 @@ def test_build_poster_rejects_oversized_grid():
         poster.build_poster(track, _params(res_mm=0.01))
     with pytest.raises(ValueError):   # groove would cut clean through the relief plate
         poster.build_poster(track, _params(plate_mm=1.0, groove_d_mm=1.5))
+
+
+def test_build_poster_rejects_cap_thicker_than_plate(monkeypatch):
+    """cap_mm >= plate_mm silently produced negative green heights (API-only path)."""
+    _fake_fetches(monkeypatch)
+    with pytest.raises(ValueError):
+        poster.build_poster(TRACK3, _params(plate_mm=2.0, cap_mm=3.0))
 
 
 def test_generate_endpoint(monkeypatch):

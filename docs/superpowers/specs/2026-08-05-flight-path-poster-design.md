@@ -114,8 +114,9 @@ Supersedes the single-poster output. Three deliverables per generate:
 - UI: three download links; preview shows frame (black, STLLoader), relief (3MFLoader,
   per-body colors), strip (red) assembled: relief and strip translated by
   (frame+fit, frame+fit, base) onto the backplate.
-- Known ceilings (accepted): relief.3mf is large (~80–120MB XML at 250mm defaults) and
-  the browser 3MF parse is slow; upgrade path is mesh decimation or binary attachments.
+- Known ceilings (accepted, measured at 250mm defaults): relief.3mf is ~9.4MB zipped —
+  the big one is frame.stl at 39.3MB (a near-flat plate meshed at full grid resolution),
+  and the JSON response totals ~65MB. Upgrade path is mesh decimation on the frame.
   Text emboss stays black-on-black (frame filament); contrasting text = 4th slot, later.
 - check_output.py extends to the trio: frame footprint/watertight, relief bodies
   round-tripped from the 3MF (also validates the writer), caps within relief bounds,

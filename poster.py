@@ -372,8 +372,10 @@ def build_poster(track, p=Params()):
     # plate ever shows up.
     if p.size_mm > 256 or p.res_mm < 0.2:
         raise ValueError("size_mm must be <= 256 (plate limit) and res_mm >= 0.2")
-    if p.plate_mm <= p.groove_d_mm:
-        raise ValueError("plate_mm must exceed groove_d_mm — the groove would cut through")
+    for label, v in (("groove depth", p.groove_d_mm), ("colour cap", p.cap_mm)):
+        if p.plate_mm <= v:   # groove cuts through / caps push the terrain negative
+            raise ValueError(f"{label} ({v}mm) must be less than the relief plate "
+                             f"thickness ({p.plate_mm}mm)")
     bounds = track_bounds(track, p.margin_pct)
     M = _grid(p)[1]
     # mercator x-span is ground distance only at the equator; scale by cos(mid-lat)
