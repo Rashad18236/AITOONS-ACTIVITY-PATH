@@ -434,7 +434,16 @@ def compose_parts(track, elev, lc, bounds, p):
         # strokes wide enough that the counters survive the dilation.
         ink = font.getbbox(p.text)
         if ink[3] > ink[1]:
-            font = _font(max(round(px * px / (ink[3] - ink[1])), 6))
+            px = max(round(px * px / (ink[3] - ink[1])), 6)
+            font = _font(px)
+            ink = font.getbbox(p.text)
+        # ...then shrink again if the string is too long for the bar. TrueType glyphs
+        # run ~40% wider than the bitmap this replaced, and nothing clamped the width:
+        # a long callsign silently clipped off the poster edge. Fit it to the ring
+        # opening, which keeps it off the corners where the side bars meet.
+        avail = N - 2 * fpx
+        if ink[2] - ink[0] > avail:
+            font = _font(max(int(px * avail / (ink[2] - ink[0])), 6))
             ink = font.getbbox(p.text)
         h = ink[3] - ink[1]
         d.text(((N - (ink[2] - ink[0])) / 2 - ink[0], N - fpx + (fpx - h) / 2 - ink[1]),
@@ -664,6 +673,7 @@ def write_3mf(bodies):
     (the old object-level extruder key left the slots unassigned). Written by hand:
     trimesh's 3MF support is export-only via lib3mf and carries neither."""
     import zipfile
+    assert len(bodies) < 100, "basematerials ids are oid+100 — they'd collide"
     # ponytail: f-string per vertex/triangle — ~2M lines and a few seconds at default
     # res. Swap in np.savetxt or a binary extension only if generation time hurts.
     objs, comps, parts = [], [], []

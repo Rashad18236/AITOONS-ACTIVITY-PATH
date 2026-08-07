@@ -713,7 +713,7 @@ def test_3mf_roundtrip_skips_the_container():
 
 def _text_body(**kw):
     """The shipped 250mm text case, without paying for a whole build_poster."""
-    p = poster.resolve(poster.Params(size_mm=250.0, text="HB-EZE", **kw))
+    p = poster.resolve(poster.Params(**{"size_mm": 250.0, "text": "HB-EZE", **kw}))
     M = poster._grid(p)[1]
     track = np.array([[47.0, 8.0, 0.0], [47.5, 9.0, 3000.0]])
     parts = poster.compose_parts(track, np.zeros((M, M), np.float32),
@@ -723,30 +723,59 @@ def _text_body(**kw):
                                              0.8, p.res_mm)
 
 
-def test_frame_text_meshes_into_readable_glyphs():
-    """Regression: load_default's ~1px strokes never filled a whole 4-corner cell,
-    so masked_slab_mesh ate the glyphs and left 840 vertices of slivers. A real
-    TrueType face plus a 1px dilation makes every glyph pixel cell-interior."""
-    p, parts, text = _text_body()
+def _assert_text_meshes(p, parts, text, min_verts):
+    """The meshability bars, shared by the TrueType and the load_default paths."""
     assert text is not None
-    assert len(text.vertices) >= 2500, f"only {len(text.vertices)} verts — still slivers"
+    assert len(text.vertices) >= min_verts, f"only {len(text.vertices)} verts — still slivers"
     assert text.is_watertight and text.is_winding_consistent and text.volume > 0
     tm = parts["text_mask"]
     # constant-thickness slab: volume / thickness IS the meshed footprint area
     foot = text.volume / 0.8
-    # The dilated mask's own 1px rim can never be meshed (a cell wants 4 corners), so
-    # the bar is the *glyph* area the dilation was there to protect: erode the mask
-    # back and require the mesh to cover all of it. Nothing of the lettering is eaten.
+    # Bar is the *glyph* area the dilation exists to protect: erode the mask back and
+    # require the mesh to cover all of it, i.e. no lettering was eaten by the cell rule.
     from PIL import ImageFilter
     eroded = Image.fromarray(tm.astype(np.uint8) * 255).filter(ImageFilter.MinFilter(3))
     glyphs = (np.asarray(eroded) > 0).sum() * p.res_mm ** 2
     assert foot >= glyphs, f"meshed {foot:.1f}mm2 of {glyphs:.1f}mm2 of glyphs"
-    assert foot >= 0.75 * tm.sum() * p.res_mm ** 2      # and most of the dilated mask
+    # ...and most of the dilated mask. Its outer 1px rim is where the loss sits (a cell
+    # wants four corners), concentrated at tight joints and counters — 75% is a
+    # no-big-chunk-missing tripwire, not the real invariant above.
+    assert foot >= 0.75 * tm.sum() * p.res_mm ** 2
     # z semantics unchanged: bottom on the ring top, 0.8mm proud
     ring = p.base_mm + p.frame_height_mm
     assert abs(text.bounds[0][2] - ring) < 1e-6
     assert abs(text.bounds[1][2] - (ring + 0.8)) < 1e-6
     assert parts["frame"].max() == ring                       # ring still flat
+
+
+def test_frame_text_meshes_into_readable_glyphs():
+    """Regression: load_default's ~1px strokes never filled a whole 4-corner cell,
+    so masked_slab_mesh ate the glyphs and left 840 vertices of slivers. A real
+    TrueType face plus a 1px dilation makes every glyph pixel cell-interior."""
+    p, parts, text = _text_body()
+    _assert_text_meshes(p, parts, text, 2500)
+
+
+def test_frame_text_meshes_without_a_truetype_font(monkeypatch):
+    """The load_default fallback is the path every box without one of FONT_PATHS
+    takes, so it has to clear the same bars — it is the dilation, not the face,
+    that satisfies the cell rule."""
+    monkeypatch.setattr(poster, "FONT_PATHS", ("/nonexistent/no-such-font.ttf",))
+    p, parts, text = _text_body()
+    _assert_text_meshes(p, parts, text, 2500)
+
+
+def test_frame_text_shrinks_to_fit_the_bar():
+    """TrueType glyphs run ~40% wider than the old bitmap, so a long string has to
+    shrink to fit the ring's bottom bar instead of silently clipping off the edge."""
+    long_text = "ZURICH KLOTEN TO GENEVA COINTRIN VIA THE ALPS"
+    p, parts, text = _text_body(text=long_text)
+    N, _, fpx = poster._grid(p)
+    tm = parts["text_mask"]
+    cols, rows = np.where(tm.any(0))[0], np.where(tm.any(1))[0]
+    assert fpx <= cols.min() and cols.max() < N - fpx      # inside the bar, off the corners
+    assert N - fpx <= rows.min() and rows.max() < N        # still on the bottom bar
+    _assert_text_meshes(p, parts, text, 2500)
 
 
 

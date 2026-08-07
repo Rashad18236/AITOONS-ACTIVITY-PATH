@@ -133,6 +133,16 @@ def main(argv=None):
                 abs(tlo[2] - ring) <= 0.01 and abs(thi[2] - ring - TEXT_MM) <= 0.01,
                 f"[{tlo[2]:.3f}, {thi[2]:.3f}]mm",
                 f"[{ring:.2f}, {ring + TEXT_MM:.2f}]mm +-0.01")
+            # 6b. and staying on the ring's bottom bar in xy. The glyphs are TrueType
+            # now, ~40% wider than the bitmap they replaced, so a long string that
+            # overflows and clips off the poster edge must not pass silently.
+            # The mesh flips y, so the bottom bar is the first fpx pixel rows.
+            bar = lo[1] + _grid(p)[2] * p.res_mm
+            chk("text body on the bottom bar",
+                tlo[0] >= lo[0] - 0.5 and thi[0] <= hi[0] + 0.5
+                and tlo[1] >= lo[1] - 0.5 and thi[1] <= bar + 0.5,
+                f"x[{tlo[0]:.1f}, {thi[0]:.1f}] y[{tlo[1]:.1f}, {thi[1]:.1f}]mm",
+                f"in x[{lo[0]:.1f}, {hi[0]:.1f}] y[{lo[1]:.1f}, {bar:.1f}]mm +-0.5")
 
         # 7. relief plate footprint == the ring opening less the fit gap. Taken from
         # _grid(), not re-derived: frame_mm/res_mm truncates (12/0.4 -> 29 px, not 30),
