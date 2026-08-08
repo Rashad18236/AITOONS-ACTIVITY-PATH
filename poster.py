@@ -461,12 +461,19 @@ def compose_parts(track, elev, lc, bounds, p):
     track_px = np.stack([(xy[:, 0] - x0) / (x1 - x0) * M,
                          (y1 - xy[:, 1]) / (y1 - y0) * M], 1)
     gmask = _groove_mask(track_px, (M, M), p)
-    # caps are separate slabs: keep them off the groove (the strip goes there) and off
-    # the outer vertex ring, where a slab wall would hang over the plate edge.
+    # Both stay off the groove — the strip goes there. The outer vertex ring is a
+    # water-only exclusion: a conformal cap is a thin slab floating at `surface - cap_mm`,
+    # and on the boundary ring it has nothing under it, so its wall hangs off the plate
+    # edge. The band is not a slab, it is a solid from the flat z_snow plane up to the
+    # surface, resting on the green below it — it cannot overhang, and a boundary cell's
+    # wall is coplanar with the terrain's own skirt. Excluding it there was the real cause
+    # of green towering above the plane: the plate's skirt stayed green up to the terrain
+    # height wherever the bbox runs a mountain off the edge (31.52mm against a 16.88mm
+    # plane on HB-EZE), which is 123 of the 266 layers holding two colours.
     border = np.zeros((M, M), bool)
     border[1:-1, 1:-1] = True
     water = (lc == 1) & ~gmask & border
-    snow = (lc == 2) & ~gmask & border
+    snow = (lc == 2) & ~gmask
     # Grey is a BAND, not a cap: the terrain solid is split at the horizontal plane
     # z_snow (the snow line on the relief's own scale, on a layer boundary), green
     # below it and grey above. A conformal cap surfaced as a `cap_mm / slope` stripe

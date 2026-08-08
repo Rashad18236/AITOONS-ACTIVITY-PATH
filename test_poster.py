@@ -1121,16 +1121,21 @@ def test_green_never_towers_above_the_snow_plane():
     region: a rim vertex is a corner of a cell that has another corner at or below the
     plane, so it can exceed the plane by at most one cell's terrain rise.
 
-    Excluded from the claim, both by design and both pre-existing: the slot (green there
-    is the slot floor, not terrain) and the outer vertex ring, which `compose_parts`
-    keeps clear of every slab so no wall overhangs the plate edge."""
+    The claim covers the whole plate *including its outer vertex ring*. The ramp climbs
+    straight off the east edge well above the snow line, which is exactly the case that
+    used to break it: the ring is excluded from the water cap (a thin conformal slab
+    there would hang off the plate edge) and the band used to be excluded with it, so the
+    plate's own skirt wall stayed green all the way up to the terrain. A band is a solid
+    resting on the green below it, so it is exempt and reaches the edge.
+
+    Only the slot is excluded — green there is the slot floor, not terrain."""
     p, M, elev, parts = _banded()
     s, z_snow = parts["surface"], parts["z_snow"]
     rise = max(np.abs(np.diff(s, axis=0)).max(), np.abs(np.diff(s, axis=1)).max())
-    plate = np.zeros((M, M), bool)
-    plate[1:-1, 1:-1] = True
-    plate &= ~poster._groove_mask(parts["track_px"], (M, M), p)
+    plate = ~poster._groove_mask(parts["track_px"], (M, M), p)
     assert s.max() > 15 * rise + z_snow                    # the ground really does tower
+    assert s[:, -1].min() > z_snow                         # ...and off the plate edge
+    assert parts["snow_cells"][:, -1].any()                # so the band reaches that edge
     assert parts["green"][plate].max() <= z_snow + rise + 1e-9
 
     # ...and that bound is a rim, not a coincidence: every green vertex above the plane
