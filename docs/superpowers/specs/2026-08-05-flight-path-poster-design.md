@@ -296,7 +296,7 @@ multiple of `layer_mm` (3MF `%.3f` -> 1e-6, binary STL float32 -> 1e-4).
 
 ---
 
-# Addendum 2026-08-08: grey as an elevation band (approved)
+# Addendum 2026-08-08: grey as an elevation band + 0.12mm print grid (approved)
 
 ## Grey is a band, not a conformal cap
 
@@ -335,3 +335,36 @@ Consequence for `check_output.py`: the grey body no longer sits within `cap_mm` 
 terrain top. Its rules are now "flat bottom" (exactly half the vertices share the lowest
 z, i.e. one plane, not a conformal underside) and "above `plate_mm`, under the relief
 ceiling". The water cap keeps the old tight `terrain + cap_mm` bound.
+
+## 0.12mm layers, snapped to the printer's real grid
+
+`layer_mm` 0.2 → **0.12** (0.4 nozzle, "Fine" preset; see `docs/print-settings.md`).
+
+The snap was `round(z / layer) * layer`, which assumes every layer is `layer_mm` thick.
+The printer's **first layer is 0.2mm** (`FIRST_LAYER_MM`, Bambu's nozzle Ø × 50% rule)
+and the rest are `layer_mm`, so a printable height is `0.2 + n*0.12`. One helper,
+`_snap(z, p, rnd=np.round)`, now does it for the terrain surface, the strip top, the
+strip's relief ceiling (`rnd=floor`, so the cap cannot land above the ceiling) and the
+`z_snow` plane. `layer_mm = 0` still opts out. z = 0 is the build plate and is exempt.
+
+Every constant that has to land on that grid moved:
+
+| Constant | Was | Now | Why |
+|---|---|---|---|
+| `layer_mm` | 0.2 | **0.12** | 1.67× the vertical quantisation over the same relief |
+| `smooth_px` | 2.0 | **1.0** | half the layer height needs half the blur; crisper terrain |
+| `cap_mm` (water) | 0.6 | **0.96** | 8 layers, and past the ~1mm opacity threshold |
+| text emboss | 0.8 | **0.84** (`TEXT_EMBOSS_MM`) | 7 layers above the ring top |
+| `SLOT_FLOOR_MM` | 1.0 | **1.04** | `0.2 + 7*0.12`: the boundary nearest 1.0. *Not* 0.96 — 0.96 is 8×0.12 of material but lands mid-layer once the 0.2 first layer is counted, which is the bug this change exists to fix |
+| `base_mm` | 4.0 | **4.04** | `0.2 + 32*0.12` |
+| `frame_height_mm` @250 | 10.0 | **9.96** | a whole 83 layers, so the ring top `base + frame_height` = 14.00 is itself a boundary |
+| `proud_mm` @250 | 1.0 | **0.96** | 8 layers above an already-snapped terrain sample |
+| `plate_mm` | 2.0 | 2.0 | already `0.2 + 15*0.12` |
+
+Guards unchanged and still hold: `plate_mm` (2.0) > `SLOT_FLOOR_MM` (1.04) and > `cap_mm`
+(0.96). `frame_height_mm` and `proud_mm` are scaled params, so only their 250mm base is
+grid-exact; at other sizes the strip top is snapped anyway and the frame is a flat
+two-level body the slicer quantises on its own.
+
+`check_output.py`'s layer rule now measures against `_snap` (the same helper the generator
+uses) and covers the colour bodies as well as the terrain and the strip.

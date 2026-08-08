@@ -98,8 +98,8 @@ def _params(**kw):
     """Test params: every scaled field pinned to its 250mm base, so these tests
     measure geometry, not the auto-scaling (which resolve() is tested for below)."""
     return poster.Params(**{"size_mm": 40.0, "frame_mm": 4.0, "res_mm": 0.5,
-                            "relief_mm": 20.0, "frame_height_mm": 10.0, "text_mm": 8.0,
-                            "groove_w_mm": 2.0, "proud_mm": 1.0, **kw})
+                            "relief_mm": 20.0, "frame_height_mm": 9.96, "text_mm": 8.0,
+                            "groove_w_mm": 2.0, "proud_mm": 0.96, **kw})
 
 
 def test_resolve_at_250_is_the_legacy_defaults():
@@ -108,10 +108,10 @@ def test_resolve_at_250_is_the_legacy_defaults():
     p = poster.resolve(poster.Params(size_mm=250))
     assert p.frame_mm == 12.0
     assert p.relief_mm == 20.0
-    assert p.frame_height_mm == 10.0
+    assert p.frame_height_mm == 9.96     # was 10.0: whole 0.12 layers, ring top 14.00
     assert p.text_mm == 8.0
     assert p.groove_w_mm == 2.0
-    assert p.proud_mm == 1.0
+    assert p.proud_mm == 0.96            # was 1.0: 8 layers of 0.12
     assert p.snow_min_mm == 3.0
 
 
@@ -119,15 +119,15 @@ def test_resolve_scales_and_floors_at_80mm():
     p = poster.resolve(poster.Params(size_mm=80))
     assert p.frame_mm == 4.0            # 3.84 -> floor
     assert p.relief_mm == 6.4           # 20 * 80/250, above its 5.0 floor
-    assert p.frame_height_mm == 3.2     # 10 * 80/250, above its 3.0 floor
+    assert p.frame_height_mm == 3.19    # 9.96 * 80/250, above its 3.0 floor
     assert p.text_mm == 3.0             # 2.56 -> floor
     assert p.groove_w_mm == 1.2         # 0.64 -> floor
-    assert p.proud_mm == 0.4            # 0.32 -> floor
+    assert p.proud_mm == 0.4            # 0.31 -> floor
     assert p.snow_min_mm == 1.5          # 0.96 -> floor
     # absolute params are untouched by size (printer properties, not visual scale)
     assert (p.base_mm, p.plate_mm, p.cap_mm, p.clearance_mm, p.fit_mm, p.res_mm,
-            p.snow_line_m, p.layer_mm, p.smooth_px) == (4.0, 2.0, 0.6, 0.30, 0.2, 0.4,
-                                                        2000.0, 0.2, 2.0)
+            p.snow_line_m, p.layer_mm, p.smooth_px) == (4.04, 2.0, 0.96, 0.30, 0.2, 0.4,
+                                                        2000.0, 0.12, 1.0)
 
 
 def test_resolve_passes_explicit_values_through_and_is_idempotent():
@@ -454,7 +454,7 @@ def test_strip_is_capped_at_the_relief_ceiling(capsys):
     m = poster.strip_mesh(parts["track_px"], parts["alt_mm"], parts["surface"], p)
     assert m.is_watertight and m.is_winding_consistent and m.volume > 0
     top = _strip_tops(m, parts["track_px"])
-    ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm      # 33.0mm
+    ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm      # 32.96mm
     assert abs(top.max() - ceiling) < 1e-9                 # capped, not 722mm
     assert np.abs(top - poster._snap(top, p)).max() < 1e-9
     assert "ceiling" in capsys.readouterr().out            # and it says so, once
@@ -486,8 +486,8 @@ def test_build_poster_v2(monkeypatch):
 
 
 def test_build_poster_text_is_its_own_white_body(monkeypatch):
-    """Text prints white on the black frame: a second body sitting exactly 0.8mm
-    proud of the ring, not an emboss in the frame's own filament."""
+    """Text prints white on the black frame: a second body sitting exactly
+    TEXT_EMBOSS_MM proud of the ring, not an emboss in the frame's own filament."""
     _fake_fetches(monkeypatch)
     p = _params(text="HB-EZE")
     frame_bodies, _, _ = poster.build_poster(TRACK3, p)
@@ -498,7 +498,7 @@ def test_build_poster_text_is_its_own_white_body(monkeypatch):
     assert m.is_watertight and m.is_winding_consistent and m.volume > 0
     ring = p.base_mm + p.frame_height_mm
     assert abs(m.bounds[0][2] - ring) < 1e-6                   # sits on the ring...
-    assert abs(m.bounds[1][2] - (ring + 0.8)) < 1e-6           # ...0.8mm proud, as before
+    assert abs(m.bounds[1][2] - (ring + poster.TEXT_EMBOSS_MM)) < 1e-6   # ...proud of it
     frame = frame_bodies[0][0]
     assert abs(frame.bounds[1][2] - ring) < 1e-6               # frame itself stays flat
 
@@ -723,8 +723,9 @@ def _text_body(**kw):
     parts = poster.compose_parts(track, np.zeros((M, M), np.float32),
                                  np.zeros((M, M), np.uint8),
                                  poster.track_bounds(track, p.margin_pct), p)
-    return p, parts, poster.masked_slab_mesh(parts["text_mask"], parts["frame"] + 0.8,
-                                             0.8, p.res_mm)
+    t = poster.TEXT_EMBOSS_MM
+    return p, parts, poster.masked_slab_mesh(parts["text_mask"], parts["frame"] + t,
+                                             t, p.res_mm)
 
 
 def _assert_text_meshes(p, parts, text, min_verts):
@@ -734,7 +735,7 @@ def _assert_text_meshes(p, parts, text, min_verts):
     assert text.is_watertight and text.is_winding_consistent and text.volume > 0
     tm = parts["text_mask"]
     # constant-thickness slab: volume / thickness IS the meshed footprint area
-    foot = text.volume / 0.8
+    foot = text.volume / poster.TEXT_EMBOSS_MM
     # Bar is the *glyph* area the dilation exists to protect: erode the mask back and
     # require the mesh to cover all of it, i.e. no lettering was eaten by the cell rule.
     from PIL import ImageFilter
@@ -745,10 +746,10 @@ def _assert_text_meshes(p, parts, text, min_verts):
     # wants four corners), concentrated at tight joints and counters — 75% is a
     # no-big-chunk-missing tripwire, not the real invariant above.
     assert foot >= 0.75 * tm.sum() * p.res_mm ** 2
-    # z semantics unchanged: bottom on the ring top, 0.8mm proud
+    # z semantics unchanged: bottom on the ring top, TEXT_EMBOSS_MM proud
     ring = p.base_mm + p.frame_height_mm
     assert abs(text.bounds[0][2] - ring) < 1e-6
-    assert abs(text.bounds[1][2] - (ring + 0.8)) < 1e-6
+    assert abs(text.bounds[1][2] - (ring + poster.TEXT_EMBOSS_MM)) < 1e-6
     assert parts["frame"].max() == ring                       # ring still flat
 
 

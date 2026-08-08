@@ -141,11 +141,15 @@ COLORS = {"frame": "#222222", "text": "#FFFFFF", "green": "#4CAF50",
 # Constant z the slot is carved down to, so the level strip seats on a flat floor
 # whatever terrain it crosses. Keeps the relief plate connected under the slot;
 # the slot's *depth* therefore varies with the terrain, its floor does not.
-SLOT_FLOOR_MM = 1.0
+# 1.04 = 0.2 + 7*0.12, the printable boundary nearest the old 1.0 (see _snap).
+SLOT_FLOOR_MM = 1.04
 
 # The slicer's first layer is thicker than the rest (Bambu: nozzle diameter x 50%),
 # so a printable height is FIRST_LAYER_MM + n*layer_mm, not n*layer_mm.
 FIRST_LAYER_MM = 0.2
+
+# White text body thickness: 7 layers at 0.12. Sits on the (flat) frame ring top.
+TEXT_EMBOSS_MM = 0.84
 
 
 def _snap(z, p, rnd=np.round):
@@ -347,7 +351,7 @@ def fetch_water_mask(bounds, px_out):
 @dataclass
 class Params:
     size_mm: float = 250.0
-    base_mm: float = 4.0
+    base_mm: float = 4.04    # 0.2 + 32*0.12: the layer boundary nearest 4.0
     relief_mm: float | None = None
     exaggeration: float = 1.5
     margin_pct: float = 15.0
@@ -359,21 +363,23 @@ class Params:
     text_mm: float | None = None
     res_mm: float = 0.4
     proud_mm: float | None = None
-    cap_mm: float = 0.6      # water cap slab thickness; grey is a band, not a cap
+    cap_mm: float = 0.96     # water cap slab thickness (8 layers); grey is a band, not a cap
     plate_mm: float = 2.0    # relief plate base thickness (slot floor sits above 0)
     fit_mm: float = 0.2      # gap per side between relief plate and frame ring
     snow_line_m: float = 2000.0   # grey band from this DEM elevation up
     snow_min_mm: float | None = None   # smallest printed grey blob (auto, scaled)
-    layer_mm: float = 0.2    # slicer layer height; terrain snaps to it (0 = don't snap)
-    smooth_px: float = 2.0   # DEM blur radius in pixels, kills sub-layer noise (0 = off)
+    layer_mm: float = 0.12   # slicer layer height; terrain snaps to it (0 = don't snap)
+    smooth_px: float = 1.0   # DEM blur radius in pixels, kills sub-layer noise (0 = off)
 
 
 # Visual params: None means "auto" — base value at 250mm, scaled by size, floored so
 # it still prints. Everything else in Params is absolute (stiffness, FDM tolerance,
 # real-world metres, printer layer height) and must not move with the poster size.
+# frame_height_mm (9.96) and proud_mm (0.96) are whole 0.12 layer counts, so ring top
+# = base_mm + frame_height_mm = 14.00 and terrain + proud_mm both stay on the layer grid.
 # {field: (base@250, floor)}
-_SCALED = {"frame_mm": (12.0, 4.0), "relief_mm": (20.0, 5.0), "frame_height_mm": (10.0, 3.0),
-           "text_mm": (8.0, 3.0), "groove_w_mm": (2.0, 1.2), "proud_mm": (1.0, 0.4),
+_SCALED = {"frame_mm": (12.0, 4.0), "relief_mm": (20.0, 5.0), "frame_height_mm": (9.96, 3.0),
+           "text_mm": (8.0, 3.0), "groove_w_mm": (2.0, 1.2), "proud_mm": (0.96, 0.4),
            "snow_min_mm": (3.0, 1.5)}
 
 
@@ -708,8 +714,9 @@ def build_poster(track, p=Params()):
         if m is not None:
             bodies.append((m, name, COLORS[name], slot))
     frame_bodies = [(heightmap_mesh(parts["frame"], p.res_mm), "frame", COLORS["frame"], 1)]
-    # text is its own white body standing 0.8mm proud of the ring, printed in slot 2
-    text = masked_slab_mesh(parts["text_mask"], parts["frame"] + 0.8, 0.8, p.res_mm)
+    # text is its own white body standing TEXT_EMBOSS_MM proud of the ring, in slot 2
+    text = masked_slab_mesh(parts["text_mask"], parts["frame"] + TEXT_EMBOSS_MM,
+                            TEXT_EMBOSS_MM, p.res_mm)
     if text is not None:
         frame_bodies.append((text, "text", COLORS["text"], 2))
     strip = strip_mesh(parts["track_px"], parts["alt_mm"], parts["surface"], p)

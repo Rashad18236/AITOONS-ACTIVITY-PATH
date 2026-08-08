@@ -20,10 +20,10 @@ import argparse, json, sys
 from dataclasses import fields
 import numpy as np
 import trimesh
-from poster import SLOT_FLOOR_MM, Params, _grid, _snap, read_3mf, resolve
+from poster import SLOT_FLOOR_MM, TEXT_EMBOSS_MM, Params, _grid, _snap, read_3mf, resolve
 
 PLATE_MM = 256.0
-TEXT_MM = 0.8     # build_poster() white text body thickness
+TEXT_MM = TEXT_EMBOSS_MM     # build_poster() white text body thickness
 
 
 def _load(path):
