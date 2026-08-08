@@ -290,7 +290,7 @@ multiple of `layer_mm` (3MF `%.3f` -> 1e-6, binary STL float32 -> 1e-4).
 
 | Param | Kind | Default | Floor |
 |---|---|---|---|
-| `snow_min_mm` | scaled | 3.0 @250mm | 1.5 |
+| `snow_min_mm` | scaled | 3.0 @250mm | 1.5 | *(deleted 2026-08-08, see the band addendum)* |
 | `layer_mm` | absolute | 0.2 (0 = no snapping) | — |
 | `smooth_px` | absolute | 2.0 (0 = no blur) | — |
 
@@ -325,9 +325,15 @@ The terrain solid is now **split at a horizontal plane**, not skinned:
   not reach and gash the assembled surface.
 - The assembled surface is therefore **unchanged**: green-top ∪ grey-top reconstructs the
   same heightmap the single body had. This is a colour-volume change, not a shape change.
-- The `_closed`/`_opened` merge stays. It no longer decides printability, but it is what
-  gives the massifs their natural irregular outline and keeps single-pixel dots out.
-  Band footprint = merged mask ∩ (`surface > z_snow`).
+- **No morphology.** The mask is the bare `elev >= snow_line_m` threshold; `_snow_mask`,
+  `_opened`, `_closed` and `snow_min_mm` are deleted. Keeping the merge was a mistake
+  carried over from the cap design: the *opening* dropped small peaks from grey but not
+  from the terrain, so they stayed green and towered above `z_snow` — 225 of 266 layers
+  on the real HB-EZE trio held more than one colour, green reaching 31.52mm against a
+  16.88mm plane. The *closing* was a no-op here, since it only adds pixels below the
+  threshold and `surface > z_snow` filters them straight back out. In a band a small peak
+  is a solid volume that prints fine, and `_slab_cells` already drops sub-2-cell blobs.
+  Band footprint = (`elev >= snow_line_m`) ∩ (`surface > z_snow`).
 - Water stays a conformal cap — lakes are flat, so its slices are lake-wide already.
   `cap_mm` is now a water-only parameter (0.96mm, 8 layers).
 

@@ -112,7 +112,6 @@ def test_resolve_at_250_is_the_legacy_defaults():
     assert p.text_mm == 8.0
     assert p.groove_w_mm == 2.0
     assert p.proud_mm == 0.96            # was 1.0: 8 layers of 0.12
-    assert p.snow_min_mm == 3.0
 
 
 def test_resolve_scales_and_floors_at_80mm():
@@ -123,7 +122,6 @@ def test_resolve_scales_and_floors_at_80mm():
     assert p.text_mm == 3.0             # 2.56 -> floor
     assert p.groove_w_mm == 1.2         # 0.64 -> floor
     assert p.proud_mm == 0.4            # 0.31 -> floor
-    assert p.snow_min_mm == 1.5          # 0.96 -> floor
     # absolute params are untouched by size (printer properties, not visual scale)
     assert (p.base_mm, p.plate_mm, p.cap_mm, p.clearance_mm, p.fit_mm, p.res_mm,
             p.snow_line_m, p.layer_mm, p.smooth_px) == (4.04, 2.0, 0.96, 0.30, 0.2, 0.4,
@@ -1026,34 +1024,27 @@ def test_build_poster_snow_caps_above_the_snow_line(monkeypatch):
     assert [b[1] for b in bodies] == ["terrain"]
 
 
-def test_snow_speckle_is_opened_away(monkeypatch):
+def test_a_small_peak_above_the_snow_line_is_a_solid_grey_body(monkeypatch):
+    """The old opening dropped small peaks from the grey mask but not from the terrain,
+    so they stayed green and rose above the z_snow plane. As a band a small peak is a
+    solid volume that prints fine, so the mask is the bare threshold — the only thing
+    still filtered is what the DEM blur and cell-based meshing remove anyway."""
     def elev(b, px):
         e = np.full((px, px), 500.0)
-        e[px // 2, px // 2] = 3000.0                       # a single spiky DEM pixel
+        e[8:13, 8:13] = 3000.0          # a 5px peak, clear of the groove and the border
+        e[4, 4] = 3000.0                # a single spiky DEM pixel
         return e
 
     monkeypatch.setattr(poster, "fetch_elevation", elev)
     monkeypatch.setattr(poster, "fetch_water_mask", lambda b, px: np.zeros((px, px), bool))
     _, bodies, _ = poster.build_poster(TRACK3, _params())
-    assert [b[1] for b in bodies] == ["terrain"]
-
-
-def test_snow_mask_merges_ridges_into_massifs_and_drops_specks():
-    """Grey caps print as coherent massifs: closing at the minimum printed blob width
-    bridges ridge slivers, the following opening removes what stayed thin."""
-    p = _params(res_mm=0.5, snow_min_mm=3.0)               # k = 7px = 3.5mm
-    e = np.zeros((60, 60))
-    e[12:48, 12:15] = 3000.0                               # ridge A, 1.5mm wide
-    e[12:48, 19:22] = 3000.0                               # ridge B, 2mm away
-    e[12:15, 40:43] = 3000.0                               # an isolated 1.5mm speck
-    e[30:40, 35:45] = 3000.0                               # a genuine 5mm massif
-    m = poster._snow_mask(e, p)
-    assert m[30, 15:19].all()                              # the 2mm gap is bridged...
-    assert m[12:48, 12:22].all()                           # ...both ridges, one region
-    assert not m[12:15, 40:43].any()                       # the speck is gone
-    assert m[32:38, 37:43].all()                           # the massif survives intact
-    old = poster._opened(e >= p.snow_line_m, 3)            # what Task 7 produced
-    assert not old[30, 16] and old[13, 41]                 # split ridges, speck kept
+    assert [b[1] for b in bodies] == ["terrain", "snow"]   # the peak survives...
+    m = bodies[1][0]
+    assert m.is_watertight and m.is_winding_consistent and m.volume > 0   # ...as a solid
+    # ...and the 1px spike is still gone: smooth_px averages it below the snow line, so
+    # the body is one blob over the peak. With the spike it would span >= 4mm in both x
+    # and y (the spike sits 4 cells away on each axis).
+    assert (m.bounds[1] - m.bounds[0])[:2].max() < 3.0
 
 
 def test_water_beats_snow(monkeypatch):
@@ -1120,6 +1111,36 @@ def test_green_and_grey_meet_exactly_at_the_snow_plane():
     verts = poster._cell_verts(parts["snow_cells"])
     assert verts.sum() > 100
     assert np.abs(parts["green"][verts] - parts["z_snow"]).max() < 1e-9  # no gap, no overlap
+
+
+def test_green_never_towers_above_the_snow_plane():
+    """The key invariant the bare snow-line threshold buys. The old opening eroded the
+    grey mask but not the terrain, so peaks it dropped stayed green and rose the full
+    relief above z_snow — green and grey then shared layers. With the bare threshold the
+    only green left above the plane is the unavoidable one-cell rim around each grey
+    region: a rim vertex is a corner of a cell that has another corner at or below the
+    plane, so it can exceed the plane by at most one cell's terrain rise.
+
+    Excluded from the claim, both by design and both pre-existing: the slot (green there
+    is the slot floor, not terrain) and the outer vertex ring, which `compose_parts`
+    keeps clear of every slab so no wall overhangs the plate edge."""
+    p, M, elev, parts = _banded()
+    s, z_snow = parts["surface"], parts["z_snow"]
+    rise = max(np.abs(np.diff(s, axis=0)).max(), np.abs(np.diff(s, axis=1)).max())
+    plate = np.zeros((M, M), bool)
+    plate[1:-1, 1:-1] = True
+    plate &= ~poster._groove_mask(parts["track_px"], (M, M), p)
+    assert s.max() > 15 * rise + z_snow                    # the ground really does tower
+    assert parts["green"][plate].max() <= z_snow + rise + 1e-9
+
+    # ...and that bound is a rim, not a coincidence: every green vertex above the plane
+    # touches one at or below it. No green survives *inside* a grey region.
+    above = plate & (parts["green"] > z_snow + 1e-9)
+    low = np.zeros((M, M), bool)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            low |= np.roll(np.roll(s <= z_snow + 1e-9, dr, 0), dc, 1)
+    assert above.any() and not (above & ~low).any()
 
 
 def test_the_band_does_not_change_the_assembled_surface():

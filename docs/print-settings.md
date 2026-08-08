@@ -333,9 +333,11 @@ instead of 133, 10× the bed contact, and the height profile becomes a crisp XY 
 
 ## 8. Generator-side implications
 
-Recommendations only — no code. Current defaults referenced from `poster.py`
+Recommendations only — no code. Defaults as they stood when this was written
 (`layer_mm=0.2`, `cap_mm=0.6`, `res_mm=0.4`, `relief_mm=20.0`, `text_mm` scaled,
-`snow_min_mm=3.0` at 250 mm).
+`snow_min_mm=3.0` at 250 mm). **Since implemented:** `layer_mm=0.12` on the
+`0.2 + n*0.12` grid, `cap_mm=0.96`, and grey is now an elevation band, not a cap —
+`snow_min_mm` and its morphology are gone (item 4 below no longer applies to grey).
 
 1. **`layer_mm` default → 0.12.** Everything below assumes it. This single change
    multiplies the terrain's vertical quantisation levels by 1.67 over the same relief

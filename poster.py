@@ -165,22 +165,6 @@ def _snap(z, p, rnd=np.round):
     return FIRST_LAYER_MM + rnd((z - FIRST_LAYER_MM) / p.layer_mm) * p.layer_mm
 
 
-def _opened(mask, k):
-    """Morphological opening via PIL: erode then dilate with a k*k kernel."""
-    img = Image.fromarray(mask.astype(np.uint8) * 255)
-    img = img.filter(ImageFilter.MinFilter(k)).filter(ImageFilter.MaxFilter(k))
-    return np.asarray(img) > 0
-
-
-def _closed(mask, k):
-    """Morphological closing: dilate then erode — the mirror of _opened.
-
-    Bridges gaps narrower than k, so neighbouring ridge slivers become one massif."""
-    img = Image.fromarray(mask.astype(np.uint8) * 255)
-    img = img.filter(ImageFilter.MaxFilter(k)).filter(ImageFilter.MinFilter(k))
-    return np.asarray(img) > 0
-
-
 # A real face, in fallback order. load_default() is a bitmap font whose strokes are
 # ~1px wide at res 0.4 — masked_slab_mesh needs all four corners of a cell, so those
 # glyphs mesh as slivers or vanish. No new dependency, no bundled font: use what the
@@ -200,16 +184,6 @@ def _font(px):
         except Exception:
             pass
     return ImageFont.load_default(size=px)
-
-
-def _snow_mask(elev, p):
-    """Grey caps: threshold, then close+open at the smallest printable blob width.
-
-    Closing first merges the ridge slivers a bare threshold leaves scattered; the
-    opening then drops whatever is still thinner than snow_min_mm. Opening alone
-    (Task 7) kept every sliver, and cell-based slabs turned 1px slivers into dots."""
-    k = max(3, int(round(p.snow_min_mm / p.res_mm)) | 1)   # odd, PIL rank filters want it
-    return _opened(_closed(elev >= p.snow_line_m, k), k)
 
 
 def _smooth(a, px):
@@ -367,7 +341,6 @@ class Params:
     plate_mm: float = 2.0    # relief plate base thickness (slot floor sits above 0)
     fit_mm: float = 0.2      # gap per side between relief plate and frame ring
     snow_line_m: float = 2000.0   # grey band from this DEM elevation up
-    snow_min_mm: float | None = None   # smallest printed grey blob (auto, scaled)
     layer_mm: float = 0.12   # slicer layer height; terrain snaps to it (0 = don't snap)
     smooth_px: float = 1.0   # DEM blur radius in pixels, kills sub-layer noise (0 = off)
 
@@ -379,8 +352,7 @@ class Params:
 # = base_mm + frame_height_mm = 14.00 and terrain + proud_mm both stay on the layer grid.
 # {field: (base@250, floor)}
 _SCALED = {"frame_mm": (12.0, 4.0), "relief_mm": (20.0, 5.0), "frame_height_mm": (9.96, 3.0),
-           "text_mm": (8.0, 3.0), "groove_w_mm": (2.0, 1.2), "proud_mm": (0.96, 0.4),
-           "snow_min_mm": (3.0, 1.5)}
+           "text_mm": (8.0, 3.0), "groove_w_mm": (2.0, 1.2), "proud_mm": (0.96, 0.4)}
 
 
 def resolve(p: Params) -> Params:
@@ -699,7 +671,12 @@ def build_poster(track, p=Params()):
     # see the same terrain, and blurring twice would wash the mountains out
     elev = _smooth(fetch_elevation(bounds, M), p.smooth_px)
     lc = np.zeros((M, M), np.uint8)
-    lc[_snow_mask(elev, p)] = 2
+    # Bare threshold, no morphology: grey is a BAND, so every bit of ground above the
+    # snow line is a solid volume that prints fine, however small its footprint. An
+    # opening (the old conformal-cap defence against 1px slivers) dropped small peaks
+    # from grey while leaving them in green — green then towered above the z_snow
+    # plane and the two colours shared layers. Sub-2-cell blobs still go: _slab_cells.
+    lc[elev >= p.snow_line_m] = 2
     try:   # water last: high Alpine lakes sit above the snow line and stay blue
         lc[fetch_water_mask(bounds, M)] = 1
     except Exception as e:
