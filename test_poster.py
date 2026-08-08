@@ -210,6 +210,7 @@ def test_compose_parts_slot_floor_is_constant():
 def test_compose_parts_shapes_and_caps():
     p, N, fpx, elev, track, bounds = _synthetic()
     M = _mpx(p)
+    p = _params(snow_line_m=400.0)                         # under the ramp's high end
     lc = np.zeros((M, M), np.uint8)
     lc[5:15, 5:15] = 1                                     # water square, away from track
     lc[30:40, 30:40] = 2                                   # snow square
@@ -222,15 +223,18 @@ def test_compose_parts_shapes_and_caps():
     assert w[10, 10] and not w[0, 0]                       # inside square, outside it
     assert not w[0, 25]                                    # 1px border excluded
     assert c[35, 35] and not c[10, 10]
-    # cap depression: green is exactly cap_mm below surface inside a cap
+    # water is a conformal cap: green is exactly cap_mm below surface inside it
     assert abs(parts["surface"][10, 10] - parts["green"][10, 10] - p.cap_mm) < 1e-9
-    assert abs(parts["surface"][35, 35] - parts["green"][35, 35] - p.cap_mm) < 1e-9
+    # grey is a band: green stops at the flat z_snow plane, however high the ground is
+    assert abs(parts["green"][35, 35] - parts["z_snow"]) < 1e-9
+    assert parts["surface"][35, 35] - parts["z_snow"] > p.cap_mm      # a body, not a skin
     # groove cells are never cap cells — a cap slab there would fight the strip
     gmask = poster._groove_mask(parts["track_px"], (M, M), p)
     assert gmask[30:40, 30:40].any()      # the groove really does cross the snow square
     assert not (w | c)[gmask].any()
-    # so outside the slot every cell drops by at most cap_mm, never cap + slot stacked
-    drop = (parts["surface"] - parts["green"])[~gmask]
+    # so outside the slot and the band every cell drops by at most cap_mm
+    band = poster._cell_verts(parts["snow_cells"])
+    drop = (parts["surface"] - parts["green"])[~gmask & ~band]
     assert drop.max() <= p.cap_mm + 1e-9
     assert not (w & c).any()
 
@@ -245,11 +249,11 @@ def test_surface_snaps_to_layer_multiples():
     rng = np.random.default_rng(3)
     noisy = poster._smooth(elev + rng.normal(0, 3.0, (M, M)), p.smooth_px)
     s = poster.compose_parts(track, noisy, np.zeros((M, M), np.uint8), bounds, p)["surface"]
-    assert np.abs(s / p.layer_mm - np.round(s / p.layer_mm)).max() < 1e-9
+    assert np.abs(s - poster._snap(s, p)).max() < 1e-9
     assert len(np.unique(s.round(9))) > 5              # a real hill keeps its levels
     off = poster.compose_parts(track, noisy, np.zeros((M, M), np.uint8), bounds,
                                _params(layer_mm=0.0))["surface"]
-    assert np.abs(off / p.layer_mm - np.round(off / p.layer_mm)).max() > 1e-3  # 0 = opt out
+    assert np.abs(off - poster._snap(off, p)).max() > 1e-3      # 0 = opt out
 
 
 def test_sub_layer_noise_collapses_to_a_flat_plane():
@@ -366,7 +370,7 @@ def test_strip_mesh_geometry():
     assert m.is_winding_consistent   # watertight alone passes inside-out meshes
     assert m.volume > 0              # outward normals, not inverted
     zmin, zmax = m.bounds[0][2], m.bounds[1][2]
-    assert abs(zmax - (surface[0, 0] + p.proud_mm)) < 1e-6
+    assert abs(zmax - poster._snap(surface[0, 0] + p.proud_mm, p)) < 1e-6
     assert abs(zmin - poster.SLOT_FLOOR_MM) < 1e-6
     # width across a straight section = groove - 2*clearance
     xs = m.vertices[np.abs(m.vertices[:, 0] - 25 * p.res_mm) < p.res_mm]
@@ -402,7 +406,7 @@ def test_strip_follows_the_flight_altitude_over_flat_terrain():
     assert top[-1] - top[0] > 15.0                         # and really does climb
     assert (top > surface[0, 0]).all()                     # above terrain everywhere
     assert abs(m.bounds[0][2] - poster.SLOT_FLOOR_MM) < 1e-6
-    assert np.abs(top / p.layer_mm - np.round(top / p.layer_mm)).max() < 1e-9
+    assert np.abs(top - poster._snap(top, p)).max() < 1e-9
 
 
 def test_strip_clamps_onto_a_peak_the_flight_crosses_below():
@@ -417,7 +421,7 @@ def test_strip_clamps_onto_a_peak_the_flight_crosses_below():
     assert m.is_watertight and m.is_winding_consistent and m.volume > 0
     top, zc = _strip_tops(m, track_px), _sampled_surface(surface, track_px)
     assert (alt[0] < zc + p.proud_mm).all()                # the clamp really engages
-    want = np.round((zc + p.proud_mm) / p.layer_mm) * p.layer_mm
+    want = poster._snap(zc + p.proud_mm, p)
     assert np.abs(top - want).max() < 1e-9                 # == surface + proud, snapped
     assert (top > zc).all()                                # never sinks into the terrain
     assert len(np.unique(top.round(6))) > 2                # and it is no longer level
@@ -452,7 +456,7 @@ def test_strip_is_capped_at_the_relief_ceiling(capsys):
     top = _strip_tops(m, parts["track_px"])
     ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm      # 33.0mm
     assert abs(top.max() - ceiling) < 1e-9                 # capped, not 722mm
-    assert np.abs(top / p.layer_mm - np.round(top / p.layer_mm)).max() < 1e-9
+    assert np.abs(top - poster._snap(top, p)).max() < 1e-9
     assert "ceiling" in capsys.readouterr().out            # and it says so, once
     # (a flight below the ceiling is untouched — test_strip_follows_the_flight_
     # altitude_over_flat_terrain tops out at 22.0mm against the same 33.0mm cap)
@@ -799,6 +803,22 @@ def test_check_output_passes_on_freshly_built_files(monkeypatch, tmp_path, text)
                               str(tmp_path / "path.stl"), "--params", params]) == 0
 
 
+def test_check_output_passes_on_a_relief_with_a_grey_band(monkeypatch, tmp_path):
+    """The all-water case above never builds a grey body, so the band's own rules
+    (flat bottom on one plane, top under the relief ceiling) go unchecked there."""
+    import check_output
+    _fake_fetches(monkeypatch, elev_top=4000.0)              # dry ramp through 2000m
+    p = _params()
+    frame_bodies, bodies, path_stl = poster.build_poster(TRACK3, p)
+    assert [b[1] for b in bodies] == ["terrain", "snow"]
+    (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
+    (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
+    (tmp_path / "path.stl").write_bytes(path_stl)
+    assert check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
+                              str(tmp_path / "path.stl"),
+                              "--params", json.dumps(asdict(p))]) == 0
+
+
 def test_check_output_flags_a_missing_text_body(monkeypatch, tmp_path, capsys):
     """Text asked for but no white body in the frame 3MF is a real failure now,
     not a hint — the body is recoverable from the mesh, unlike the old emboss."""
@@ -1040,3 +1060,89 @@ def test_water_beats_snow(monkeypatch):
     _fake_fetches(monkeypatch, water=True, elev_top=4000.0)
     _, bodies, _ = poster.build_poster(TRACK3, _params())
     assert [b[1] for b in bodies] == ["terrain", "water"]
+
+
+# --- grey elevation band -----------------------------------------------------
+
+def _banded(snow_line_m=600.0, lc_all=False, **kw):
+    """Synthetic E-W ramp (0-1000m) with the ground above `snow_line_m` marked grey."""
+    p = _params(snow_line_m=snow_line_m, **kw)
+    M = _mpx(p)
+    elev = np.tile(np.linspace(0, 1000, M), (M, 1))
+    track = np.array([[47.0, 8.0, 0], [47.5, 9.0, 3000]])
+    bounds = poster.track_bounds(track, p.margin_pct)
+    lc = np.zeros((M, M), np.uint8)
+    lc[np.ones_like(elev, bool) if lc_all else (elev >= snow_line_m)] = 2
+    return p, M, elev, poster.compose_parts(track, elev, lc, bounds, p)
+
+
+def test_snap_lands_on_the_first_layer_grid():
+    """The printer lays a 0.2mm first layer and 0.12mm ones after it, so a printable
+    height is 0.2 + n*0.12 — not n*0.12, which is what round(z/layer) gave."""
+    p = _params()
+    z = np.array([0.21, 0.25, 0.26, 1.0, 5.0, 31.7])
+    s = poster._snap(z, p)
+    n = (s - poster.FIRST_LAYER_MM) / p.layer_mm
+    assert np.abs(n - np.round(n)).max() < 1e-9
+    assert np.abs(s - z).max() <= p.layer_mm / 2 + 1e-9        # nearest boundary
+    exact = poster.FIRST_LAYER_MM + 7 * p.layer_mm
+    assert abs(poster._snap(exact, p) - exact) < 1e-12         # a boundary is a fixed point
+    assert (poster._snap(z, _params(layer_mm=0.0)) == z).all()  # 0 = opt out
+
+
+def test_z_snow_is_the_snow_line_on_the_relief_scale():
+    p, M, elev, parts = _banded()
+    e0, e1 = float(elev.min()), float(elev.max())
+    want = p.plate_mm + (p.snow_line_m - e0) / (e1 - e0) * p.relief_mm * p.exaggeration
+    assert abs(parts["z_snow"] - poster._snap(want, p)) < 1e-9
+    assert abs(parts["z_snow"] - poster._snap(parts["z_snow"], p)) < 1e-12   # on a boundary
+    assert p.plate_mm <= parts["z_snow"] < parts["surface"].max()
+
+
+def test_grey_is_a_band_with_a_flat_bottom_not_a_conformal_skin():
+    """The cap was a 0.6mm shell conformal to terrain: on a 2.3mm/mm alpine slope it
+    surfaces as a 0.26mm stripe, narrower than one extrusion, and the slicer merges it
+    into the neighbouring colour. A band from a horizontal plane has no such stripe."""
+    p, M, elev, parts = _banded()
+    m = poster.band_mesh(parts, p)
+    assert m.is_watertight and m.is_winding_consistent and m.volume > 0
+    z = m.vertices[:, 2]
+    assert abs(z.min() - parts["z_snow"]) < 1e-9                # flat bottom on the plane
+    assert (np.abs(z - z.min()) < 1e-9).sum() == len(z) // 2    # exactly the bottom half
+    assert parts["z_snow"] < z.max() <= parts["surface"].max() + 1e-9
+    skin = poster.masked_slab_mesh(parts["snow"], parts["surface"], p.cap_mm, p.res_mm)
+    assert m.volume > 3 * skin.volume                           # a body, not a skin
+
+
+def test_green_and_grey_meet_exactly_at_the_snow_plane():
+    p, M, elev, parts = _banded()
+    verts = poster._cell_verts(parts["snow_cells"])
+    assert verts.sum() > 100
+    assert np.abs(parts["green"][verts] - parts["z_snow"]).max() < 1e-9  # no gap, no overlap
+
+
+def test_the_band_does_not_change_the_assembled_surface():
+    """Colour-volume change, not a shape change: green top union grey top is still
+    exactly the surface heightmap the single body had."""
+    p, M, elev, parts = _banded()
+    verts = poster._cell_verts(parts["snow_cells"])
+    top = np.where(verts, parts["surface"], parts["green"])
+    gmask = poster._groove_mask(parts["track_px"], (M, M), p)
+    assert np.abs(top - parts["surface"])[~gmask].max() < 1e-9
+    assert verts.any() and gmask.any()
+
+
+def test_snow_line_above_the_dem_leaves_no_band():
+    p, M, elev, parts = _banded(snow_line_m=5000.0, lc_all=True)
+    assert not parts["snow_cells"].any()
+    assert poster.band_mesh(parts, p) is None
+    gmask = poster._groove_mask(parts["track_px"], (M, M), p)
+    assert (parts["green"][~gmask] == parts["surface"][~gmask]).all()
+
+
+def test_snow_line_below_the_dem_leaves_no_green_above_the_plate():
+    p, M, elev, parts = _banded(snow_line_m=-100.0, lc_all=True)
+    assert abs(parts["z_snow"] - p.plate_mm) < 1e-9        # clamped to the plate, not under
+    verts = poster._cell_verts(parts["snow_cells"])
+    assert verts.mean() > 0.8
+    assert np.abs(parts["green"][verts] - p.plate_mm).max() < 1e-9

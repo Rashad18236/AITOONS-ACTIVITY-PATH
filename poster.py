@@ -143,6 +143,23 @@ COLORS = {"frame": "#222222", "text": "#FFFFFF", "green": "#4CAF50",
 # the slot's *depth* therefore varies with the terrain, its floor does not.
 SLOT_FLOOR_MM = 1.0
 
+# The slicer's first layer is thicker than the rest (Bambu: nozzle diameter x 50%),
+# so a printable height is FIRST_LAYER_MM + n*layer_mm, not n*layer_mm.
+FIRST_LAYER_MM = 0.2
+
+
+def _snap(z, p, rnd=np.round):
+    """Snap z onto the printable layer grid FIRST_LAYER_MM + n*layer_mm.
+
+    `round(z / layer) * layer` was wrong: it assumes every layer is layer_mm thick,
+    so with a 0.2mm first layer the whole terrain sat half a layer off every boundary
+    — exactly the ragged sub-layer islands the snapping exists to prevent.
+    layer_mm = 0 opts out. `rnd` is np.floor (plus an epsilon) where a hard ceiling
+    is wanted instead of the nearest boundary."""
+    if p.layer_mm <= 0:
+        return z
+    return FIRST_LAYER_MM + rnd((z - FIRST_LAYER_MM) / p.layer_mm) * p.layer_mm
+
 
 def _opened(mask, k):
     """Morphological opening via PIL: erode then dilate with a k*k kernel."""
@@ -342,10 +359,10 @@ class Params:
     text_mm: float | None = None
     res_mm: float = 0.4
     proud_mm: float | None = None
-    cap_mm: float = 0.6      # colour-cap slab thickness
+    cap_mm: float = 0.6      # water cap slab thickness; grey is a band, not a cap
     plate_mm: float = 2.0    # relief plate base thickness (slot floor sits above 0)
     fit_mm: float = 0.2      # gap per side between relief plate and frame ring
-    snow_line_m: float = 2000.0   # grey caps above this DEM elevation
+    snow_line_m: float = 2000.0   # grey band from this DEM elevation up
     snow_min_mm: float | None = None   # smallest printed grey blob (auto, scaled)
     layer_mm: float = 0.2    # slicer layer height; terrain snaps to it (0 = don't snap)
     smooth_px: float = 2.0   # DEM blur radius in pixels, kills sub-layer noise (0 = off)
@@ -409,8 +426,9 @@ def compose_parts(track, elev, lc, bounds, p):
     frame (N,N): backplate + raised ring, flat — printed alone.
     text_mask (N,N): the glyph pixels, printed as their own white body on top of
     the ring (empty when no text was asked for).
-    green/surface/water/snow/track_px: the (M,M) relief plate that drops into the
-    ring, its pre-slot pre-cap top, the two colour-cap vertex masks, and the
+    green/surface/water/snow/snow_cells/z_snow/track_px: the (M,M) relief plate that
+    drops into the ring, its pre-slot pre-cap top, the water and grey vertex masks,
+    the grey band's meshed cells and the horizontal plane it starts from, and the
     track in relief-plate pixels.
     alt_mm: flight altitude per original track point, on the same vertical scale
     as `surface`, for the path wall."""
@@ -454,12 +472,10 @@ def compose_parts(track, elev, lc, bounds, p):
         text_mask = np.asarray(img.filter(ImageFilter.MaxFilter(3))) > 0
     e0, e1 = float(elev.min()), float(elev.max())
     to_mm = lambda m: p.plate_mm + (m - e0) / max(e1 - e0, 1e-9) * p.relief_mm * p.exaggeration
-    surface = to_mm(elev)
-    if p.layer_mm > 0:
-        # Snap the terrain to whole slicer layers, before the caps and the slot are
-        # cut, so those keep their exact offsets. Sub-layer DEM wobble otherwise
-        # slices into scattered single-layer islands all over the flat ground.
-        surface = np.round(surface / p.layer_mm) * p.layer_mm
+    # Snap the terrain to whole slicer layers, before the caps and the slot are cut,
+    # so those keep their exact offsets. Sub-layer DEM wobble otherwise slices into
+    # scattered single-layer islands all over the flat ground.
+    surface = _snap(to_mm(elev), p)
     alt_mm = to_mm(np.asarray(track, float)[:, 2])   # same scale: the flight rides the relief
     # project track into relief-plate pixels (row 0 = north)
     x0, y0, x1, y1 = bounds
@@ -473,10 +489,23 @@ def compose_parts(track, elev, lc, bounds, p):
     border[1:-1, 1:-1] = True
     water = (lc == 1) & ~gmask & border
     snow = (lc == 2) & ~gmask & border
-    green = surface - p.cap_mm * (water | snow)
+    # Grey is a BAND, not a cap: the terrain solid is split at the horizontal plane
+    # z_snow (the snow line on the relief's own scale, on a layer boundary), green
+    # below it and grey above. A conformal cap surfaced as a `cap_mm / slope` stripe
+    # — 0.26mm on median alpine ground, under one extrusion width — which the slicer
+    # merges into the neighbouring colour and prints in transition filament.
+    # Clamped to the plate so a snow line under the whole DEM cannot thin it.
+    z_snow = _snap(max(to_mm(p.snow_line_m), p.plate_mm), p)
+    # Cells, not vertices: the band's footprint has to be exactly what the mesher
+    # meshes, or the green top drops to z_snow along a rim the grey does not cover
+    # and the assembled surface gains a gash.
+    snow_cells = _slab_cells(snow & (surface > z_snow))
+    green = surface - p.cap_mm * water
+    green[_cell_verts(snow_cells)] = z_snow
     green[gmask] = SLOT_FLOOR_MM        # full-depth slot, constant floor
     return dict(frame=frame, text_mask=text_mask, green=green, surface=surface,
-                water=water, snow=snow, track_px=track_px, alt_mm=alt_mm)
+                water=water, snow=snow, snow_cells=snow_cells, z_snow=z_snow,
+                track_px=track_px, alt_mm=alt_mm)
 
 
 def _offsets(track_px):
@@ -539,10 +568,33 @@ def _unpinch(cells):
         cells[1:, :-1] &= ~b
 
 
+def _slab_cells(mask):
+    """Cells a slab over `mask` actually meshes: all four corners set, pinches dropped."""
+    return _unpinch(mask[:-1, :-1] & mask[:-1, 1:] & mask[1:, :-1] & mask[1:, 1:])
+
+
+def _cell_verts(cells):
+    """The (H,W) vertex footprint of an (H-1,W-1) cell mask."""
+    v = np.zeros(np.array(cells.shape) + 1, bool)
+    for dr, dc in ((0, 0), (0, 1), (1, 0), (1, 1)):
+        v[dr:dr + cells.shape[0], dc:dc + cells.shape[1]] |= cells
+    return v
+
+
 def masked_slab_mesh(mask, top, thickness, res_mm):
     """Constant-thickness slab over masked cells; top follows `top` surface."""
+    return _slab_mesh(_slab_cells(mask), top, top - thickness, res_mm)
+
+
+def band_mesh(parts, p):
+    """Grey elevation band: solid from the flat z_snow plane up to the terrain surface."""
+    return _slab_mesh(parts["snow_cells"], parts["surface"],
+                      np.full_like(parts["surface"], parts["z_snow"]), p.res_mm)
+
+
+def _slab_mesh(cells, top, bot, res_mm):
+    """Watertight solid over `cells`, between the (H,W) vertex surfaces `bot` and `top`."""
     H, W = top.shape
-    cells = _unpinch(mask[:-1, :-1] & mask[:-1, 1:] & mask[1:, :-1] & mask[1:, 1:])
     rc = np.argwhere(cells)
     if not len(rc):
         return None
@@ -554,7 +606,7 @@ def masked_slab_mesh(mask, top, thickness, res_mm):
     idx[vy, vx] = np.arange(len(vy))
     n = len(vy)
     vt = np.stack([vx * res_mm, (H - 1 - vy) * res_mm, top[vy, vx]], 1)
-    vb = vt.copy(); vb[:, 2] -= thickness
+    vb = vt.copy(); vb[:, 2] = bot[vy, vx]
     F = []
     # ponytail: python loop over cells, vectorize if generation time hurts
     incell = lambda r, c: 0 <= r < H - 1 and 0 <= c < W - 1 and cells[r, c]
@@ -593,14 +645,14 @@ def strip_mesh(track_px, alt_mm, surface, p):
                  np.clip(cx.round().astype(int), 0, W - 1)]
     alt = np.interp(t, d, np.asarray(alt_mm, float))   # altitude onto the same stations
     ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm
-    if p.layer_mm > 0:   # a layer-aligned cap keeps the snap below it (round is monotone)
-        ceiling = math.floor(ceiling / p.layer_mm + 1e-9) * p.layer_mm
+    # a layer-aligned cap keeps the snap below it (round is monotone); floor, never
+    # round, or the cap itself would land above the relief's own ceiling
+    ceiling = float(_snap(ceiling, p, lambda x: np.floor(x + 1e-6)))
     if (over := alt > ceiling).any():
         print(f"path: flight above the relief ceiling on {over.mean() * 100:.0f}% of the "
               f"track — wall capped at {ceiling:.2f}mm")
-    z_top, z_bot = np.minimum(np.maximum(alt, zc + p.proud_mm), ceiling), SLOT_FLOOR_MM
-    if p.layer_mm > 0:
-        z_top = np.round(z_top / p.layer_mm) * p.layer_mm
+    z_top = _snap(np.minimum(np.maximum(alt, zc + p.proud_mm), ceiling), p)
+    z_bot = SLOT_FLOOR_MM
     L, R = C + nrm * half, C - nrm * half
 
     def mm(q, z):
@@ -631,7 +683,7 @@ def build_poster(track, p=Params()):
     # plate ever shows up.
     if p.size_mm > 256 or p.res_mm < 0.2:
         raise ValueError("size_mm must be <= 256 (plate limit) and res_mm >= 0.2")
-    for label, v in (("slot floor", SLOT_FLOOR_MM), ("colour cap", p.cap_mm)):
+    for label, v in (("slot floor", SLOT_FLOOR_MM), ("water cap", p.cap_mm)):
         if p.plate_mm <= v:   # slot floor above the plate top / caps push terrain negative
             raise ValueError(f"{label} ({v}mm) must be less than the relief plate "
                              f"thickness ({p.plate_mm}mm)")
@@ -648,10 +700,13 @@ def build_poster(track, p=Params()):
         print(f"water: Overpass unavailable ({e}) — poster without water")
     parts = compose_parts(track, elev, lc, bounds, p)
     bodies = [(heightmap_mesh(parts["green"], p.res_mm), "terrain", COLORS["green"], 1)]
-    for key, name, slot in (("water", "water", 2), ("snow", "snow", 3)):
-        cap = masked_slab_mesh(parts[key], parts["surface"], p.cap_mm, p.res_mm)
-        if cap is not None:
-            bodies.append((cap, name, COLORS[key], slot))
+    # water stays a conformal cap (lakes are flat, so its slices are lake-wide anyway);
+    # grey is a band standing on the z_snow plane, which green's top is clamped to
+    for name, slot, m in (("water", 2, masked_slab_mesh(parts["water"], parts["surface"],
+                                                        p.cap_mm, p.res_mm)),
+                          ("snow", 3, band_mesh(parts, p))):
+        if m is not None:
+            bodies.append((m, name, COLORS[name], slot))
     frame_bodies = [(heightmap_mesh(parts["frame"], p.res_mm), "frame", COLORS["frame"], 1)]
     # text is its own white body standing 0.8mm proud of the ring, printed in slot 2
     text = masked_slab_mesh(parts["text_mask"], parts["frame"] + 0.8, 0.8, p.res_mm)

@@ -20,7 +20,7 @@ import argparse, json, sys
 from dataclasses import fields
 import numpy as np
 import trimesh
-from poster import SLOT_FLOOR_MM, Params, _grid, read_3mf, resolve
+from poster import SLOT_FLOOR_MM, Params, _grid, _snap, read_3mf, resolve
 
 PLATE_MM = 256.0
 TEXT_MM = 0.8     # build_poster() white text body thickness
@@ -155,18 +155,32 @@ def main(argv=None):
                 f"{ext:.2f}mm", f"{want:.2f}mm +-0.5 (size-2*frame-2*fit, gridded)")
         chk("relief flat back", abs(rlo[2]) <= 0.01, f"z_min {rlo[2]:.4f}mm", "0 +-0.01")
 
-        # 8. caps sit on the terrain: inside its footprint, and no higher than the
-        # terrain top plus cap_mm (the terrain is carved down by exactly cap_mm
-        # under a cap, so surface = terrain + cap_mm there — that bound is tight)
-        cap_hi = rhi[2] + p.cap_mm + 0.01
+        # 8. colour bodies sit on the terrain: inside its footprint, and vertically
+        # bounded by the relief. The water cap is still a conformal slab, so its top
+        # is terrain + cap_mm (tight: the terrain is carved down by exactly cap_mm
+        # under it). The grey body is a BAND — a solid from a horizontal z_snow plane
+        # up to the surface — so it reaches the relief's own ceiling, and the thing
+        # to check instead is that its bottom really is that one flat plane.
+        relief_hi = p.plate_mm + p.relief_mm * p.exaggeration + 0.01
         for name, m in caps:
             clo, chi = m.bounds
             chk(f"cap {name} inside relief xy",
                 all(clo[i] >= rlo[i] - 0.5 and chi[i] <= rhi[i] + 0.5 for i in (0, 1)),
                 f"x[{clo[0]:.1f},{chi[0]:.1f}] y[{clo[1]:.1f},{chi[1]:.1f}]",
                 f"in x[{rlo[0]:.1f},{rhi[0]:.1f}] y[{rlo[1]:.1f},{rhi[1]:.1f}] +-0.5")
-            chk(f"cap {name} z range", clo[2] >= rlo[2] - 0.01 and chi[2] <= cap_hi,
-                f"[{clo[2]:.3f}, {chi[2]:.3f}]mm", f"in [{rlo[2]:.3f}, {cap_hi:.3f}]mm")
+            if name == "snow":
+                z = m.vertices[:, 2]
+                flat = int((np.abs(z - clo[2]) <= 1e-6).sum())
+                chk("snow band flat bottom", flat == len(z) // 2,
+                    f"{flat} of {len(z)} verts on z={clo[2]:.3f}mm", f"{len(z) // 2} (half)")
+                chk("snow band above the plate, under the relief top",
+                    clo[2] >= p.plate_mm - 0.01 and chi[2] <= relief_hi,
+                    f"[{clo[2]:.3f}, {chi[2]:.3f}]mm",
+                    f"in [{p.plate_mm:.2f}, {relief_hi:.3f}]mm")
+            else:
+                cap_hi = rhi[2] + p.cap_mm + 0.01
+                chk(f"cap {name} z range", clo[2] >= rlo[2] - 0.01 and chi[2] <= cap_hi,
+                    f"[{clo[2]:.3f}, {chi[2]:.3f}]mm", f"in [{rlo[2]:.3f}, {cap_hi:.3f}]mm")
 
         # 9. strip stays inside the relief plate it drops into (same local frame)
         for i, axis in enumerate("xy"):
@@ -188,15 +202,20 @@ def main(argv=None):
         chk("strip top under the relief ceiling", shi[2] <= ceiling + 0.01,
             f"{shi[2]:.3f}mm", f"<= {ceiling:.2f}mm (plate + relief*exag + proud)")
 
-        # 11. layer snapping: terrain and strip z land on whole slicer layers, so flat
-        # ground slices as uniform layers instead of ragged single-layer islands.
-        # Tolerances are the file formats': 3MF writes %.3f, binary STL is float32.
+        # 11. layer snapping: every relief z lands on a printable layer boundary, so
+        # flat ground slices as uniform layers instead of ragged single-layer islands.
+        # The grid is first_layer + n*layer_mm (the printer's first layer is thicker),
+        # plus z=0, which is the plate itself. Tolerances are the file formats':
+        # 3MF writes %.3f, binary STL is float32.
         if p.layer_mm > 0:
-            for label, m, tol in (("terrain", terrain, 1e-6), ("strip", strip, 1e-4)):
-                z = m.vertices[:, 2] / p.layer_mm
-                off = float(np.abs(z - np.round(z)).max()) * p.layer_mm
-                chk(f"{label} z on layer multiples", off <= tol,
-                    f"max off {off:.1e}mm", f"multiple of {p.layer_mm}mm +-{tol:g}")
+            for label, m, tol in ([("terrain", terrain, 1e-6)]
+                                  + [(n, c, 1e-6) for n, c in caps]
+                                  + [("strip", strip, 1e-4)]):
+                z = m.vertices[:, 2]
+                z = z[np.abs(z) > tol]                    # z=0 is the build plate
+                off = float(np.abs(z - _snap(z, p)).max()) if len(z) else 0.0
+                chk(f"{label} z on layer boundaries", off <= tol,
+                    f"max off {off:.1e}mm", f"0.2 + n*{p.layer_mm}mm +-{tol:g}")
 
     wn = max(len(r[1]) for r in rows)
     wg = max(len(r[2]) for r in rows)

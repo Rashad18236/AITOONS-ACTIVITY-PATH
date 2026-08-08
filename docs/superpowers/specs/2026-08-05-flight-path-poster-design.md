@@ -293,3 +293,45 @@ multiple of `layer_mm` (3MF `%.3f` -> 1e-6, binary STL float32 -> 1e-4).
 | `snow_min_mm` | scaled | 3.0 @250mm | 1.5 |
 | `layer_mm` | absolute | 0.2 (0 = no snapping) | — |
 | `smooth_px` | absolute | 2.0 (0 = no blur) | — |
+
+---
+
+# Addendum 2026-08-08: grey as an elevation band (approved)
+
+## Grey is a band, not a conformal cap
+
+Measured: the grey cap was a `cap_mm` = 0.6mm shell following the terrain. A horizontal
+slice through it is a stripe `cap_mm / slope` wide; the median alpine slope on a 250mm
+poster is 2.29mm rise per mm run, so the stripe surfaces at **0.26mm — narrower than one
+0.42mm extrusion**. Slicers detect such non-printable segmented regions and merge them
+into the neighbouring colour, so what printed was transition filament, not grey: the
+"blotted grey".
+
+The terrain solid is now **split at a horizontal plane**, not skinned:
+
+- `z_snow` = `snow_line_m` mapped through the same elevation→mm scale `compose_parts`
+  already uses for the surface and the flight altitude, then `_snap`ped to a layer
+  boundary and clamped to `plate_mm` (a snow line below the whole DEM must not thin the
+  plate). Above the DEM's top the band is simply empty.
+- **green body** = the terrain heightmap with its top clamped to `z_snow` under the band.
+- **grey body** = a solid from the flat `z_snow` plane up to `surface`, only where
+  `surface > z_snow`. Same mesher as the caps: `masked_slab_mesh` was split into
+  `_slab_cells` (mask → meshable cells) and `_slab_mesh(cells, top, bot, res)`, which
+  now takes a bottom *surface* instead of a constant thickness. `band_mesh` passes the
+  constant `z_snow` plane. Winding and the pinch-drop rule are untouched.
+- The two bodies meet exactly at `z_snow`: green's top is clamped on
+  `_cell_verts(snow_cells)` — the vertices the grey mesh actually covers, not the raw
+  mask. Clamping on the mask would drop the green top along a one-cell rim the grey does
+  not reach and gash the assembled surface.
+- The assembled surface is therefore **unchanged**: green-top ∪ grey-top reconstructs the
+  same heightmap the single body had. This is a colour-volume change, not a shape change.
+- The `_closed`/`_opened` merge stays. It no longer decides printability, but it is what
+  gives the massifs their natural irregular outline and keeps single-pixel dots out.
+  Band footprint = merged mask ∩ (`surface > z_snow`).
+- Water stays a conformal cap — lakes are flat, so its slices are lake-wide already.
+  `cap_mm` is now a water-only parameter (0.96mm, 8 layers).
+
+Consequence for `check_output.py`: the grey body no longer sits within `cap_mm` of the
+terrain top. Its rules are now "flat bottom" (exactly half the vertices share the lowest
+z, i.e. one plane, not a conformal underside) and "above `plate_mm`, under the relief
+ceiling". The water cap keeps the old tight `terrain + cap_mm` bound.
