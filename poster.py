@@ -157,6 +157,12 @@ SUB_RATIO = 0.65
 GAP_RATIO = 0.35
 TEXT_MARGIN_MM = 3.0
 
+# The text body is meshed on its own grid, TEXT_SUB times finer than the frame's.
+# On the terrain's 0.4mm grid an 8mm glyph is ~20px tall, every curve stair-steps by
+# 0.4mm and the 1px dilation below fattens the strokes by another 0.4mm. At 4x the
+# edge pitch is 0.1mm and the dilation costs 0.1mm — vertices are the only price.
+TEXT_SUB = 4
+
 
 def _snap(z, p, rnd=np.round):
     """Snap z onto the printable layer grid FIRST_LAYER_MM + n*layer_mm.
@@ -444,20 +450,23 @@ def _fit_line(s, ink_px, avail_px):
 
 
 def _text_mask(H, N, fpx, chin_px, p):
-    """(bool glyph mask, its res_mm) for the caption, over the (H,N) frame's extent.
+    """(bool glyph mask, its res_mm) for the caption, on the TEXT_SUB-finer grid.
 
-    Lines are centred in the full bottom bar (frame_mm + chin_mm tall), line 2 at
-    SUB_RATIO of line 1 with GAP_RATIO of line 1 between them."""
-    res = p.res_mm
-    W, Hf = N, H
+    The mask spans the same physical extent as the (H,N) frame, so the text body it
+    meshes lands in the frame's own coordinates — but on its own pitch, which is the
+    whole point: glyph edges step by res_mm/TEXT_SUB instead of by the terrain's
+    res_mm. Lines are centred in the full bottom bar (frame_mm + chin_mm tall),
+    line 2 at SUB_RATIO of line 1 with GAP_RATIO of line 1 between them."""
+    res = p.res_mm / TEXT_SUB
+    W, Hf = N * TEXT_SUB, H * TEXT_SUB
     lines = _lines(p)
     if not lines:
         return np.zeros((Hf, W), bool), res
     img = Image.new("L", (W, Hf))
     d = ImageDraw.Draw(img)
-    bar_top = N - fpx                       # first row of the bottom bar
-    bar_h = fpx + chin_px
-    avail = N - 2 * fpx                     # ring opening: keeps the text off the corners
+    bar_top = (N - fpx) * TEXT_SUB          # first fine row of the bottom bar
+    bar_h = (fpx + chin_px) * TEXT_SUB
+    avail = (N - 2 * fpx) * TEXT_SUB        # ring opening: keeps the text off the corners
     hs = [h / res for _, h in lines]
     gap = GAP_RATIO * p.text_mm / res
     block = sum(hs) + gap * (len(hs) - 1)
@@ -477,6 +486,7 @@ def _text_mask(H, N, fpx, chin_px, p):
     # Dilate 1px: masked_slab_mesh only meshes cells with all four corners set, so a
     # stroke survives only where every glyph pixel is cell-interior. After a
     # MaxFilter(3) each original pixel has all 8 neighbours, i.e. four full cells.
+    # On this grid that costs 0.1mm of fattening, not the frame grid's 0.4mm.
     return np.asarray(img.filter(ImageFilter.MaxFilter(3))) > 0, res
 
 
@@ -489,8 +499,8 @@ def compose_parts(track, elev, lc, bounds, p):
     frame (N+chin_px, N): backplate + raised ring, flat — printed alone. The chin
     rows hang below the square (heightmap_mesh maps y = (H-1-row)*res, so appending
     rows extends the poster southward); the opening keeps its indices.
-    text_mask / text_res: the caption's glyph pixels and the grid pitch they were
-    rendered on, printed as their own white body on the ring (empty when no text).
+    text_mask / text_res: the glyph pixels on their own TEXT_SUB-times finer grid,
+    printed as their own white body on top of the ring (empty when no text).
     green/surface/water/snow/snow_cells/z_snow/track_px: the (M,M) relief plate that
     drops into the ring, its pre-slot pre-cap top, the water and grey vertex masks,
     the grey band's meshed cells and the horizontal plane it starts from, and the
@@ -754,9 +764,14 @@ def build_poster(track, p=Params()):
                           ("snow", 3, band_mesh(parts, p))):
         if m is not None:
             bodies.append((m, name, COLORS[name], slot))
+    ring_top = p.base_mm + p.frame_height_mm
     frame_bodies = [(heightmap_mesh(parts["frame"], p.res_mm), "frame", COLORS["frame"], 1)]
-    # text is its own white body standing TEXT_EMBOSS_MM proud of the ring, in slot 2
-    text = masked_slab_mesh(parts["text_mask"], parts["frame"] + TEXT_EMBOSS_MM,
+    # Text is its own white body standing TEXT_EMBOSS_MM proud of the ring, in slot 2.
+    # Its top is a CONSTANT, not parts["frame"] + emboss: the text sits on the flat
+    # ring, so it needs no heightmap of its own — which is what frees it to be meshed
+    # on a finer grid than the frame (see _text_mask).
+    tm = parts["text_mask"]
+    text = masked_slab_mesh(tm, np.full(tm.shape, ring_top + TEXT_EMBOSS_MM),
                             TEXT_EMBOSS_MM, parts["text_res"])
     if text is not None:
         frame_bodies.append((text, "text", COLORS["text"], 2))

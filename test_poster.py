@@ -340,18 +340,19 @@ def test_strip_seats_in_groove_at_every_angle():
 
 def test_compose_parts_text_is_a_mask_not_an_emboss():
     """Text is printed white as its own body, so the frame heightmap stays flat —
-    the glyph pixels come back as a mask instead."""
+    the glyph pixels come back as a mask instead, on its own finer grid."""
     p, N, fpx, elev, track, bounds = _synthetic()
     M = _mpx(p)
+    S = poster.TEXT_SUB
     lc = np.zeros((M, M), np.uint8)
     q = _params(text="TEST", text_mm=3.0)
     parts = poster.compose_parts(track, elev, lc, bounds, q)
     frame, tm = parts["frame"], parts["text_mask"]
     H = N + poster._grid(q)[3]
     assert frame.max() == p.base_mm + p.frame_height_mm    # ring is flat, nothing embossed
-    assert tm.shape == (H, N) and tm.dtype == bool
-    assert parts["text_res"] == q.res_mm
-    assert tm.any() and tm[:N - fpx, :].sum() == 0         # glyphs live on the bottom bar
+    assert tm.shape == (H * S, N * S) and tm.dtype == bool
+    assert parts["text_res"] == q.res_mm / S
+    assert tm.any() and tm[:(N - fpx) * S, :].sum() == 0   # glyphs live on the bottom bar
     assert not poster.compose_parts(track, elev, lc, bounds, _params())["text_mask"].any()
 
 
@@ -403,11 +404,11 @@ def test_chin_auto_sizes_to_hold_the_caption():
                                  bounds, q)
     tm, tres = parts["text_mask"], parts["text_res"]
     rows = np.where(tm.any(1))[0]
-    top = N - fpx                                          # first row of the bar
-    # one pixel of slack: _fit_line rounds the em to a whole px, so rendered ink lands
-    # within a pixel of the nominal line height it was asked for
-    assert (rows.min() - top) * tres >= poster.TEXT_MARGIN_MM - tres
-    assert (tm.shape[0] - 1 - rows.max()) * tres >= poster.TEXT_MARGIN_MM - tres
+    top = (N - fpx) * poster.TEXT_SUB                      # first fine row of the bar
+    # 0.2mm of slack: _fit_line rounds the em to a whole px, so rendered ink lands
+    # within a fraction of the nominal line height it was asked for
+    assert (rows.min() - top) * tres >= poster.TEXT_MARGIN_MM - 0.2
+    assert (tm.shape[0] - 1 - rows.max()) * tres >= poster.TEXT_MARGIN_MM - 0.2
 
 
 def test_explicit_chin_mm_overrides_the_auto_size():
@@ -432,7 +433,7 @@ def test_second_line_renders_smaller_than_the_first():
     assert abs(h2 / h1 - poster.SUB_RATIO) < 0.15
     # both lines live inside the ring opening's x range, off the corners
     cols = np.where(tm.any(0))[0]
-    assert fpx <= cols.min() and cols.max() < N - fpx
+    assert fpx * poster.TEXT_SUB <= cols.min() and cols.max() < (N - fpx) * poster.TEXT_SUB
 
 
 def test_heightmap_mesh_watertight():
@@ -811,8 +812,9 @@ def _text_body(**kw):
                                  np.zeros((M, M), np.uint8),
                                  poster.track_bounds(track, p.margin_pct), p)
     t = poster.TEXT_EMBOSS_MM
-    return p, parts, poster.masked_slab_mesh(parts["text_mask"], parts["frame"] + t,
-                                             t, parts["text_res"])
+    tm = parts["text_mask"]
+    top = np.full(tm.shape, p.base_mm + p.frame_height_mm + t)
+    return p, parts, poster.masked_slab_mesh(tm, top, t, parts["text_res"])
 
 
 def _assert_text_meshes(p, parts, text, min_verts):
@@ -845,7 +847,7 @@ def test_frame_text_meshes_into_readable_glyphs():
     so masked_slab_mesh ate the glyphs and left 840 vertices of slivers. A real
     TrueType face plus a 1px dilation makes every glyph pixel cell-interior."""
     p, parts, text = _text_body()
-    _assert_text_meshes(p, parts, text, 2500)
+    _assert_text_meshes(p, parts, text, 20000)
 
 
 def test_frame_text_meshes_without_a_truetype_font(monkeypatch):
@@ -854,7 +856,28 @@ def test_frame_text_meshes_without_a_truetype_font(monkeypatch):
     that satisfies the cell rule."""
     monkeypatch.setattr(poster, "FONT_PATHS", ("/nonexistent/no-such-font.ttf",))
     p, parts, text = _text_body()
-    _assert_text_meshes(p, parts, text, 2500)
+    _assert_text_meshes(p, parts, text, 20000)
+
+
+def test_text_is_meshed_on_its_own_fine_grid():
+    """The readability fix. On the terrain's 0.4mm grid an 8mm glyph is ~20px tall
+    and every curve stair-steps by 0.4mm, then a 1px dilation blurs it further.
+    The text body has its own grid: TEXT_SUB times finer, so an edge steps by 0.1mm
+    and the dilation costs 0.1mm — at the cost of nothing but vertices."""
+    p, parts, text = _text_body()
+    N, _, fpx, chin_px = poster._grid(p)
+    S = poster.TEXT_SUB
+    assert parts["text_res"] == p.res_mm / S
+    assert parts["text_mask"].shape == ((N + chin_px) * S, N * S)
+    # glyph edges land on the fine pitch, not the frame's
+    xs = np.unique(text.vertices[:, 0].round(6))
+    assert abs(np.diff(xs).min() - parts["text_res"]) < 1e-6
+    # ...and the same glyphs on the coarse grid are an order of magnitude cruder
+    coarse = poster.masked_slab_mesh(
+        parts["text_mask"][::S, ::S],
+        np.full((N + chin_px, N), p.base_mm + p.frame_height_mm + poster.TEXT_EMBOSS_MM),
+        poster.TEXT_EMBOSS_MM, p.res_mm)
+    assert len(text.vertices) > 4 * len(coarse.vertices)
 
 
 def test_frame_text_shrinks_to_fit_the_bar():
@@ -863,11 +886,12 @@ def test_frame_text_shrinks_to_fit_the_bar():
     long_text = "ZURICH KLOTEN TO GENEVA COINTRIN VIA THE ALPS"
     p, parts, text = _text_body(text=long_text)
     N, _, fpx, chin_px = poster._grid(p)
+    S = poster.TEXT_SUB
     tm = parts["text_mask"]
     cols, rows = np.where(tm.any(0))[0], np.where(tm.any(1))[0]
-    assert fpx <= cols.min() and cols.max() < N - fpx      # inside the bar, off the corners
-    assert N - fpx <= rows.min() and rows.max() < N + chin_px      # on the bottom bar
-    _assert_text_meshes(p, parts, text, 2500)
+    assert fpx * S <= cols.min() and cols.max() < (N - fpx) * S   # off the corners
+    assert (N - fpx) * S <= rows.min() and rows.max() < (N + chin_px) * S   # on the bar
+    _assert_text_meshes(p, parts, text, 20000)
 
 
 

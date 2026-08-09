@@ -374,3 +374,86 @@ two-level body the slicer quantises on its own.
 
 `check_output.py`'s layer rule now measures against `_snap` (the same helper the generator
 uses) and covers the colour bodies as well as the terrain and the strip.
+
+---
+
+# Addendum 2026-08-09: frame chin + two-line readable text (approved)
+
+Two problems with the printed frame: the white text was not smooth or readable, and the
+bottom bar was too small for a proper caption.
+
+## Readability: the text gets its own, finer grid
+
+The glyphs were rasterised on the **terrain's** 0.4mm grid, so an 8mm capital was ~20px
+tall, every curve stair-stepped by 0.4mm, and the 1px `MaxFilter(3)` dilation (which
+`masked_slab_mesh`' four-corner cell rule needs) fattened every stroke by another 0.4mm.
+
+The text body stands on the *flat* ring, so it never needed the frame's heightmap at all
+— only a constant top. Decoupling that is what frees it to use its own pitch:
+
+- `_text_mask()` renders and returns the mask on a `TEXT_SUB = 4`× grid, `text_res =
+  res_mm / TEXT_SUB` = **0.1mm** at defaults, spanning the same physical extent as the
+  frame. `compose_parts` returns `text_res` alongside `text_mask`.
+- `build_poster` meshes it with `masked_slab_mesh(text_mask, np.full(shape, ring_top +
+  TEXT_EMBOSS_MM), TEXT_EMBOSS_MM, text_res)` — a **constant** top array, not
+  `parts["frame"] + emboss`. Signature and z semantics unchanged: the body still sits on
+  the ring top and stands `TEXT_EMBOSS_MM` (0.84) proud.
+
+Measured on the shipped 250mm "HB-EZE" case: 2796 → **27304 vertices**, edge pitch 0.4 →
+0.1mm, and the meshed ink area falls 175.7 → 124.5mm² — that 29% is the coarse dilation's
+stroke-fattening, gone. 4× is where it converges: 6× yields 123.7mm² (0.6% more) for 2.2×
+the vertices, and 0.1mm is already a quarter of the 0.4mm nozzle.
+
+## The chin: the frame grows downward, the opening does not
+
+`size_mm` keeps today's meaning — the poster **width** and the square relief area. The
+caption bar is extended **outward at the bottom** by `chin_mm`, so the relief and the ring
+opening are unaffected *by construction*:
+
+```python
+N, M, fpx, chin_px = _grid(p)          # N, M, fpx keep their formulas; chin_px is new
+H = N + chin_px
+frame = np.full((H, N), p.base_mm)
+ring = np.ones((H, N), bool)
+ring[fpx:N - fpx, fpx:N - fpx] = False # unchanged indices -> chin rows are all ring
+```
+
+`heightmap_mesh` maps `y = (H-1-row)*res`, so appended rows extend the poster southward.
+Everything downstream is shape-generic (`heightmap_mesh`, `_slab_mesh`, `_slab_cells`,
+`_groove_mask` all read `H, W = …`) and the relief path is `(M,M)` and untouched. Proven,
+not asserted: the opening sub-array and every relief array are **byte-identical** to a
+no-chin build of the same poster.
+
+`chin_mm` is auto (`None`) by default and **derived, not scaled** — it follows `text_mm`
+and `frame_mm`, which are scaled already:
+
+```
+block   = text_mm + GAP_RATIO*text_mm + SUB_RATIO*text_mm      # 0.35, 0.65
+chin_mm = ceil_to_pixel(max(block + 2*TEXT_MARGIN_MM - gridded_ring, 0))   # margin 3.0mm
+```
+
+`gridded_ring = int(frame_mm/res_mm)*res_mm`, i.e. the bar the glyphs actually get —
+`frame_mm` itself would over-promise by up to one pixel. No caption → `chin_mm == 0` →
+square frame, every earlier behaviour bit-for-bit. An explicit `chin_mm` overrides, and
+`_text_mask` scales the block down to fit whatever bar it is given.
+
+## Two lines
+
+`Params.text2: str = ""`. Line 1 at `text_mm`, line 2 at `SUB_RATIO*text_mm`, gap
+`GAP_RATIO*text_mm`, the block centred in the full bar (`frame_mm + chin_mm`). Each line
+is sized independently by the existing measure-ink → fit-height → fit-width logic, now
+factored into `_fit_line(s, ink_px, avail_px)`; `avail` is still the ring opening, which
+keeps the text off the corners.
+
+## Wiring
+
+- `check_output.py` rule 3 is per axis: x == `size_mm`, y == `size_mm + chin_mm`, **both
+  ≤ 256**. A poster that fits the plate in x can now overflow it in y, and this is the
+  rule that says so. Rule 6b's bar is `lo[1] + frame_mm + chin_mm`. Text z rules unchanged.
+- `static/index.html`: a `text2` input, sent alongside `text`; the relief/strip assembly
+  offset becomes `[inset, inset + R.chin_mm, R.base_mm]` — the frame's y origin moved down.
+- `app.py`: nothing. It introspects `Params`, and `resolved` already carries the new fields.
+
+Live at `size_mm=170` (HB-EZE, both lines): frame 169.60 × 178.80mm on the 256 plate,
+chin 9.2mm, bar 17.2mm holding a 10.88mm block with 3.16mm margins, text body 57874
+vertices at 0.1mm pitch, `check_output.py` 45/45.
