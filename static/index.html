@@ -28,6 +28,7 @@
   <label>Text (bottom frame bar)</label><input id="text" placeholder="ZURICH → GENEVA">
   <label>Second line (smaller)</label><input id="text2" placeholder="HB-EZE · 12.07.2026">
   <label>Poster size mm</label><input id="size_mm" type="number" value="250">
+  <div id="dims" style="font-size:11px;margin:3px 0;color:#444"></div>
   <label>Max relief mm</label><input id="relief_mm" type="number" placeholder="auto">
   <label>Vertical exaggeration</label><input id="exaggeration" type="number" step="0.1" value="1.5">
   <label>Margin %</label><input id="margin_pct" type="number" value="15">
@@ -111,6 +112,28 @@ function dl(el, bytes, name, type) {
   el.href = URL.createObjectURL(new Blob([bytes], { type }));
   el.download = name; el.style.display = 'block';
 }
+
+// Live frame size. A caption hangs a chin below the square, so the poster is taller
+// than size_mm and can run off the plate while the width still looks fine — the
+// server does the sum because the chin comes out of resolve(), not out of arithmetic.
+const dims = document.getElementById('dims');
+let dimsTimer;
+async function refreshDims() {
+  const q = new URLSearchParams(['size_mm', 'text', 'text2'].map(
+    id => [id, document.getElementById(id).value]));
+  try {
+    const d = await (await fetch('/dimensions?' + q)).json();
+    dims.textContent = `Frame: ${d.width.toFixed(1)} × ${d.height.toFixed(1)} mm  ·  `
+      + (d.fits ? 'fits 256mm plate'
+                : `— OVER the 256mm plate (max ${d.max_size_mm}mm at this caption)`);
+    dims.style.color = d.fits ? '#444' : '#a00';
+  } catch (e) { dims.textContent = ''; }   // blank/garbage size field: say nothing
+}
+for (const id of ['size_mm', 'text', 'text2'])
+  document.getElementById(id).addEventListener('input', () => {
+    clearTimeout(dimsTimer); dimsTimer = setTimeout(refreshDims, 300);
+  });
+refreshDims();   // the default 250 is the value that bit us — show it before any typing
 
 document.getElementById('go').onclick = async () => {
   const f = document.getElementById('file').files[0];

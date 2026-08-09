@@ -795,6 +795,28 @@ def test_generate_refuses_a_poster_over_the_plate():
     assert "249.6 x 260.0mm" in detail and "256mm plate" in detail and "<=" in detail
 
 
+def test_dimensions_endpoint():
+    """The live UI line: resolve + _grid, no meshing, so it answers instantly."""
+    from fastapi.testclient import TestClient
+    import app as appmod
+    client = TestClient(appmod.app)
+    get = lambda **q: client.get("/dimensions", params=q).json()
+
+    over = get(size_mm=250, text="ZURICH", text2="HB-EZE")
+    assert (over["width"], over["height"], over["chin_mm"]) == (249.6, 260.0, 10.4)
+    assert over["fits"] is False
+    assert over["max_size_mm"] < 250     # and it is a size that actually fits
+    assert max(poster.footprint_mm(poster.resolve(poster.Params(
+        size_mm=over["max_size_mm"], text="ZURICH", text2="HB-EZE")))) <= poster.PLATE_MM
+
+    ok = get(size_mm=170, text="ZURICH", text2="HB-EZE")
+    assert (ok["width"], ok["height"], ok["fits"]) == (169.6, 179.2, True)
+
+    bare = get(size_mm=250)              # no caption -> no chin, still square
+    assert (bare["width"], bare["height"], bare["chin_mm"], bare["fits"]) == \
+        (249.6, 249.6, 0.0, True)
+
+
 def test_generate_bad_file():
     from fastapi.testclient import TestClient
     import app as appmod

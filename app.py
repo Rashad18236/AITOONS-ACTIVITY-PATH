@@ -32,4 +32,15 @@ async def generate(file: UploadFile, params: str = Form("{}")):
             "resolved": asdict(p)}
 
 
+@app.get("/dimensions")
+def dimensions(size_mm: float = core.Params.size_mm, text: str = "", text2: str = ""):
+    """Frame footprint for the live UI line under the size field. resolve + _grid
+    only — no meshing, so it is instant. Nothing else in Params moves the footprint."""
+    p0 = core.Params(size_mm=size_mm, text=text, text2=text2)
+    p = core.resolve(p0)
+    w, h = core.footprint_mm(p)
+    return {"width": w, "height": h, "chin_mm": p.chin_mm,
+            "fits": max(w, h) <= core.PLATE_MM, "max_size_mm": core.max_size_mm(p0)}
+
+
 app.mount("/", StaticFiles(directory="static", html=True))
