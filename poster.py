@@ -385,7 +385,10 @@ def resolve(p: Params) -> Params:
         # (the preview and the checker both offset by the mm value).
         ls = _lines(p)
         block = sum(h for _, h in ls) + GAP_RATIO * p.text_mm * (len(ls) - 1) if ls else 0.0
-        ring = int(p.frame_mm / p.res_mm) * p.res_mm   # the gridded bar, as _grid's fpx
+        # The bar is measured the way the mesher measures it: rows N-fpx..H-1 span
+        # (fpx + chin_px - 1) * res_mm of y, one pixel short of the nominal
+        # frame_mm + chin_mm. Ask for that pixel back, or the margins come out short.
+        ring = (int(p.frame_mm / p.res_mm) - 1) * p.res_mm
         need = max(block + 2 * TEXT_MARGIN_MM - ring, 0.0) if ls else 0.0
         p = replace(p, chin_mm=round(math.ceil(round(need / p.res_mm, 6)) * p.res_mm, 6))
     core = p.groove_w_mm - 2 * p.clearance_mm
@@ -452,21 +455,31 @@ def _fit_line(s, ink_px, avail_px):
 def _text_mask(H, N, fpx, chin_px, p):
     """(bool glyph mask, its res_mm) for the caption, on the TEXT_SUB-finer grid.
 
-    The mask spans the same physical extent as the (H,N) frame, so the text body it
-    meshes lands in the frame's own coordinates — but on its own pitch, which is the
-    whole point: glyph edges step by res_mm/TEXT_SUB instead of by the terrain's
-    res_mm. Lines are centred in the full bottom bar (frame_mm + chin_mm tall),
-    line 2 at SUB_RATIO of line 1 with GAP_RATIO of line 1 between them."""
+    The mask spans the frame's EXACT physical extent, so the text body it meshes
+    lands in the frame's own coordinates — but on its own pitch, which is the whole
+    point: glyph edges step by res_mm/TEXT_SUB instead of by the terrain's res_mm.
+
+    (H-1)*TEXT_SUB+1 rows, not H*TEXT_SUB. Both meshers map row -> (rows-1-row)*res,
+    and that -1 is a VERTEX count, not a cell count: it does not scale with TEXT_SUB.
+    An H*TEXT_SUB mask put every glyph (1 - 1/TEXT_SUB)*res_mm — 0.3mm at defaults —
+    north of where the frame thinks that row is. Sized this way, fine row r*TEXT_SUB
+    is exactly frame row r, in both axes, at every resolution.
+
+    Lines are centred in the bottom bar (frame rows N-fpx..H-1), line 2 at SUB_RATIO
+    of line 1 with GAP_RATIO of line 1 between them."""
     res = p.res_mm / TEXT_SUB
-    W, Hf = N * TEXT_SUB, H * TEXT_SUB
+    W, Hf = (N - 1) * TEXT_SUB + 1, (H - 1) * TEXT_SUB + 1
     lines = _lines(p)
     if not lines:
         return np.zeros((Hf, W), bool), res
     img = Image.new("L", (W, Hf))
     d = ImageDraw.Draw(img)
-    bar_top = (N - fpx) * TEXT_SUB          # first fine row of the bottom bar
-    bar_h = (fpx + chin_px) * TEXT_SUB
-    avail = (N - 2 * fpx) * TEXT_SUB        # ring opening: keeps the text off the corners
+    bar_top = (N - fpx) * TEXT_SUB          # frame row N-fpx, exactly
+    bar_h = Hf - 1 - bar_top                # ...down to the last frame row, exactly
+    # Ring opening, in fine columns, less one pixel per side for the dilation below:
+    # keeps the text off the corners where the side bars meet. Frame cols fpx..N-fpx-1
+    # are fine cols fpx*TEXT_SUB..(N-fpx-1)*TEXT_SUB, so the span is (N-2*fpx-1) coarse.
+    avail = (N - 2 * fpx - 1) * TEXT_SUB - 2
     hs = [h / res for _, h in lines]
     gap = GAP_RATIO * p.text_mm / res
     block = sum(hs) + gap * (len(hs) - 1)
@@ -481,7 +494,7 @@ def _text_mask(H, N, fpx, chin_px, p):
     y = bar_top + (bar_h - block) / 2
     for s, h in zip((s for s, _ in lines), hs):
         font, ink = _fit_line(s, h, avail)
-        d.text(((W - (ink[2] - ink[0])) / 2 - ink[0], y - ink[1]), s, fill=255, font=font)
+        d.text(((W - 1 - (ink[2] - ink[0])) / 2 - ink[0], y - ink[1]), s, fill=255, font=font)
         y += h + gap                        # nominal, so a width-shrunk line cannot crowd
     # Dilate 1px: masked_slab_mesh only meshes cells with all four corners set, so a
     # stroke survives only where every glyph pixel is cell-interior. After a

@@ -457,3 +457,48 @@ keeps the text off the corners.
 Live at `size_mm=170` (HB-EZE, both lines): frame 169.60 × 178.80mm on the 256 plate,
 chin 9.2mm, bar 17.2mm holding a 10.88mm block with 3.16mm margins, text body 57874
 vertices at 0.1mm pitch, `check_output.py` 45/45.
+
+## Correction 2026-08-09a (review round 1)
+
+Two defects found in review, both reproduced end-to-end.
+
+**The fine text grid was not registered to the frame grid — 0.3mm y drift.** The mask was
+sized `(H*TEXT_SUB, N*TEXT_SUB)`. Both `heightmap_mesh` and `_slab_mesh` map
+`row -> (rows-1-row)*res`, and that `-1` is a **vertex** count: it does not scale with
+`TEXT_SUB`. Fine row `r*TEXT_SUB` therefore landed at `(H-1-r)*res + (1 - 1/TEXT_SUB)*res`,
+i.e. 0.3mm north of frame row `r` at defaults, on every row, with the error growing with
+`res_mm`. Measured at the live 170mm params (N=425, H=448): coarse row 405 → 16.800mm,
+same row via the text grid → 17.100mm. x was unshifted but its *extent* was one fine pixel
+too wide, for the same reason.
+
+Fix: size the mask `(H-1)*TEXT_SUB+1 × (N-1)*TEXT_SUB+1`, so fine row `r*TEXT_SUB` **is**
+frame row `r` at every resolution. Three follow-on terms:
+
+- `bar_h = Hf - 1 - bar_top` — the bar is frame rows `N-fpx..H-1`, which span
+  `(fpx + chin_px - 1)*res_mm`, one pixel less than the nominal `frame_mm + chin_mm`.
+- `resolve`'s auto chin measures against that same bar,
+  `ring = (int(frame_mm/res_mm) - 1) * res_mm`, or the 3mm margins come out a half-pixel
+  short. Consequence: chin at the live 170mm case 9.2 → **9.6mm**.
+- x centring uses `W - 1` (the frame's true centre) and `avail` is
+  `(N - 2*fpx - 1)*TEXT_SUB - 2` — the opening's span in fine columns, less one pixel per
+  side for the dilation, which would otherwise put a glyph 0.025mm over the corner.
+
+Guarded by `test_the_text_grid_is_registered_to_the_frame_grid`: it meshes two corner
+cells of the fine grid and asserts their bounds equal the frame mesh's in x and y to
+1e-9, then asserts the real glyphs sit inside the bar by `heightmap_mesh`'s own row→y
+mapping. Every other geometric test measures inside a single grid, which is why this
+shipped; reverting the mask sizing fails the new test with exactly the 0.3mm.
+
+**`check_output.py` rule 6 ignored `text2`.** `(text is not None) == bool(p.text)` FAILed a
+valid `text2`-only caption ("text body present", 31/32). Now `bool(p.text or p.text2)`, and
+the checker's pass-test is parametrized over all four caption combinations. Rule 6b's bar
+is likewise taken from `_grid` rows rather than nominal mm.
+
+**User-visible height change.** The auto chin fires for *any* caption, so a single-line
+250mm poster is now **2.4mm taller** than before this change (252.4mm, still on the plate)
+and a two-line one is 10.4mm taller — 260.4mm, which **overflows the 256 plate**. ~245mm
+is the practical two-line ceiling; the per-axis y rule is what reports it.
+
+Re-verified live at 170mm: two-line 169.60 × 179.20mm, chin 9.6mm, text 57874 verts;
+`text2`-only 169.60 × 171.60mm, chin 2.0mm, text 17930 verts. Both **45/45 PASS**, both
+grid-registered exactly, opening and relief still byte-identical to a no-caption build.

@@ -128,9 +128,11 @@ def main(argv=None):
         chk("frame ring height", abs(hi[2] - ring) <= 0.01,
             f"{hi[2]:.3f}mm", f"{ring:.2f}mm +-0.01")
 
-        # 6. white text body: present iff text was asked for, sitting on the ring
-        chk("text body present", (text is not None) == bool(p.text),
-            "yes" if text is not None else "no", "yes" if p.text else "no")
+        # 6. white text body: present iff a caption was asked for, sitting on the ring.
+        # EITHER line counts — a text2-only caption is valid and builds a body.
+        caption = bool(p.text or p.text2)
+        chk("text body present", (text is not None) == caption,
+            "yes" if text is not None else "no", "yes" if caption else "no")
         if text is not None:
             tlo, thi = text.bounds
             chk("text body z range",
@@ -140,8 +142,11 @@ def main(argv=None):
             # 6b. and staying on the ring's bottom bar in xy. The glyphs are TrueType
             # now, ~40% wider than the bitmap they replaced, so a long string that
             # overflows and clips off the poster edge must not pass silently.
-            # The mesh flips y, so the bottom bar is the ring's own band plus the chin.
-            bar = lo[1] + p.frame_mm + p.chin_mm
+            # The mesh flips y, so the bottom bar is the ring's own band plus the chin
+            # — measured in grid rows, the way the mesher lays them out, not in nominal
+            # mm (frame_mm truncates to fpx, and rows N-fpx..H-1 span one pixel less).
+            _, _, fpx, chin_px = _grid(p)
+            bar = lo[1] + (fpx + chin_px - 1) * p.res_mm
             chk("text body on the bottom bar",
                 tlo[0] >= lo[0] - 0.5 and thi[0] <= hi[0] + 0.5
                 and tlo[1] >= lo[1] - 0.5 and thi[1] <= bar + 0.5,

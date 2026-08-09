@@ -350,7 +350,7 @@ def test_compose_parts_text_is_a_mask_not_an_emboss():
     frame, tm = parts["frame"], parts["text_mask"]
     H = N + poster._grid(q)[3]
     assert frame.max() == p.base_mm + p.frame_height_mm    # ring is flat, nothing embossed
-    assert tm.shape == (H * S, N * S) and tm.dtype == bool
+    assert tm.shape == ((H - 1) * S + 1, (N - 1) * S + 1) and tm.dtype == bool
     assert parts["text_res"] == q.res_mm / S
     assert tm.any() and tm[:(N - fpx) * S, :].sum() == 0   # glyphs live on the bottom bar
     assert not poster.compose_parts(track, elev, lc, bounds, _params())["text_mask"].any()
@@ -393,7 +393,8 @@ def test_chin_auto_sizes_to_hold_the_caption():
     q = _params(text="ZURICH", text2="HB-EZE", text_mm=6.0)
     block = 6.0 + 0.35 * 6.0 + poster.SUB_RATIO * 6.0      # line1 + gap + line2
     N, _, fpx, chin_px = poster._grid(q)
-    bar = (fpx + chin_px) * q.res_mm                       # the bar the glyphs actually get
+    # frame rows N-fpx..H-1, measured the way heightmap_mesh maps them to y
+    bar = (fpx + chin_px - 1) * q.res_mm
     assert bar >= block + 2 * poster.TEXT_MARGIN_MM - 1e-9
     assert bar < block + 2 * poster.TEXT_MARGIN_MM + q.res_mm   # pixel rounding, no more
     # one line needs less chin than two, no caption needs none
@@ -868,16 +869,43 @@ def test_text_is_meshed_on_its_own_fine_grid():
     N, _, fpx, chin_px = poster._grid(p)
     S = poster.TEXT_SUB
     assert parts["text_res"] == p.res_mm / S
-    assert parts["text_mask"].shape == ((N + chin_px) * S, N * S)
+    assert parts["text_mask"].shape == ((N + chin_px - 1) * S + 1, (N - 1) * S + 1)
     # glyph edges land on the fine pitch, not the frame's
     xs = np.unique(text.vertices[:, 0].round(6))
     assert abs(np.diff(xs).min() - parts["text_res"]) < 1e-6
     # ...and the same glyphs on the coarse grid are an order of magnitude cruder
     coarse = poster.masked_slab_mesh(
-        parts["text_mask"][::S, ::S],
+        parts["text_mask"][::S, ::S],                      # exactly the frame's own rows
         np.full((N + chin_px, N), p.base_mm + p.frame_height_mm + poster.TEXT_EMBOSS_MM),
         poster.TEXT_EMBOSS_MM, p.res_mm)
     assert len(text.vertices) > 4 * len(coarse.vertices)
+
+
+def test_the_text_grid_is_registered_to_the_frame_grid():
+    """The fine mask must span the frame's EXACT extent, or the caption prints offset.
+
+    Regression: heightmap_mesh and _slab_mesh both map row -> (rows-1-row)*res, and
+    that -1 is a vertex count — it does not scale with TEXT_SUB. An (H*TEXT_SUB,
+    N*TEXT_SUB) mask therefore sat (1 - 1/TEXT_SUB)*res_mm = 0.3mm north of the frame
+    at defaults, on every row, and the error grows with res_mm. Nothing caught it
+    because every other geometric test measures inside ONE grid; this one is the only
+    test that puts the two meshes side by side."""
+    p, parts, text = _text_body()
+    frame = poster.heightmap_mesh(parts["frame"], p.res_mm)
+    tm, tres = parts["text_mask"], parts["text_res"]
+    # two corner cells are enough to pin all four edges of the fine grid's extent
+    probe = np.zeros(tm.shape, bool)
+    probe[:2, :2] = probe[-2:, -2:] = True
+    m = poster.masked_slab_mesh(probe, np.full(tm.shape, 1.0), 0.5, tres)
+    assert np.allclose(m.bounds[:, :2], frame.bounds[:, :2], atol=1e-9), \
+        f"text grid {m.bounds[:, :2].tolist()} vs frame {frame.bounds[:, :2].tolist()}"
+    # ...and the real glyphs land inside the caption bar, measured by heightmap_mesh's
+    # own row -> y mapping. Exact, not check_output's +-0.5mm, which absorbed the bug.
+    N, _, fpx, chin_px = poster._grid(p)
+    bar_top_y = (fpx + chin_px - 1) * p.res_mm             # frame row N-fpx
+    assert text.bounds[0][1] >= -1e-9
+    assert text.bounds[1][1] <= bar_top_y + 1e-9
+    assert text.bounds[1][1] > bar_top_y - p.frame_mm      # and really is on the bar
 
 
 def test_frame_text_shrinks_to_fit_the_bar():
@@ -890,7 +918,7 @@ def test_frame_text_shrinks_to_fit_the_bar():
     tm = parts["text_mask"]
     cols, rows = np.where(tm.any(0))[0], np.where(tm.any(1))[0]
     assert fpx * S <= cols.min() and cols.max() < (N - fpx) * S   # off the corners
-    assert (N - fpx) * S <= rows.min() and rows.max() < (N + chin_px) * S   # on the bar
+    assert (N - fpx) * S <= rows.min() and rows.max() <= (N + chin_px - 1) * S  # on the bar
     _assert_text_meshes(p, parts, text, 20000)
 
 
@@ -900,12 +928,15 @@ def test_frame_text_shrinks_to_fit_the_bar():
 
 
 
-@pytest.mark.parametrize("text", ["HB-EZE", ""])
-def test_check_output_passes_on_freshly_built_files(monkeypatch, tmp_path, text):
-    """The shipped checker agrees with the shipped builder, text body or not."""
+@pytest.mark.parametrize("text,text2", [("HB-EZE", ""), ("", ""),
+                                        ("", "HB-EZE"), ("ZURICH", "HB-EZE")])
+def test_check_output_passes_on_freshly_built_files(monkeypatch, tmp_path, text, text2):
+    """The shipped checker agrees with the shipped builder, whichever caption lines
+    were asked for. text2 alone is a valid caption and builds a body — the checker's
+    present-iff rule read `p.text` only and FAILed a perfectly good poster."""
     import check_output
     _fake_fetches(monkeypatch, water=True)
-    p = _params(text=text)
+    p = _params(text=text, text2=text2, text_mm=3.0)
     frame_bodies, bodies, path_stl = poster.build_poster(TRACK3, p)
     (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
     (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
