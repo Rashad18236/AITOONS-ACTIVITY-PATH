@@ -360,7 +360,7 @@ Every constant that has to land on that grid moved:
 | `layer_mm` | 0.2 | **0.12** | 1.67× the vertical quantisation over the same relief |
 | `smooth_px` | 2.0 | **1.0** | half the layer height needs half the blur; crisper terrain |
 | `cap_mm` (water) | 0.6 | **0.96** | 8 layers, and past the ~1mm opacity threshold |
-| text emboss | 0.8 | **0.84** (`TEXT_EMBOSS_MM`) | 7 layers above the ring top |
+| text emboss | 0.8 | **0.84** (`TEXT_EMBOSS_MM`) | 7 layers above the ring top. Since raised again to **1.20** (10 layers) — 0.84 of white over black is inside the marginal opacity band; see `docs/print-settings.md` |
 | `SLOT_FLOOR_MM` | 1.0 | **1.04** | `0.2 + 7*0.12`: the boundary nearest 1.0. *Not* 0.96 — 0.96 is 8×0.12 of material but lands mid-layer once the 0.2 first layer is counted, which is the bug this change exists to fix |
 | `base_mm` | 4.0 | **4.04** | `0.2 + 32*0.12` |
 | `frame_height_mm` @250 | 10.0 | **9.96** | a whole 83 layers, so the ring top `base + frame_height` = 14.00 is itself a boundary |
@@ -397,7 +397,7 @@ The text body stands on the *flat* ring, so it never needed the frame's heightma
 - `build_poster` meshes it with `masked_slab_mesh(text_mask, np.full(shape, ring_top +
   TEXT_EMBOSS_MM), TEXT_EMBOSS_MM, text_res)` — a **constant** top array, not
   `parts["frame"] + emboss`. Signature and z semantics unchanged: the body still sits on
-  the ring top and stands `TEXT_EMBOSS_MM` (0.84) proud.
+  the ring top and stands `TEXT_EMBOSS_MM` (0.84 when this shipped, now 1.20) proud.
 
 Measured on the shipped 250mm "HB-EZE" case: 2796 → **27304 vertices**, edge pitch 0.4 →
 0.1mm, and the meshed ink area falls 175.7 → 124.5mm² — that 29% is the coarse dilation's
