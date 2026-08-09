@@ -524,8 +524,8 @@ def _stroke_mm(mask, res):
     return 2 * 32 * res
 
 
-def _thicken(mask, cap_px, res):
-    """One caption line, dilated: 1px for the mesher, plus whatever MIN_STROKE_MM needs.
+def _dilation_px(mask, cap_px, res):
+    """Fine pixels one caption line must grow by: 1 for the mesher, plus MIN_STROKE_MM.
 
     The 1px is structural — masked_slab_mesh only meshes cells with all four corners
     set, so a stroke survives only where every glyph pixel is cell-interior, and after
@@ -543,10 +543,43 @@ def _thicken(mask, cap_px, res):
         print(f"text: {stroke:.2f}mm strokes want {n}px of dilation, capped at {cap}px "
               f"({stroke + 2 * (cap - 1) * res:.2f}mm) to keep the counters open")
         n = cap
+    return n
+
+
+def _dilate(mask, n):
     img = Image.fromarray(np.where(mask, 255, 0).astype(np.uint8))
     for _ in range(n):    # ponytail: n cheap MaxFilter(3)s — one MaxFilter(2n+1) is
         img = img.filter(ImageFilter.MaxFilter(3))   # the same square, at O(n^2)/px
     return np.asarray(img) > 0
+
+
+def _line_mask(shape, s, font, extra, top):
+    """(`s` drawn centred in a `shape` mask, its ink width), tracked by `extra` px.
+
+    ImageDraw.text has no tracking parameter, so the line is laid out here instead:
+    pen x accumulates font.getlength(ch) + extra and each glyph is drawn on its own.
+    `extra` is what pays for the dilation in _dilate — a glyph grown by n pixels on
+    every side eats n off each side of every gap, so an advance has to grow by 2n or
+    the letters touch, which is exactly what the thickening was meant to prevent.
+
+    The cost of drawing glyph by glyph is kerning: per-character advances only, so
+    pairs like "VA" sit a shade loose. Loose is the direction this whole function is
+    pushing anyway. `top` is the em-box top, as ImageDraw.text takes it."""
+    xs, x, l, r = [], 0.0, math.inf, -math.inf
+    for ch in s:
+        b = font.getbbox(ch)
+        if b[2] > b[0]:                       # ink-bearing: a space moves no bbox
+            l, r = min(l, x + b[0]), max(r, x + b[2])
+        xs.append(x)
+        x += font.getlength(ch) + extra
+    if r < l:
+        return np.zeros(shape, bool), 0.0
+    img = Image.new("L", (shape[1], shape[0]))
+    d = ImageDraw.Draw(img)
+    x0 = (shape[1] - 1 - (r - l)) / 2 - l     # centred on the tracked ink, not the em
+    for ch, x in zip(s, xs):
+        d.text((x0 + x, top), ch, fill=255, font=font)
+    return np.asarray(img) > 0, r - l
 
 
 def _text_mask(H, N, fpx, chin_px, p):
@@ -591,11 +624,19 @@ def _text_mask(H, N, fpx, chin_px, p):
     # One image per line, thickened on its own: line 2 is the smaller face, so its
     # strokes are thinner and it needs more dilation than line 1 to clear the floor.
     for s, h in zip((s for s, _ in lines), hs):
-        img = Image.new("L", (W, Hf))
         font, ink = _fit_line(s, h, avail)
-        ImageDraw.Draw(img).text(((W - 1 - (ink[2] - ink[0])) / 2 - ink[0], y - ink[1]),
-                                 s, fill=255, font=font)
-        mask |= _thicken(np.asarray(img) > 0, h, res)
+        # The dilation is measured off a first, untracked render, because it depends
+        # only on the rendered stroke; the tracking that answers it then changes the
+        # width, so the width fit is redone against the TRACKED ink or a long line
+        # walks off the bar. n is not re-measured after that shrink: tracking and
+        # dilation must stay the same number, and a hair under MIN_STROKE_MM beats a
+        # line whose letters touch.
+        n = _dilation_px(_line_mask((Hf, W), s, font, 0, y - ink[1])[0], h, res)
+        glyphs, w = _line_mask((Hf, W), s, font, 2 * n, y - ink[1])
+        if w > avail:
+            font = _font(max(int(font.size * avail / w), 6))
+            glyphs = _line_mask((Hf, W), s, font, 2 * n, y - font.getbbox(s)[1])[0]
+        mask |= _dilate(glyphs, n)
         y += h + gap                        # nominal, so a width-shrunk line cannot crowd
     return mask, res
 

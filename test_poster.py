@@ -503,6 +503,41 @@ def _counter_mm2(mask, res):
     return int((np.array(img) == 0).sum()) * res ** 2
 
 
+def _blobs(mask):
+    """Number of 4-connected ink blobs. floodfill each one out until no ink is left.
+
+    PIL's floodfill rather than a hand-rolled BFS: it is already imported here, it is
+    4-connected, and it is the same flood in C. .copy() for the same reason as above."""
+    img = Image.fromarray(np.where(mask, 255, 0).astype(np.uint8)).copy()
+    for n in range(10000):
+        ys, xs = np.nonzero(np.array(img) == 255)
+        if not len(ys):
+            return n
+        ImageDraw.floodfill(img, (int(xs[0]), int(ys[0])), 1)
+    raise AssertionError("10000 blobs — that is not a caption")
+
+
+def test_the_stroke_floor_does_not_merge_the_caption_letters():
+    """The dilation that clears MIN_STROKE_MM also eats the gaps between the letters:
+    it grows every glyph by n fine pixels on all sides, so a gap narrower than 2n
+    closes. At 170mm the subtitle takes n=2 and "HB-EZE · 02.08.2026" came out as 7
+    blobs where it has 17 letters — thickening strokes for readability while welding
+    the words shut. So each line is now TRACKED by 2n as well: the advance between
+    two characters grows by exactly what the two facing edges gained, and the
+    designed gap survives the dilation intact.
+
+    ">=", not "==": a glyph is allowed to be more than one blob (an accented capital,
+    a dotted i at this size). Nothing in a plain sans caption is, so this reads 17/17
+    in practice, but the invariant asserted is "no two letters merged", not a count."""
+    p = poster.resolve(poster.Params(size_mm=170.0, text="ZURICH → ALTENRHEIN",
+                                     text2="HB-EZE · 02.08.2026"))
+    N, _, fpx, chin_px = poster._grid(p)
+    tm, _ = poster._text_mask(N + chin_px, N, fpx, chin_px, p)
+    for s, band in zip((p.text, p.text2), _split_lines(tm)):
+        ink = sum(not c.isspace() for c in s)
+        assert _blobs(band) >= ink, f"{s!r}: {_blobs(band)} blobs for {ink} letters"
+
+
 def test_heightmap_mesh_watertight():
     rng = np.random.default_rng(0)
     hm = 4.0 + rng.random((20, 30)) * 5
