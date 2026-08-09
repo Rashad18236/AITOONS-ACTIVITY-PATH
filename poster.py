@@ -148,8 +148,12 @@ SLOT_FLOOR_MM = 1.04
 # so a printable height is FIRST_LAYER_MM + n*layer_mm, not n*layer_mm.
 FIRST_LAYER_MM = 0.2
 
-# White text body thickness: 7 layers at 0.12. Sits on the (flat) frame ring top.
-TEXT_EMBOSS_MM = 0.84
+# White text body thickness: 10 layers at 0.12. Sits on the (flat) frame ring top.
+# Not 0.84 (7 layers): white PLA over black needs ~1.0mm before it stops reading
+# warm-grey under a raking lamp, which is the light a wall-hung poster gets. It costs
+# one extra 0.1g of white and no extra filament change — the caption is the only
+# geometry above the ring, so the plate has exactly one black->white change either way.
+TEXT_EMBOSS_MM = 1.20
 
 # Caption layout. Line 2 is a subtitle at SUB_RATIO of line 1, GAP_RATIO of line 1
 # below it; TEXT_MARGIN_MM of clear ring above and below the block decides the chin.
@@ -369,6 +373,20 @@ _SCALED = {"frame_mm": (12.0, 4.0), "relief_mm": (20.0, 5.0), "frame_height_mm":
            "text_mm": (8.0, 3.0), "groove_w_mm": (2.0, 1.2), "proud_mm": (0.96, 0.4)}
 
 
+def _layers(v, p, mul=1.0):
+    """Round a z-direction *thickness* UP to a whole number of layers.
+
+    _snap() puts an absolute z on the FIRST_LAYER_MM + n*layer_mm grid; this is its
+    delta form. base_mm and plate_mm already sit on that grid, so a whole-layer
+    thickness stacked on them keeps everything above it on the grid too. Up, never
+    nearest: these thicknesses all have a printability floor and rounding one down
+    can cross it. `mul` snaps the thing the thickness is multiplied by before it
+    reaches a real z (relief_mm only matters through the exaggeration)."""
+    if p.layer_mm <= 0:
+        return v
+    return round(math.ceil(v * mul / p.layer_mm - 1e-9) * p.layer_mm / mul, 6)
+
+
 def _lines(p):
     """[(string, ink height mm), ...] for the caption lines that were asked for."""
     return [(s, h) for s, h in ((p.text, p.text_mm), (p.text2, SUB_RATIO * p.text_mm)) if s]
@@ -378,6 +396,15 @@ def resolve(p: Params) -> Params:
     """Params with every auto (None) field filled in — the only place that happens."""
     p = replace(p, **{k: max(floor, round(base * p.size_mm / 250, 2))
                       for k, (base, floor) in _SCALED.items() if getattr(p, k) is None})
+    # Scaling lands z heights between layers: at 170mm frame_height_mm came out 6.77,
+    # putting the ring top — the black/white colour boundary — 0.05mm above boundary
+    # 88, so which layer it printed on was the slicer's rounding to decide. Snap the
+    # z-direction params here, once, and every height built on them (ring top, text
+    # top, relief ceiling) is on the grid by construction. frame_mm, text_mm,
+    # groove_w_mm and chin_mm are XY and are deliberately left alone.
+    p = replace(p, frame_height_mm=_layers(p.frame_height_mm, p),
+                proud_mm=_layers(p.proud_mm, p),
+                relief_mm=_layers(p.relief_mm, p, p.exaggeration))
     if p.chin_mm is None:
         # Auto chin: whatever the caption needs beyond the bottom bar it already has.
         # Derived, not scaled — it follows text_mm and frame_mm, which are scaled

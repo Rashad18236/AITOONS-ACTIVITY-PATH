@@ -123,14 +123,38 @@ def test_resolve_scales_and_floors_at_80mm():
     p = poster.resolve(poster.Params(size_mm=80))
     assert p.frame_mm == 4.0            # 3.84 -> floor
     assert p.relief_mm == 6.4           # 20 * 80/250, above its 5.0 floor
-    assert p.frame_height_mm == 3.19    # 9.96 * 80/250, above its 3.0 floor
+    assert p.frame_height_mm == 3.24    # 9.96 * 80/250 = 3.19, up to 27 whole layers
     assert p.text_mm == 3.0             # 2.56 -> floor
     assert p.groove_w_mm == 1.2         # 0.64 -> floor
-    assert p.proud_mm == 0.4            # 0.31 -> floor
+    assert p.proud_mm == 0.48           # 0.31 -> 0.4 floor, up to 4 whole layers
     # absolute params are untouched by size (printer properties, not visual scale)
     assert (p.base_mm, p.plate_mm, p.cap_mm, p.clearance_mm, p.fit_mm, p.res_mm,
             p.snow_line_m, p.layer_mm, p.smooth_px) == (4.04, 2.0, 0.96, 0.30, 0.2, 0.4,
                                                         2000.0, 0.12, 1.0)
+
+
+def test_resolve_snaps_z_heights_to_the_layer_grid():
+    """Every z the frame stacks up must land on a printable layer boundary.
+
+    Regression: at 170mm frame_height_mm scaled to 6.7728 and rounded to 6.77, so the
+    ring top came out 10.81mm — 0.05mm above boundary 88. Which layer the black/white
+    colour boundary lands on was then decided by the slicer's rounding, not by us.
+    In-plane params (frame_mm, text_mm, groove_w_mm, chin_mm) must NOT be snapped:
+    the layer grid is a z grid and means nothing in xy."""
+    # 10 layers: white PLA over black only stops reading warm-grey at ~1.0mm
+    assert poster.TEXT_EMBOSS_MM == 1.2
+    for size in (250, 200, 170, 120):
+        p = poster.resolve(poster.Params(size_mm=size, text="ZURICH", text2="HB-EZE"))
+        ring_top = p.base_mm + p.frame_height_mm
+        for label, z in (("ring top", ring_top),
+                         ("text top", ring_top + poster.TEXT_EMBOSS_MM),
+                         ("relief ceiling",
+                          p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm)):
+            off = abs(z - poster._snap(z, p))
+            assert off < 1e-9, f"{size}mm {label} {z:.4f}mm is {off:.4f}mm off the grid"
+        # xy is not snapped — a frame width forced onto 0.12mm steps would be nonsense
+        assert p.frame_mm == max(4.0, round(12.0 * size / 250, 2))
+        assert p.text_mm == max(3.0, round(8.0 * size / 250, 2))
 
 
 def test_resolve_passes_explicit_values_through_and_is_idempotent():
