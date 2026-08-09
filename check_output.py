@@ -20,9 +20,9 @@ import argparse, json, sys
 from dataclasses import fields
 import numpy as np
 import trimesh
-from poster import SLOT_FLOOR_MM, TEXT_EMBOSS_MM, Params, _grid, _snap, read_3mf, resolve
+from poster import (PLATE_MM, SLOT_FLOOR_MM, TEXT_EMBOSS_MM, Params, _grid, _snap,
+                    read_3mf, resolve)
 
-PLATE_MM = 256.0
 TEXT_MM = TEXT_EMBOSS_MM     # build_poster() white text body thickness
 
 

@@ -1,7 +1,8 @@
 import io
 import json
 import os
-from dataclasses import asdict
+import re
+from dataclasses import asdict, replace
 
 import numpy as np
 import pytest
@@ -713,6 +714,26 @@ def test_build_poster_rejects_oversized_grid():
         poster.build_poster(track, _params(plate_mm=1.0))
 
 
+def test_build_poster_rejects_a_frame_taller_than_the_plate():
+    """The chin is height the plate has to find, and only check_output.py said so.
+
+    250mm with two caption lines is 249.6 x 260.0mm — 4mm of overhang nobody saw
+    until the files were sliced. The refusal names both axes and the size that fits."""
+    track = np.array([[47.0, 8.0, 0], [47.5, 9.0, 3000]])
+    p = poster.Params(size_mm=250.0, text="ZURICH", text2="HB-EZE")
+    with pytest.raises(ValueError) as e:
+        poster.build_poster(track, p)
+    msg = str(e.value)
+    assert "249.6 x 260.0mm" in msg and "256mm plate" in msg
+    assert "one caption line" in msg          # the concrete way out of a two-liner
+    mx = float(re.search(r"<=([\d.]+)mm", msg).group(1))
+    # the suggestion is the real ceiling: it fits, and one 0.1mm step up does not
+    fits = lambda s: max(poster.footprint_mm(poster.resolve(replace(p, size_mm=s))))
+    assert fits(mx) <= poster.PLATE_MM < fits(round(mx + 0.1, 1))
+    # and a one-line caption at 250mm is still fine (2.4mm of chin, not 10.4)
+    assert poster.footprint_mm(poster.resolve(replace(p, text2=""))) == (249.6, 252.0)
+
+
 def test_build_poster_rejects_cap_thicker_than_plate(monkeypatch):
     """cap_mm >= plate_mm silently produced negative green heights (API-only path)."""
     _fake_fetches(monkeypatch)
@@ -758,6 +779,20 @@ def test_generate_endpoint_auto_scales_at_80mm(monkeypatch):
     # 80 - 2*(4.0 ring + 0.5 ceil'd fit) = 71, less one grid pixel = 70.5.
     # At the old fixed 12mm ring this would be 54.5.
     assert abs(ext - 70.5) < 0.5
+
+
+def test_generate_refuses_a_poster_over_the_plate():
+    """The whole refusal has to reach the UI: the front end prints `detail` verbatim.
+
+    No monkeypatched fetches on purpose — the guard fires before any network call."""
+    from fastapi.testclient import TestClient
+    import app as appmod
+    r = TestClient(appmod.app).post(
+        "/generate", files={"file": ("f.kml", KML.encode())},
+        data={"params": '{"size_mm": 250, "text": "ZURICH", "text2": "HB-EZE"}'})
+    assert r.status_code == 502          # same generic handler the other guards use
+    detail = r.json()["detail"]
+    assert "249.6 x 260.0mm" in detail and "256mm plate" in detail and "<=" in detail
 
 
 def test_generate_bad_file():
@@ -1085,6 +1120,11 @@ def test_check_output_flags_a_chin_that_overflows_the_plate(monkeypatch, tmp_pat
     import check_output
     _fake_fetches(monkeypatch)
     p = _params(text="HB", text_mm=3.0, chin_mm=250.0)     # 40mm wide, 290mm tall
+    # build_poster refuses this frame now — that IS the guard, and it is tested by
+    # test_build_poster_rejects_a_frame_taller_than_the_plate. Lift the ceiling for
+    # the generation step only: check_output binds PLATE_MM at import, so the checker
+    # below still measures the exported mesh against the real 256mm plate.
+    monkeypatch.setattr(poster, "PLATE_MM", 1e6)
     frame_bodies, bodies, path_stl = poster.build_poster(TRACK3, p)
     (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
     (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))

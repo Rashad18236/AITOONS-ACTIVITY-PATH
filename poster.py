@@ -161,6 +161,10 @@ TEXT_EMBOSS_MM = 1.20
 # dilates each line until it clears this. See docs/print-settings.md.
 MIN_STROKE_MM = 1.0
 
+# Bambu build plate. The hard ceiling on BOTH frame axes: size_mm is the width, and
+# the chin makes the height size_mm + chin_mm, which is the one that overflows first.
+PLATE_MM = 256.0
+
 # Caption layout. Line 2 is a subtitle at SUB_RATIO of line 1, GAP_RATIO of line 1
 # below it; TEXT_MARGIN_MM of clear ring above and below the block decides the chin.
 SUB_RATIO = 0.65
@@ -453,6 +457,31 @@ def _grid(p):
     fpx = int(p.frame_mm / p.res_mm)
     return (N, N - 2 * (fpx + math.ceil(p.fit_mm / p.res_mm)), fpx,
             int(round((p.chin_mm or 0.0) / p.res_mm, 6)))
+
+
+def footprint_mm(p):
+    """(width, height) mm the printed frame really occupies, for a RESOLVED p.
+
+    Not (size_mm, size_mm + chin_mm): the mesher spans (N-1) pixels, so the width is
+    one grid pixel short of nominal (249.6, not 250, at defaults). chin_px * res_mm IS
+    chin_mm — resolve() rounds it to a whole pixel precisely so this holds."""
+    N, _, _, chin_px = _grid(p)
+    w = round((N - 1) * p.res_mm, 6)
+    return w, round(w + chin_px * p.res_mm, 6)
+
+
+def max_size_mm(p):
+    """Largest size_mm, in 0.1mm steps, whose footprint fits the plate with this caption.
+
+    Takes UNRESOLVED params: the chin follows text_mm and frame_mm, which follow
+    size_mm, so shrinking the poster shrinks the chin too and the answer is not
+    simply PLATE_MM - chin_mm."""
+    # ponytail: 0.1mm linear scan down from the asked-for size — ~50 resolve() calls
+    # for the 250mm two-line case, microseconds. Bisect if a caller ever runs it hot.
+    s = min(p.size_mm, PLATE_MM)
+    while s > 0 and max(footprint_mm(resolve(replace(p, size_mm=s)))) > PLATE_MM:
+        s = round(s - 0.1, 1)
+    return s
 
 
 def _groove_mask(track_px, shape, p):
@@ -880,12 +909,21 @@ def build_poster(track, p=Params()):
     """Track -> (frame_bodies, relief_bodies, path_strip_stl).
 
     Both body lists are [(mesh, name, hex_colour, extruder_slot), ...] for write_3mf."""
-    p = resolve(p)   # auto (None) visual params -> concrete mm; everything below is mm
+    p0, p = p, resolve(p)   # auto (None) visual params -> concrete mm; all mm below
     # ponytail: reject rather than clamp — a typo'd 2500mm is a mistake to surface,
     # not to silently honour, and N^2 grids OOM the box. Raise the cap if a bigger
     # plate ever shows up.
-    if p.size_mm > 256 or p.res_mm < 0.2:
-        raise ValueError("size_mm must be <= 256 (plate limit) and res_mm >= 0.2")
+    if p.res_mm < 0.2:
+        raise ValueError("res_mm must be >= 0.2")
+    # The whole footprint, chin included: a caption makes the frame taller than it is
+    # wide, so the height is what overflows first and only check_output.py used to say
+    # so — after the 20 minutes of meshing that produced an unprintable file.
+    w, h = footprint_mm(p)
+    if max(w, h) > PLATE_MM:
+        alt = {1: ", or drop the caption",
+               2: ", or use one caption line"}.get(len(_lines(p)), "")
+        raise ValueError(f"frame would be {w:.1f} x {h:.1f}mm — over the {PLATE_MM:.0f}mm "
+                         f"plate. Reduce poster size to <={max_size_mm(p0):g}mm{alt}.")
     for label, v in (("slot floor", SLOT_FLOOR_MM), ("water cap", p.cap_mm)):
         if p.plate_mm <= v:   # slot floor above the plate top / caps push terrain negative
             raise ValueError(f"{label} ({v}mm) must be less than the relief plate "

@@ -17,8 +17,13 @@ async def generate(file: UploadFile, params: str = Form("{}")):
     except (ValueError, AttributeError) as e:
         raise HTTPException(400, str(e))
     try:
-        p = core.resolve(core.Params(**kw))   # blank fields auto-scale; preview needs the values
-        frame_bodies, bodies, path_stl = core.build_poster(track, p)
+        p0 = core.Params(**kw)
+        p = core.resolve(p0)   # blank fields auto-scale; the preview needs the values
+        # p0, not p: build_poster resolves anyway (idempotent), and an over-plate
+        # refusal has to suggest a smaller size against the AUTO chin, which shrinks
+        # with the poster. Handed the resolved p it would freeze the 250mm chin and
+        # suggest 246.3mm — a size that is still over the plate once it rescales.
+        frame_bodies, bodies, path_stl = core.build_poster(track, p0)
         frame_3mf, relief_3mf = core.write_3mf(frame_bodies), core.write_3mf(bodies)
     except Exception as e:  # DEM/land-cover fetch or meshing failed
         raise HTTPException(502, f"Generation failed: {e}")
