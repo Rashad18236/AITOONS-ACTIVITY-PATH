@@ -5,7 +5,7 @@ from dataclasses import asdict
 
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import poster
 
@@ -461,6 +461,48 @@ def test_second_line_renders_smaller_than_the_first():
     assert fpx * poster.TEXT_SUB <= cols.min() and cols.max() < (N - fpx) * poster.TEXT_SUB
 
 
+def _split_lines(tm):
+    """(line 1 rows, line 2 rows) of a two-line mask, split on the blank gap."""
+    rows = np.where(tm.any(1))[0]
+    blank = np.where(~tm.any(1)[rows.min():rows.max() + 1])[0]
+    assert len(blank), "the two lines ran together"
+    split = rows.min() + blank[len(blank) // 2]
+    return tm[:split], tm[split:]
+
+
+def test_caption_strokes_clear_the_printable_stroke_floor():
+    """A 0.4mm nozzle cannot hold a stroke under ~0.8mm (1.0mm recommended): at
+    1.5-2.2 extrusion widths a glyph is pure perimeter, and Arachne flips between one
+    and two beads along the stroke, nicking one edge and blobbing the other
+    (docs/print-settings.md). The rendered strokes were 0.6-0.9mm, so the mask is
+    dilated until the measured stroke clears MIN_STROKE_MM — per line, because line 2
+    is the smaller face and needs the most."""
+    p, N, fpx, elev, track, bounds = _synthetic()
+    q = _params(text="ZURICH", text2="HB-EZE", text_mm=6.0)
+    parts = poster.compose_parts(track, elev, np.zeros((_mpx(q), _mpx(q)), np.uint8),
+                                 bounds, q)
+    tm, res = parts["text_mask"], parts["text_res"]
+    for label, band in zip(("line 1", "line 2"), _split_lines(tm)):
+        stroke = poster._stroke_mm(band, res)
+        assert stroke >= poster.MIN_STROKE_MM - 1e-9, f"{label}: {stroke:.2f}mm strokes"
+    # ...and the counters survived. A dilation that welds the hole in an R or a B
+    # shut turns the bowl into a blob, which is worse than a thin stroke — hence the
+    # cap on total dilation. R and the two B counters must still be open.
+    assert _counter_mm2(tm, res) > 1.0, "the dilation closed the letter counters"
+
+
+def _counter_mm2(mask, res):
+    """Area of the enclosed background (letter counters), mm2.
+
+    Flood the background in from a corner; whatever background survives is walled in
+    by ink. No labelling, so no scipy — the total area is enough of a tripwire."""
+    # .copy(): a fromarray() image shares the numpy buffer and floodfill's writes
+    # never show up in the array we read back — the fill silently does nothing
+    img = Image.fromarray(np.where(mask, 255, 0).astype(np.uint8)).copy()
+    ImageDraw.floodfill(img, (0, 0), 128)
+    return int((np.array(img) == 0).sum()) * res ** 2
+
+
 def test_heightmap_mesh_watertight():
     rng = np.random.default_rng(0)
     hm = 4.0 + rng.random((20, 30)) * 5
@@ -879,7 +921,7 @@ def test_frame_text_meshes_without_a_truetype_font(monkeypatch):
     """The load_default fallback is the path every box without one of FONT_PATHS
     takes, so it has to clear the same bars — it is the dilation, not the face,
     that satisfies the cell rule."""
-    monkeypatch.setattr(poster, "FONT_PATHS", ("/nonexistent/no-such-font.ttf",))
+    monkeypatch.setattr(poster, "FONT_PATHS", (("/nonexistent/no-such-font.ttf", 0),))
     p, parts, text = _text_body()
     _assert_text_meshes(p, parts, text, 20000)
 

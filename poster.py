@@ -155,6 +155,12 @@ FIRST_LAYER_MM = 0.2
 # geometry above the ring, so the plate has exactly one black->white change either way.
 TEXT_EMBOSS_MM = 1.20
 
+# Printable stroke floor for a 0.4mm nozzle: below ~0.8mm a glyph stroke is under two
+# extrusion widths and Arachne flips between one and two beads along its length; 1.0mm
+# is the recommended figure. The rendered faces come out at 0.6-0.9mm, so _text_mask
+# dilates each line until it clears this. See docs/print-settings.md.
+MIN_STROKE_MM = 1.0
+
 # Caption layout. Line 2 is a subtitle at SUB_RATIO of line 1, GAP_RATIO of line 1
 # below it; TEXT_MARGIN_MM of clear ring above and below the block decides the chin.
 SUB_RATIO = 0.65
@@ -181,20 +187,28 @@ def _snap(z, p, rnd=np.round):
     return FIRST_LAYER_MM + rnd((z - FIRST_LAYER_MM) / p.layer_mm) * p.layer_mm
 
 
-# A real face, in fallback order. load_default() is a bitmap font whose strokes are
-# ~1px wide at res 0.4 — masked_slab_mesh needs all four corners of a cell, so those
-# glyphs mesh as slivers or vanish. No new dependency, no bundled font: use what the
-# box has, and fall back to the bitmap if it has nothing.
-FONT_PATHS = ("/System/Library/Fonts/Helvetica.ttc",
-              "/System/Library/Fonts/Supplemental/Arial.ttf",
-              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-              "/usr/share/fonts/dejavu/DejaVuSans.ttf")
+# (path, face index), in fallback order. Bold first: a caption stroke has to clear
+# MIN_STROKE_MM and a bold face is ~40% of the way there for free, where dilation
+# pays for it in closed counters. Helvetica.ttc is a collection — index 1 is its Bold
+# face; the .ttf files are single faces, index 0.
+# load_default() is a bitmap font whose strokes are ~1px wide at res 0.4 —
+# masked_slab_mesh needs all four corners of a cell, so those glyphs mesh as slivers
+# or vanish. No new dependency, no bundled font: use what the box has, fall back to
+# the regular faces, and to the bitmap only if it has neither.
+FONT_PATHS = (("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 0),
+              ("/System/Library/Fonts/Helvetica.ttc", 1),
+              ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 0),
+              ("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf", 0),
+              ("/System/Library/Fonts/Helvetica.ttc", 0),
+              ("/System/Library/Fonts/Supplemental/Arial.ttf", 0),
+              ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0),
+              ("/usr/share/fonts/dejavu/DejaVuSans.ttf", 0))
 
 
 def _font(px):
-    for path in FONT_PATHS:
+    for path, index in FONT_PATHS:
         try:
-            f = ImageFont.truetype(path, px)
+            f = ImageFont.truetype(path, px, index=index)
             f.getlength("M")   # Helvetica.ttc raises "division by zero" below ~8px
             return f
         except Exception:
@@ -479,6 +493,62 @@ def _fit_line(s, ink_px, avail_px):
     return font, ink
 
 
+# Fraction of a line's ink that must be eroded away before the passes are counted as
+# a stroke width. NOT 1.0 (erode until empty): the last pass to survive is the fattest
+# feature on the line, and on a real caption that is the head of the "→" or the dot in
+# "·", not a stem — "ZURICH → ALTENRHEIN" at 5.4mm caps measures 1.60mm to empty
+# against a 1.1mm true stem, and would never be thickened however thin its stems got.
+# At 0.75 the measurement matches an "HH" control to within a pixel on both lines.
+_STROKE_ERODED = 0.75
+
+
+def _stroke_mm(mask, res):
+    """Stroke width of a glyph mask, in mm, by successive erosion.
+
+    Each MinFilter(3) peels one pixel off every edge, so a stroke of width w loses
+    2*res of it per pass and is gone after w/(2*res) passes — count the passes to a
+    known fraction of the ink and you have measured w."""
+    img = Image.fromarray(np.where(mask, 255, 0).astype(np.uint8))
+    box = img.getbbox()
+    if box is None:
+        return math.inf                 # no ink: nothing to thicken
+    # crop to the ink with a 1px rim (crop pads with black outside the source), so a
+    # glyph touching the mask edge erodes from that side too, and so the erosion runs
+    # over a few hundred kpx instead of the whole poster-sized grid
+    img = img.crop((box[0] - 1, box[1] - 1, box[2] + 1, box[3] + 1))
+    left = (1 - _STROKE_ERODED) * int((np.asarray(img) > 0).sum())
+    for i in range(1, 33):   # ponytail: ceiling at 32 passes = 6.4mm of stroke at
+        img = img.filter(ImageFilter.MinFilter(3))   # 0.1mm — no caption is that fat
+        if int((np.asarray(img) > 0).sum()) <= left:
+            return 2 * i * res / _STROKE_ERODED
+    return 2 * 32 * res
+
+
+def _thicken(mask, cap_px, res):
+    """One caption line, dilated: 1px for the mesher, plus whatever MIN_STROKE_MM needs.
+
+    The 1px is structural — masked_slab_mesh only meshes cells with all four corners
+    set, so a stroke survives only where every glyph pixel is cell-interior, and after
+    one MaxFilter(3) each pixel has all 8 neighbours, i.e. four full cells. On this
+    grid that costs 0.1mm of fattening, not the frame grid's 0.4mm. Every pixel past
+    the first is bought stroke width.
+
+    Capped at a quarter of the cap height: a dilation wide enough to weld the counter
+    of an R or a B shut turns the letter into a blob, and slightly under the floor
+    prints better than that. The cap engaging is worth knowing about, so it says so."""
+    stroke = _stroke_mm(mask, res)
+    n = 1 + max(math.ceil((MIN_STROKE_MM - stroke) / 2 / res - 1e-9), 0)
+    cap = max(int(0.25 * cap_px), 1)
+    if n > cap:
+        print(f"text: {stroke:.2f}mm strokes want {n}px of dilation, capped at {cap}px "
+              f"({stroke + 2 * (cap - 1) * res:.2f}mm) to keep the counters open")
+        n = cap
+    img = Image.fromarray(np.where(mask, 255, 0).astype(np.uint8))
+    for _ in range(n):    # ponytail: n cheap MaxFilter(3)s — one MaxFilter(2n+1) is
+        img = img.filter(ImageFilter.MaxFilter(3))   # the same square, at O(n^2)/px
+    return np.asarray(img) > 0
+
+
 def _text_mask(H, N, fpx, chin_px, p):
     """(bool glyph mask, its res_mm) for the caption, on the TEXT_SUB-finer grid.
 
@@ -499,8 +569,6 @@ def _text_mask(H, N, fpx, chin_px, p):
     lines = _lines(p)
     if not lines:
         return np.zeros((Hf, W), bool), res
-    img = Image.new("L", (W, Hf))
-    d = ImageDraw.Draw(img)
     bar_top = (N - fpx) * TEXT_SUB          # frame row N-fpx, exactly
     bar_h = Hf - 1 - bar_top                # ...down to the last frame row, exactly
     # Ring opening, in fine columns, less one pixel per side for the dilation below:
@@ -519,15 +587,17 @@ def _text_mask(H, N, fpx, chin_px, p):
         gap *= room / block
         block = room
     y = bar_top + (bar_h - block) / 2
+    mask = np.zeros((Hf, W), bool)
+    # One image per line, thickened on its own: line 2 is the smaller face, so its
+    # strokes are thinner and it needs more dilation than line 1 to clear the floor.
     for s, h in zip((s for s, _ in lines), hs):
+        img = Image.new("L", (W, Hf))
         font, ink = _fit_line(s, h, avail)
-        d.text(((W - 1 - (ink[2] - ink[0])) / 2 - ink[0], y - ink[1]), s, fill=255, font=font)
+        ImageDraw.Draw(img).text(((W - 1 - (ink[2] - ink[0])) / 2 - ink[0], y - ink[1]),
+                                 s, fill=255, font=font)
+        mask |= _thicken(np.asarray(img) > 0, h, res)
         y += h + gap                        # nominal, so a width-shrunk line cannot crowd
-    # Dilate 1px: masked_slab_mesh only meshes cells with all four corners set, so a
-    # stroke survives only where every glyph pixel is cell-interior. After a
-    # MaxFilter(3) each original pixel has all 8 neighbours, i.e. four full cells.
-    # On this grid that costs 0.1mm of fattening, not the frame grid's 0.4mm.
-    return np.asarray(img.filter(ImageFilter.MaxFilter(3))) > 0, res
+    return mask, res
 
 
 def compose_parts(track, elev, lc, bounds, p):
