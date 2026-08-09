@@ -25,7 +25,8 @@
 <div id="panel">
   <h3>Flight Path Poster</h3>
   <label>FR24 track (KML/CSV)</label><input type="file" id="file" accept=".kml,.csv">
-  <label>Text (bottom frame bar)</label><input id="text" placeholder="ZRH → GVA · 12.07.2026">
+  <label>Text (bottom frame bar)</label><input id="text" placeholder="ZURICH → GENEVA">
+  <label>Second line (smaller)</label><input id="text2" placeholder="HB-EZE · 12.07.2026">
   <label>Poster size mm</label><input id="size_mm" type="number" value="250">
   <label>Max relief mm</label><input id="relief_mm" type="number" placeholder="auto">
   <label>Vertical exaggeration</label><input id="exaggeration" type="number" step="0.1" value="1.5">
@@ -116,7 +117,8 @@ document.getElementById('go').onclick = async () => {
   const status = document.getElementById('status');
   if (!f) { status.textContent = 'Pick a KML/CSV file first.'; return; }
   status.textContent = 'Generating… (terrain download + meshing, ~10-30s)';
-  const params = { text: document.getElementById('text').value };
+  const params = { text: document.getElementById('text').value,
+                   text2: document.getElementById('text2').value };
   for (const id of ['size_mm','relief_mm','exaggeration','margin_pct','groove_w_mm',
                     'snow_line_m','layer_mm']) {
     const v = parseFloat(document.getElementById(id).value);
@@ -133,11 +135,13 @@ document.getElementById('go').onclick = async () => {
     clearScene();
     const fb = b64bytes(j.frame), rb = b64bytes(j.relief), sb = b64bytes(j.path);
     // relief plate and strip are meshed in plate-local coords: lift them onto the
-    // backplate and inset by the ring plus the fit gap (rounded up to a pixel, as _grid does)
+    // backplate and inset by the ring plus the fit gap (rounded up to a pixel, as _grid does).
+    // In y the chin has pushed the frame's origin down by chin_mm, so the opening
+    // — and everything that drops into it — is that much higher up.
     const R = j.resolved;   // server-resolved params: blank "auto" fields already filled in
     const fitCeil = Math.ceil(R.fit_mm / R.res_mm) * R.res_mm;
     const inset = R.frame_mm + fitCeil;
-    const at = [inset, inset, R.base_mm];
+    const at = [inset, inset + R.chin_mm, R.base_mm];
     const frame = place(threeMFGroup(fb, FRAME_ORDER), [0, 0, 0]);
     place(threeMFGroup(rb, RELIEF_ORDER), at);
     place(stlMesh(sb, STRIP_COLOR), at);

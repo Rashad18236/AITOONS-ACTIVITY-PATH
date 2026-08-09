@@ -96,10 +96,14 @@ def test_decode_terrarium():
 
 def _params(**kw):
     """Test params: every scaled field pinned to its 250mm base, so these tests
-    measure geometry, not the auto-scaling (which resolve() is tested for below)."""
-    return poster.Params(**{"size_mm": 40.0, "frame_mm": 4.0, "res_mm": 0.5,
-                            "relief_mm": 20.0, "frame_height_mm": 9.96, "text_mm": 8.0,
-                            "groove_w_mm": 2.0, "proud_mm": 0.96, **kw})
+    measure geometry, not the auto-scaling (which resolve() is tested for below).
+
+    Resolved, because chin_mm is derived from the caption and compose_parts/_grid
+    are only ever handed resolved params (build_poster and check_output both resolve)."""
+    return poster.resolve(poster.Params(**{
+        "size_mm": 40.0, "frame_mm": 4.0, "res_mm": 0.5, "relief_mm": 20.0,
+        "frame_height_mm": 9.96, "text_mm": 8.0, "groove_w_mm": 2.0,
+        "proud_mm": 0.96, **kw}))
 
 
 def test_resolve_at_250_is_the_legacy_defaults():
@@ -112,6 +116,7 @@ def test_resolve_at_250_is_the_legacy_defaults():
     assert p.text_mm == 8.0
     assert p.groove_w_mm == 2.0
     assert p.proud_mm == 0.96            # was 1.0: 8 layers of 0.12
+    assert p.chin_mm == 0.0              # no caption -> the frame stays square
 
 
 def test_resolve_scales_and_floors_at_80mm():
@@ -155,7 +160,8 @@ def test_relief_plate_clears_the_frame_ring():
     fit and the plate will not drop into the frame."""
     for res in (0.2, 0.25, 0.3, 0.4, 0.5):
         p = _params(res_mm=res)
-        N, M, fpx = poster._grid(p)
+        N, M, fpx, chin_px = poster._grid(p)
+        assert chin_px == 0                          # no caption -> no chin, ever
         opening = N - 2 * fpx                        # ring inner width, px
         gap = (opening - M) / 2 * res                # per side, mm
         assert gap >= p.fit_mm, f"res={res}: gap {gap:.2f}mm < fit_mm {p.fit_mm}"
@@ -338,12 +344,95 @@ def test_compose_parts_text_is_a_mask_not_an_emboss():
     p, N, fpx, elev, track, bounds = _synthetic()
     M = _mpx(p)
     lc = np.zeros((M, M), np.uint8)
-    parts = poster.compose_parts(track, elev, lc, bounds, _params(text="TEST", text_mm=3.0))
+    q = _params(text="TEST", text_mm=3.0)
+    parts = poster.compose_parts(track, elev, lc, bounds, q)
     frame, tm = parts["frame"], parts["text_mask"]
+    H = N + poster._grid(q)[3]
     assert frame.max() == p.base_mm + p.frame_height_mm    # ring is flat, nothing embossed
-    assert tm.shape == (N, N) and tm.dtype == bool
+    assert tm.shape == (H, N) and tm.dtype == bool
+    assert parts["text_res"] == q.res_mm
     assert tm.any() and tm[:N - fpx, :].sum() == 0         # glyphs live on the bottom bar
     assert not poster.compose_parts(track, elev, lc, bounds, _params())["text_mask"].any()
+
+
+# --- the chin: extra frame height at the bottom, for the caption ----------------
+
+def _chinned(**kw):
+    """(bare parts, chinned parts, chin_px) over the same synthetic terrain."""
+    p, N, fpx, elev, track, bounds = _synthetic()
+    lc = np.zeros((_mpx(p), _mpx(p)), np.uint8)
+    q = _params(**kw)
+    return (poster.compose_parts(track, elev, lc, bounds, p),
+            poster.compose_parts(track, elev, lc, bounds, q), poster._grid(q)[3])
+
+
+def test_the_chin_extends_the_frame_downward_and_leaves_the_opening_alone():
+    """The chin is extra ring at the bottom only: the inner opening keeps its exact
+    indices and values, so the relief plate that drops into it is untouched."""
+    p, N, fpx, elev, track, bounds = _synthetic()
+    bare, chinned, chin_px = _chinned(text="ZURICH", text2="HB-EZE")
+    M = _mpx(p)
+    assert chin_px > 0
+    assert bare["frame"].shape == (N, N)                   # no caption -> square, as before
+    assert chinned["frame"].shape == (N + chin_px, N)      # taller than wide, downward
+    # byte-identical opening at byte-identical indices — this is the gate
+    op = (slice(fpx, N - fpx), slice(fpx, N - fpx))
+    assert (chinned["frame"][op] == bare["frame"][op]).all()
+    assert (chinned["frame"][op] == p.base_mm).all()
+    assert (chinned["frame"][:N] == bare["frame"]).all()   # the whole square is unchanged
+    assert (chinned["frame"][N:] == p.base_mm + p.frame_height_mm).all()   # chin is all ring
+    # ...and the relief the opening holds is not even aware of it
+    for k in ("green", "surface", "water", "snow"):
+        assert chinned[k].shape == (M, M) and (chinned[k] == bare[k]).all()
+
+
+def test_chin_auto_sizes_to_hold_the_caption():
+    """Two lines plus TEXT_MARGIN_MM top and bottom decide the chin, so the bar is
+    always exactly as tall as the caption needs and never taller."""
+    q = _params(text="ZURICH", text2="HB-EZE", text_mm=6.0)
+    block = 6.0 + 0.35 * 6.0 + poster.SUB_RATIO * 6.0      # line1 + gap + line2
+    N, _, fpx, chin_px = poster._grid(q)
+    bar = (fpx + chin_px) * q.res_mm                       # the bar the glyphs actually get
+    assert bar >= block + 2 * poster.TEXT_MARGIN_MM - 1e-9
+    assert bar < block + 2 * poster.TEXT_MARGIN_MM + q.res_mm   # pixel rounding, no more
+    # one line needs less chin than two, no caption needs none
+    assert 0 == _params().chin_mm < _params(text="ZURICH", text_mm=6.0).chin_mm < q.chin_mm
+    # the glyphs really do sit inside those margins
+    p, N, fpx, elev, track, bounds = _synthetic()
+    parts = poster.compose_parts(track, elev, np.zeros((_mpx(q), _mpx(q)), np.uint8),
+                                 bounds, q)
+    tm, tres = parts["text_mask"], parts["text_res"]
+    rows = np.where(tm.any(1))[0]
+    top = N - fpx                                          # first row of the bar
+    # one pixel of slack: _fit_line rounds the em to a whole px, so rendered ink lands
+    # within a pixel of the nominal line height it was asked for
+    assert (rows.min() - top) * tres >= poster.TEXT_MARGIN_MM - tres
+    assert (tm.shape[0] - 1 - rows.max()) * tres >= poster.TEXT_MARGIN_MM - tres
+
+
+def test_explicit_chin_mm_overrides_the_auto_size():
+    q = _params(text="ZURICH", text2="HB-EZE", chin_mm=3.0)
+    assert q.chin_mm == 3.0
+    assert poster._grid(q)[3] == int(3.0 / q.res_mm)
+    assert poster.resolve(q) == q                          # still idempotent
+
+
+def test_second_line_renders_smaller_than_the_first():
+    p, N, fpx, elev, track, bounds = _synthetic()
+    q = _params(text="MMMM", text2="MMMM", text_mm=6.0)
+    tm = poster.compose_parts(track, elev, np.zeros((_mpx(q), _mpx(q)), np.uint8),
+                              bounds, q)["text_mask"]
+    rows = np.where(tm.any(1))[0]
+    blank = np.where(~tm.any(1)[rows.min():rows.max() + 1])[0]   # the gap between the lines
+    assert len(blank), "the two lines ran together"
+    split = rows.min() + blank[len(blank) // 2]
+    h1 = tm[:split].any(1).sum()
+    h2 = tm[split:].any(1).sum()
+    assert 0 < h2 < h1                                     # line 2 is the smaller subtitle
+    assert abs(h2 / h1 - poster.SUB_RATIO) < 0.15
+    # both lines live inside the ring opening's x range, off the corners
+    cols = np.where(tm.any(0))[0]
+    assert fpx <= cols.min() and cols.max() < N - fpx
 
 
 def test_heightmap_mesh_watertight():
@@ -723,7 +812,7 @@ def _text_body(**kw):
                                  poster.track_bounds(track, p.margin_pct), p)
     t = poster.TEXT_EMBOSS_MM
     return p, parts, poster.masked_slab_mesh(parts["text_mask"], parts["frame"] + t,
-                                             t, p.res_mm)
+                                             t, parts["text_res"])
 
 
 def _assert_text_meshes(p, parts, text, min_verts):
@@ -731,19 +820,19 @@ def _assert_text_meshes(p, parts, text, min_verts):
     assert text is not None
     assert len(text.vertices) >= min_verts, f"only {len(text.vertices)} verts — still slivers"
     assert text.is_watertight and text.is_winding_consistent and text.volume > 0
-    tm = parts["text_mask"]
+    tm, res = parts["text_mask"], parts["text_res"]
     # constant-thickness slab: volume / thickness IS the meshed footprint area
     foot = text.volume / poster.TEXT_EMBOSS_MM
     # Bar is the *glyph* area the dilation exists to protect: erode the mask back and
     # require the mesh to cover all of it, i.e. no lettering was eaten by the cell rule.
     from PIL import ImageFilter
     eroded = Image.fromarray(tm.astype(np.uint8) * 255).filter(ImageFilter.MinFilter(3))
-    glyphs = (np.asarray(eroded) > 0).sum() * p.res_mm ** 2
+    glyphs = (np.asarray(eroded) > 0).sum() * res ** 2
     assert foot >= glyphs, f"meshed {foot:.1f}mm2 of {glyphs:.1f}mm2 of glyphs"
     # ...and most of the dilated mask. Its outer 1px rim is where the loss sits (a cell
     # wants four corners), concentrated at tight joints and counters — 75% is a
     # no-big-chunk-missing tripwire, not the real invariant above.
-    assert foot >= 0.75 * tm.sum() * p.res_mm ** 2
+    assert foot >= 0.75 * tm.sum() * res ** 2
     # z semantics unchanged: bottom on the ring top, TEXT_EMBOSS_MM proud
     ring = p.base_mm + p.frame_height_mm
     assert abs(text.bounds[0][2] - ring) < 1e-6
@@ -773,11 +862,11 @@ def test_frame_text_shrinks_to_fit_the_bar():
     shrink to fit the ring's bottom bar instead of silently clipping off the edge."""
     long_text = "ZURICH KLOTEN TO GENEVA COINTRIN VIA THE ALPS"
     p, parts, text = _text_body(text=long_text)
-    N, _, fpx = poster._grid(p)
+    N, _, fpx, chin_px = poster._grid(p)
     tm = parts["text_mask"]
     cols, rows = np.where(tm.any(0))[0], np.where(tm.any(1))[0]
     assert fpx <= cols.min() and cols.max() < N - fpx      # inside the bar, off the corners
-    assert N - fpx <= rows.min() and rows.max() < N        # still on the bottom bar
+    assert N - fpx <= rows.min() and rows.max() < N + chin_px      # on the bottom bar
     _assert_text_meshes(p, parts, text, 2500)
 
 
@@ -831,6 +920,25 @@ def test_check_output_flags_a_missing_text_body(monkeypatch, tmp_path, capsys):
                             str(tmp_path / "path.stl"),
                             "--params", json.dumps(asdict(_params(text="HB-EZE")))])
     assert rc == 1 and "text body" in capsys.readouterr().out
+
+
+def test_check_output_flags_a_chin_that_overflows_the_plate(monkeypatch, tmp_path, capsys):
+    """size_mm still means the poster's *width*; the chin is extra height outside it,
+    so a big poster plus a caption can now run off the 256mm plate in y alone. The
+    footprint rule is per axis for exactly that reason."""
+    import check_output
+    _fake_fetches(monkeypatch)
+    p = _params(text="HB", text_mm=3.0, chin_mm=250.0)     # 40mm wide, 290mm tall
+    frame_bodies, bodies, path_stl = poster.build_poster(TRACK3, p)
+    (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
+    (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
+    (tmp_path / "path.stl").write_bytes(path_stl)
+    rc = check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
+                            str(tmp_path / "path.stl"), "--params", json.dumps(asdict(p))])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "FAIL  frame y footprint" in out       # 290mm > the 256mm plate
+    assert "PASS  frame x footprint" in out       # width is still exactly size_mm
 
 
 def test_elevation_always_uses_the_fit_zoom(monkeypatch):

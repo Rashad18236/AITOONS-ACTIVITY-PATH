@@ -106,15 +106,19 @@ def main(argv=None):
         rlo, rhi = terrain.bounds
         slo, shi = strip.bounds
 
-        # 3. frame footprint == size_mm and fits the plate
+        # 3. frame footprint and plate fit. size_mm is the poster's WIDTH and the
+        # square relief area; the chin is extra height hung below it, so y is
+        # size_mm + chin_mm and the two axes need their own rule — a poster that
+        # fits the plate in x can now overflow it in y, and this is what says so.
         # ponytail: flat +-0.5mm absorbs the (N-1)*res_mm grid off-by-one-pixel
         # (249.6mm at defaults). Spuriously FAILs for res_mm > 0.5 — compare against
         # (int(size_mm/res_mm)-1)*res_mm if a coarse-res preset ever ships.
-        for i, axis in enumerate("xy"):
+        for i, (axis, want) in enumerate((("x", p.size_mm),
+                                          ("y", p.size_mm + p.chin_mm))):
             ext = hi[i] - lo[i]
             chk(f"frame {axis} footprint",
-                abs(ext - p.size_mm) <= 0.5 and ext <= PLATE_MM,
-                f"{ext:.2f}mm", f"{p.size_mm}mm +-0.5, <= {PLATE_MM}mm plate")
+                abs(ext - want) <= 0.5 and ext <= PLATE_MM,
+                f"{ext:.2f}mm", f"{want}mm +-0.5, <= {PLATE_MM}mm plate")
 
         # 4. flat back at z=0 (bounds min is the lowest vertex, so nothing is below it)
         chk("frame flat back", abs(lo[2]) <= 0.01, f"z_min {lo[2]:.4f}mm", "0 +-0.01")
@@ -136,8 +140,8 @@ def main(argv=None):
             # 6b. and staying on the ring's bottom bar in xy. The glyphs are TrueType
             # now, ~40% wider than the bitmap they replaced, so a long string that
             # overflows and clips off the poster edge must not pass silently.
-            # The mesh flips y, so the bottom bar is the first fpx pixel rows.
-            bar = lo[1] + _grid(p)[2] * p.res_mm
+            # The mesh flips y, so the bottom bar is the ring's own band plus the chin.
+            bar = lo[1] + p.frame_mm + p.chin_mm
             chk("text body on the bottom bar",
                 tlo[0] >= lo[0] - 0.5 and thi[0] <= hi[0] + 0.5
                 and tlo[1] >= lo[1] - 0.5 and thi[1] <= bar + 0.5,

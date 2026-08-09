@@ -151,6 +151,12 @@ FIRST_LAYER_MM = 0.2
 # White text body thickness: 7 layers at 0.12. Sits on the (flat) frame ring top.
 TEXT_EMBOSS_MM = 0.84
 
+# Caption layout. Line 2 is a subtitle at SUB_RATIO of line 1, GAP_RATIO of line 1
+# below it; TEXT_MARGIN_MM of clear ring above and below the block decides the chin.
+SUB_RATIO = 0.65
+GAP_RATIO = 0.35
+TEXT_MARGIN_MM = 3.0
+
 
 def _snap(z, p, rnd=np.round):
     """Snap z onto the printable layer grid FIRST_LAYER_MM + n*layer_mm.
@@ -334,7 +340,9 @@ class Params:
     groove_w_mm: float | None = None  # slot width; its depth is derived, see SLOT_FLOOR_MM
     clearance_mm: float = 0.30  # per side; FDM PLA seating margin (rasterisation ±1px + elephant-foot)
     text: str = ""
+    text2: str = ""          # second caption line, printed smaller (SUB_RATIO)
     text_mm: float | None = None
+    chin_mm: float | None = None  # extra frame height BELOW the square, for the caption
     res_mm: float = 0.4
     proud_mm: float | None = None
     cap_mm: float = 0.96     # water cap slab thickness (8 layers); grey is a band, not a cap
@@ -355,10 +363,25 @@ _SCALED = {"frame_mm": (12.0, 4.0), "relief_mm": (20.0, 5.0), "frame_height_mm":
            "text_mm": (8.0, 3.0), "groove_w_mm": (2.0, 1.2), "proud_mm": (0.96, 0.4)}
 
 
+def _lines(p):
+    """[(string, ink height mm), ...] for the caption lines that were asked for."""
+    return [(s, h) for s, h in ((p.text, p.text_mm), (p.text2, SUB_RATIO * p.text_mm)) if s]
+
+
 def resolve(p: Params) -> Params:
     """Params with every auto (None) field filled in — the only place that happens."""
     p = replace(p, **{k: max(floor, round(base * p.size_mm / 250, 2))
                       for k, (base, floor) in _SCALED.items() if getattr(p, k) is None})
+    if p.chin_mm is None:
+        # Auto chin: whatever the caption needs beyond the bottom bar it already has.
+        # Derived, not scaled — it follows text_mm and frame_mm, which are scaled
+        # already. Rounded UP to a whole grid pixel so chin_px * res_mm IS chin_mm
+        # (the preview and the checker both offset by the mm value).
+        ls = _lines(p)
+        block = sum(h for _, h in ls) + GAP_RATIO * p.text_mm * (len(ls) - 1) if ls else 0.0
+        ring = int(p.frame_mm / p.res_mm) * p.res_mm   # the gridded bar, as _grid's fpx
+        need = max(block + 2 * TEXT_MARGIN_MM - ring, 0.0) if ls else 0.0
+        p = replace(p, chin_mm=round(math.ceil(round(need / p.res_mm, 6)) * p.res_mm, 6))
     core = p.groove_w_mm - 2 * p.clearance_mm
     if core < 0.4:   # what is left of the strip between the two clearance gaps
         raise ValueError(f"groove_w_mm ({p.groove_w_mm}mm) leaves a {core:.2f}mm strip "
@@ -367,15 +390,19 @@ def resolve(p: Params) -> Params:
 
 
 def _grid(p):
-    """(N, M, fpx): full grid px, relief-plate grid px, frame ring width px.
+    """(N, M, fpx, chin_px): full grid px, relief-plate px, ring width px, chin rows.
 
     The fit gap is rounded UP to a whole pixel. int((frame_mm + fit_mm) / res_mm)
     truncates a 0.2mm gap to zero at every sane resolution (0.2-0.5mm), and the
     relief plate then comes out exactly the size of the ring opening — an
-    interference fit no FDM printer wins. Rounding up errs loose, which glues."""
+    interference fit no FDM printer wins. Rounding up errs loose, which glues.
+
+    chin_px is extra frame rows appended BELOW the square: N, M and fpx keep their
+    formulas, so the ring opening and everything that drops into it are untouched."""
     N = int(p.size_mm / p.res_mm)
     fpx = int(p.frame_mm / p.res_mm)
-    return N, N - 2 * (fpx + math.ceil(p.fit_mm / p.res_mm)), fpx
+    return (N, N - 2 * (fpx + math.ceil(p.fit_mm / p.res_mm)), fpx,
+            int(round((p.chin_mm or 0.0) / p.res_mm, 6)))
 
 
 def _groove_mask(track_px, shape, p):
@@ -395,59 +422,88 @@ def _groove_mask(track_px, shape, p):
     return np.asarray(img) > 0
 
 
+def _fit_line(s, ink_px, avail_px):
+    """(font, ink bbox) for `s`, ~ink_px tall and never wider than avail_px.
+
+    Size by measured ink, not em: an em box is ~30% taller than its capitals, so
+    using the target as the em left glyphs 30% short, whose strokes the dilation in
+    _text_mask then fattened shut (B's counters filled). Then shrink again if the
+    string is too long — TrueType glyphs run ~40% wider than the bitmap they
+    replaced, and an unclamped long callsign clipped off the poster edge."""
+    px = max(int(ink_px), 6)
+    font = _font(px)
+    ink = font.getbbox(s)
+    if ink[3] > ink[1]:
+        px = max(round(px * ink_px / (ink[3] - ink[1])), 6)
+        font = _font(px)
+        ink = font.getbbox(s)
+    if ink[2] - ink[0] > avail_px:
+        font = _font(max(int(px * avail_px / (ink[2] - ink[0])), 6))
+        ink = font.getbbox(s)
+    return font, ink
+
+
+def _text_mask(H, N, fpx, chin_px, p):
+    """(bool glyph mask, its res_mm) for the caption, over the (H,N) frame's extent.
+
+    Lines are centred in the full bottom bar (frame_mm + chin_mm tall), line 2 at
+    SUB_RATIO of line 1 with GAP_RATIO of line 1 between them."""
+    res = p.res_mm
+    W, Hf = N, H
+    lines = _lines(p)
+    if not lines:
+        return np.zeros((Hf, W), bool), res
+    img = Image.new("L", (W, Hf))
+    d = ImageDraw.Draw(img)
+    bar_top = N - fpx                       # first row of the bottom bar
+    bar_h = fpx + chin_px
+    avail = N - 2 * fpx                     # ring opening: keeps the text off the corners
+    hs = [h / res for _, h in lines]
+    gap = GAP_RATIO * p.text_mm / res
+    block = sum(hs) + gap * (len(hs) - 1)
+    # An auto chin already sized the bar to hold this. An explicit chin_mm (or a
+    # frame_mm narrower than text_mm, with chin_mm=0) may not, so scale the block
+    # down to fit — never off the bar, ever, whatever the caller asked for.
+    room = max(bar_h - 2 * TEXT_MARGIN_MM / res, 0.6 * bar_h)
+    if block > room:
+        hs = [h * room / block for h in hs]
+        gap *= room / block
+        block = room
+    y = bar_top + (bar_h - block) / 2
+    for s, h in zip((s for s, _ in lines), hs):
+        font, ink = _fit_line(s, h, avail)
+        d.text(((W - (ink[2] - ink[0])) / 2 - ink[0], y - ink[1]), s, fill=255, font=font)
+        y += h + gap                        # nominal, so a width-shrunk line cannot crowd
+    # Dilate 1px: masked_slab_mesh only meshes cells with all four corners set, so a
+    # stroke survives only where every glyph pixel is cell-interior. After a
+    # MaxFilter(3) each original pixel has all 8 neighbours, i.e. four full cells.
+    return np.asarray(img.filter(ImageFilter.MaxFilter(3))) > 0, res
+
+
 def compose_parts(track, elev, lc, bounds, p):
     """Split the poster into its printable pieces, all heights in mm.
 
     `elev` arrives already smoothed (build_poster blurs once and shares the array
     with the snow threshold, so nothing gets blurred twice).
 
-    frame (N,N): backplate + raised ring, flat — printed alone.
-    text_mask (N,N): the glyph pixels, printed as their own white body on top of
-    the ring (empty when no text was asked for).
+    frame (N+chin_px, N): backplate + raised ring, flat — printed alone. The chin
+    rows hang below the square (heightmap_mesh maps y = (H-1-row)*res, so appending
+    rows extends the poster southward); the opening keeps its indices.
+    text_mask / text_res: the caption's glyph pixels and the grid pitch they were
+    rendered on, printed as their own white body on the ring (empty when no text).
     green/surface/water/snow/snow_cells/z_snow/track_px: the (M,M) relief plate that
     drops into the ring, its pre-slot pre-cap top, the water and grey vertex masks,
     the grey band's meshed cells and the horizontal plane it starts from, and the
     track in relief-plate pixels.
     alt_mm: flight altitude per original track point, on the same vertical scale
     as `surface`, for the path wall."""
-    N, M, fpx = _grid(p)
-    frame = np.full((N, N), p.base_mm)
-    ring = np.ones((N, N), bool)
-    ring[fpx:N - fpx, fpx:N - fpx] = False
+    N, M, fpx, chin_px = _grid(p)
+    H = N + chin_px
+    frame = np.full((H, N), p.base_mm)
+    ring = np.ones((H, N), bool)
+    ring[fpx:N - fpx, fpx:N - fpx] = False   # unchanged indices -> chin rows are all ring
     frame[ring] = p.base_mm + p.frame_height_mm
-    text_mask = np.zeros((N, N), bool)
-    if p.text:
-        img = Image.new("L", (N, N))
-        d = ImageDraw.Draw(img)
-        # Target ink height: text_mm, but never taller than the ring band it sits on
-        # (frame_mm can be smaller than text_mm), leaving 2px each side for the
-        # dilation below. fpx >= 8 always (frame_mm floors at 4mm, res_mm caps at 0.5).
-        px = max(min(int(p.text_mm / p.res_mm), fpx - 4), 6)
-        font = _font(px)
-        # Size by measured ink, not em: an em box is ~30% taller than its capitals, so
-        # `px` as the em left 14px-tall glyphs whose strokes the 1px dilation below
-        # fattened shut (B's counters filled). Scaling to a px-tall ink box keeps the
-        # strokes wide enough that the counters survive the dilation.
-        ink = font.getbbox(p.text)
-        if ink[3] > ink[1]:
-            px = max(round(px * px / (ink[3] - ink[1])), 6)
-            font = _font(px)
-            ink = font.getbbox(p.text)
-        # ...then shrink again if the string is too long for the bar. TrueType glyphs
-        # run ~40% wider than the bitmap this replaced, and nothing clamped the width:
-        # a long callsign silently clipped off the poster edge. Fit it to the ring
-        # opening, which keeps it off the corners where the side bars meet.
-        avail = N - 2 * fpx
-        if ink[2] - ink[0] > avail:
-            font = _font(max(int(px * avail / (ink[2] - ink[0])), 6))
-            ink = font.getbbox(p.text)
-        h = ink[3] - ink[1]
-        d.text(((N - (ink[2] - ink[0])) / 2 - ink[0], N - fpx + (fpx - h) / 2 - ink[1]),
-               p.text, fill=255, font=font)
-        # Dilate 1px: masked_slab_mesh only meshes cells with all four corners set, so
-        # a stroke survives only where every glyph pixel is cell-interior. After a
-        # MaxFilter(3) each original pixel has all 8 neighbours, i.e. four full cells.
-        text_mask = np.asarray(img.filter(ImageFilter.MaxFilter(3))) > 0
+    text_mask, text_res = _text_mask(H, N, fpx, chin_px, p)
     e0, e1 = float(elev.min()), float(elev.max())
     to_mm = lambda m: p.plate_mm + (m - e0) / max(e1 - e0, 1e-9) * p.relief_mm * p.exaggeration
     # Snap the terrain to whole slicer layers, before the caps and the slot are cut,
@@ -488,7 +544,8 @@ def compose_parts(track, elev, lc, bounds, p):
     green = surface - p.cap_mm * water
     green[_cell_verts(snow_cells)] = z_snow
     green[gmask] = SLOT_FLOOR_MM        # full-depth slot, constant floor
-    return dict(frame=frame, text_mask=text_mask, green=green, surface=surface,
+    return dict(frame=frame, text_mask=text_mask, text_res=text_res,
+                green=green, surface=surface,
                 water=water, snow=snow, snow_cells=snow_cells, z_snow=z_snow,
                 track_px=track_px, alt_mm=alt_mm)
 
@@ -700,7 +757,7 @@ def build_poster(track, p=Params()):
     frame_bodies = [(heightmap_mesh(parts["frame"], p.res_mm), "frame", COLORS["frame"], 1)]
     # text is its own white body standing TEXT_EMBOSS_MM proud of the ring, in slot 2
     text = masked_slab_mesh(parts["text_mask"], parts["frame"] + TEXT_EMBOSS_MM,
-                            TEXT_EMBOSS_MM, p.res_mm)
+                            TEXT_EMBOSS_MM, parts["text_res"])
     if text is not None:
         frame_bodies.append((text, "text", COLORS["text"], 2))
     strip = strip_mesh(parts["track_px"], parts["alt_mm"], parts["surface"], p)
