@@ -437,3 +437,338 @@ Recommendations only — no code. Defaults as they stood when this was written
 - [Forum: Large print keeps warping at corners](https://forum.bambulab.com/t/large-print-keeps-warping-at-corners-tried-liquid-glue-and-brims/44024) and [Warping — PLA — Textured PEI Gold Plate](https://forum.bambulab.com/t/warping-pla-textured-pei-gold-plate/60067)
 - [Forum: Prime tower on edge of build plate?](https://forum.bambulab.com/t/prime-tower-on-edge-of-build-plate/66471) — plate keep-out and tower placement
 - [ScienceInsights: How to 3D print tall thin objects](https://scienceinsights.org/how-to-3d-print-tall-thin-objects-without-them-falling-over/) — brim 10–15 mm, Z-hop, reduced speeds for tall thin parts
+
+---
+
+## Frame & caption — sharp text profile
+
+Scope: `frame.3mf` only — one multi-part object, part **"frame"** (extruder 1, black) and
+part **"text"** (extruder 2, white), 169.6 × 179.2 mm at `size_mm=170`, base 4.04 mm,
+ring top z ≈ 10.81 mm, caption 0.84 mm proud (7 layers at 0.12). This section refines
+§1, §2, §3 and §5 for the caption; where it contradicts §5's `frame.3mf` row, this
+section wins, and the contradiction is called out.
+
+**Since implemented** (items 1–3 of *Generator-side implications* below): the caption is
+**1.20 mm** proud (10 layers), resolved Z dimensions are snapped to whole layers so the
+ring top at `size_mm=170` is **10.88 mm** (`0.2 + 89 × 0.12`) and the caption spans
+layers 89–99, and the caption is set in the box's **bold** face with a measured
+stroke floor of 1.0 mm. Read 0.84 mm and 10.81 mm below as the numbers that motivated
+the change, not as what the generator emits. Item 4 (cap-height floors) is **not**
+implemented: at 170 mm the subtitle is still 3.5 mm, and the stroke floor thickens it
+to the point where its letters touch — raise `size_mm`, `text_mm` or `SUB_RATIO` if
+that shows.
+
+### The two facts that drive everything here
+
+1. **Glyph strokes are 0.6–0.9 mm — 1.5–2.2 extrusions wide.** At that scale a stroke is
+   *entirely perimeter*. There is no infill, no top fill, nothing else. Every quality
+   decision is therefore a wall-generator decision, and the goal is: **every stroke
+   resolves to a whole number of beads, and that number never changes along the stroke.**
+2. **Nothing black exists above z = 10.81.** The ring top is flat all round (the chin is
+   9.6 mm taller in *plan*, not in Z), so the caption is the only geometry in the top
+   7 layers. The plate therefore contains **exactly one filament change** (black → white,
+   at the layer where the caption starts). That single fact makes purge essentially free
+   and rewrites §3's cost model for this plate — see *Multi-colour* below.
+
+### Settings table
+
+`P` = **per-part override on the "text" part** (select the part in the Objects list,
+gear icon → *Add settings*). `F` = per-part on the "frame" part. `O` = object-level
+(whole `frame.3mf` object). `G` = whole plate / Process preset.
+
+Scope caveat: line widths, wall loops, wall-generator parameters, ironing, shell counts
+and feature speeds are *region*-scope in the PrusaSlicer lineage Bambu Studio inherits,
+so they are offerable per part. **Seam position, layer height, brim and supports are
+object-scope** — they cannot be set on one part only. If your Studio build does not
+offer a given row on the part, set it plate-wide; every value below is harmless on the
+black frame too.
+
+#### Wall generator (Quality → Precision; Advanced mode. Orca: Quality → Walls and surfaces → Advanced)
+
+| Setting (Bambu Studio) | Scope | Value | Why |
+|---|---|---|---|
+| **Wall generator** | G | **Arachne** | Not close. At 1.5–2.2× line width Classic must choose 1 or 2 fixed-width loops and dump the remainder into gap fill — that is the blob down the middle of a stem and the closed counter in an *e*. Arachne varies bead width continuously and prints a 0.7 mm stroke as one 0.7 mm bead or two 0.35 mm beads with **no gap fill at all**. Verify it after every Studio update; regressions to Classic have shipped in Bambu profiles before (§7). |
+| **Wall transition filter margin** (`wall_transition_filter_deviation`) | P | **50 %** (0.20 mm; default 25 %) | **The most valuable knob in this whole section.** It is hysteresis on the bead-count decision. The text mesh is built on a 0.1 mm grid, so a nominally 0.70 mm stem actually wobbles ±0.05 mm along its length. At the default margin Arachne flips 2 beads → 1 bead → 2 beads over a few millimetres, and every flip is an extrusion stop/start: a nick on one edge and a bead of surplus on the other. 50 % makes the stroke commit to one bead count and hold it. |
+| **Minimum wall width** (`min_bead_width`) | P | **85 %** (0.34 mm) — **leave it** | This is the width below which Arachne refuses to split into two beads, so it sets the 1-bead/2-bead crossover at 2 × 0.34 = **0.68 mm**. With strokes at 0.6–0.9 mm that puts 0.6 mm strokes on a single clean bead and 0.7–0.9 mm strokes on two — which is what you want. Do **not** lower it "to keep detail": beads under ~0.34 mm from a 0.4 mm nozzle wander inside the aperture and under-extrude. Do not raise it either — 100 % would push the crossover to 0.80 mm and force a 0.78 mm stroke through as a single 0.78 mm bead, 1.95× nozzle, past Bambu's own 1.5× ceiling. |
+| **Minimum feature size** (`min_feature_size`) | P | **10 %** (0.04 mm; default 25 % = 0.10 mm) | Features thinner than this are discarded outright. The default is 0.10 mm — *exactly* the text mesh's grid pitch, so every one-cell facet on a curve sits on the coin-flip boundary. 10 % moves the threshold well clear of the geometry. Strokes are nowhere near this; what it protects is counters, serif junctions and the tips of *A*, *V*, *W*. |
+| **Wall transition length** (`wall_transition_length`) | P | **100 %** (0.40 mm, default) — leave | The runway over which a 2-bead stroke tapers into a 1-bead one. Shortening it makes the change abrupt and deposits the surplus as a blob at the taper; lengthening it spreads a visible width ramp along a stroke only ~5 mm long. Default is right. |
+| **Wall transitioning threshold angle** (`wall_transition_angle`) | P | **10°** (default) — leave | Wedges wider than this angle get *no* centre bead; lowering it removes more centre beads, raising it adds them. Letter terminals and stem/bowl junctions are wedges. At 0.7 mm stroke a centre bead is a third extrusion squeezed into two extrusions' worth of space — reliably a blob. **Uncertain**: one Bambu forum thread reports 59° working well for thin walls generally; that advice is for load-bearing thin walls, not 5 mm glyphs. If terminals print visibly hollow, step to 20–25° and re-check for blobbing. Do not start there. |
+| **Wall distribution count** (`wall_distribution_count`) | P | **1** (default) — confirm | Number of beads, counted inward, allowed to vary in width. 1 pins the *outer* bead at exactly the outer-wall line width and dumps all variation on the inner one. The outer bead is the visible glyph edge; it must not breathe. |
+| **Wall loops** | P | **2** | With outer/inner line width at 0.36 mm, 2 loops = 0.72 mm — a stroke is pure perimeter at every width in the 0.6–0.9 mm range. Same arithmetic as `path.stl` in §5. **1 loop** leaves a 0.1–0.2 mm remainder that becomes gap fill down the middle of every stem; **3 loops** cannot fit and Arachne discards the third anyway. |
+| **Order of walls** | P | **Inner/Outer** | Not Inner/Outer/Inner — with only 2 loops there is no third pass, and Inner/Outer lays the visible bead last against a solid, already-cooled reference. |
+| **Detect thin wall** | G | ON (no-op) | Classic-only in the PrusaSlicer lineage. Harmless under Arachne; leave as §1 has it. |
+| **Slice gap closing radius** | G | **0.01 mm** | As §1. Critical here: the default 0.049 mm can weld a narrow counter shut on a 0.1 mm-grid mesh. |
+
+#### Line widths (Quality → Line width)
+
+| Setting | Scope | Value | Why |
+|---|---|---|---|
+| Outer wall | **P** | **0.36 mm** | 90 % of nozzle. Two effects: corner radius on the printed path is ≈ half the line width, so glyph corners sharpen from ~0.20 mm to ~0.18 mm; and 2 × 0.36 = 0.72 mm sits in the middle of the stroke-width band, so most strokes land on an exact 2-bead solution. |
+| Inner wall | **P** | **0.36 mm** | Must match — the inner bead is half the stroke, not a hidden structural loop. |
+| Top surface | **P** | **0.36 mm** | The glyph tops. See *Top surface* below. |
+| Internal solid / sparse infill | **P** | 0.40 mm | Never used at this stroke width; set only so a fat glyph junction cannot invent a wide fill line. |
+| All frame line widths | F/G | unchanged from §1 (0.42 default, 0.40 outer, 0.40 top) | The frame is not the problem. |
+| **Minimum practical line width, 0.4 nozzle** | — | **0.30 mm hard floor, 0.34 mm practical** | Bambu's guidance is 0.75–1.5 × nozzle Ø = 0.30–0.60 mm, and Studio's own `min_bead_width` clamp is 85 % = 0.34 mm — set the outer wall to 0.30 and the wall generator will widen thin beads back to 0.34 anyway. **Cost of going below ~0.34:** the extrudate is stretched thinner than the aperture it left, so it wanders laterally within ±0.4 mm regardless of the commanded width — you buy path noise, not precision. Plus under-extrusion, weak layer bonding on a 7-layer part, and ~15 % more print time for the extra beads. **0.36 mm is the sweet spot; 0.32 mm is the floor worth trying if 0.36 leaves counters closed.** |
+
+#### Seams (Quality → Seam — object scope, cannot be set per part)
+
+Yes, a 0.84 mm-tall letter gets conventional seams: **one per closed loop, per layer**.
+An *R* is 2 loops (outline + counter) × 7 layers = 14 seams. They land on the 0.84 mm
+vertical side wall of the glyph, invisible from straight on, obvious in raking light.
+
+| Setting | Scope | Value | Why |
+|---|---|---|---|
+| **Seam position** | O | **Sharpest corner** | Overrides §1's *Aligned* for this plate. Letters are almost entirely corners — stem ends, stem/bowl junctions, counter corners — and *Sharpest corner* tucks the start/stop into a concave corner where the geometry already breaks. *Aligned* stacks 7 seams into one vertical zip on an arbitrary point of each letter, which on an *O* lands mid-curve; *Random* gives you 7 scattered pockmarks per letter, which is strictly worse than one line. The frame ring loses nothing — its seam moves into a rectangle corner, which is where you'd want it anyway. |
+| **Staggered inner seams** | O | **ON** | With 2 loops it offsets the inner bead's seam from the outer's, so the two do not stack into a through-channel across the stroke. |
+| **Scarf joint seam** / *Smart scarf seam* / *Seam slope* | O | **OFF — all of it** | A scarf ramps flow up and down over a taper length of ~10 mm. A glyph counter perimeter is 3–8 mm total; the ramp cannot develop, so you get an under-extruded loop instead of a hidden seam. Documented limitation: scarf seams are not for perimeters shorter than the taper distance. This is a "must be off" (see below). |
+| Seam gap | O | default (10 %) | Do not zero it on loops this short — the anti-blob gap matters more than the notch at this scale. |
+| **Avoid crossing wall** | G | **ON** | Each letter is an island. On 7 layers with ~20 islands the head travels between letters constantly; every crossing is a chance to drag white over black. |
+| Z hop type / height | G | **Auto / 0.4 mm** | Same reason. |
+| Retraction / Wipe while retracting | G | default ON | Stringing white filament between letters across a black ring is the single most visible failure mode on this plate. Do not disable retraction on travel between islands. |
+| Reduce infill retraction | G | **OFF** | As §1. |
+
+#### Multi-colour (Project Filaments panel + Process → Others)
+
+**Recalculated for this plate.** Because the caption is the only thing above z = 10.81,
+the plate has **one** black→white change, not one per layer. Purge is therefore a
+rounding error and should be maximised, not economised.
+
+| Setting | Scope | Value | Why |
+|---|---|---|---|
+| Prime tower | G | **ON** | Mandatory. It is the only place the transition filament can go, and it re-stabilises nozzle pressure before the first white bead. Height only needs to reach 11.65 mm here, so it is cheap. |
+| Prime tower width | G | 60 mm is plenty | A 170 mm poster leaves room; §5's 130 mm long-and-shallow trick is a 250 mm-plate problem. |
+| **Flushing volume black → white** | G | **999 mm³ (the maximum)** | Overrides §5's 700. It happens **once**, so the entire cost is ≈ 1.0 cm³ ≈ **1.24 g** of PLA. There is no reason to tune it: black→white is the worst direction (a trace of black pigment tints white grey immediately, while the reverse is invisible), community-recommended range is 500–800 mm³, and users chasing black-into-white bleed routinely max the field at 999. Spend the gram. |
+| Flushing volume white → black | G | 150 mm³ | Never occurs on this plate (white is last), but keep it sane. |
+| Flushing multiplier | G | **1.0** | Do not reduce. |
+| Filament change volume / prime volume (per filament, BS 2.0+) | G | **60 mm³ for the white** | Same argument — once. |
+| Flush into objects' infill | G | inert here — leave **OFF** | §5 sets this ON for `frame.3mf` on the reasoning that black infill hides purge. That reasoning does not apply: the change happens *above* all black geometry, so there is no black infill left to absorb it. Enabling it can only put purge somewhere you don't want. |
+| **Flush into this object** | **P** | **OFF, explicitly** | Non-negotiable. Purge inside a white part 0.7 mm wide would be the whole part. |
+| Flow Dynamics Calibration (print dialog) | G | **ON** | Per-filament pressure advance. See *Speed & cooling*. |
+
+**How many layers are contaminated (Q5), quantified.**
+
+Two independent mechanisms, and they have very different answers:
+
+- **Contamination.** With the prime tower ON and 999 mm³ of flush, **N ≈ 0** — the dirty
+  filament is spent on the tower before the head returns to the model, and there is only
+  one change to get wrong. Without a prime tower (or at a stock ~300 mm³ flush) expect
+  **N ≈ 2–4 layers**, i.e. one third to more than half of a 7-layer caption printed in
+  grey. That is the whole risk, and 999 mm³ + tower retires it for 1.24 g.
+- **Opacity / show-through.** This is the mechanism that 0.84 mm does *not* solve. White
+  PLA over black needs thickness before it stops reading warm-grey: §3's own finding is
+  **0.6 mm minimum, 1.0 mm where it reliably stops showing the substrate**, and Bambu's
+  0.2 mm profiles push colour ~3 layers deep for the same reason. **0.84 mm is inside the
+  marginal band** — it will read white in diffuse light and slightly grey under a raking
+  lamp, which is exactly the lighting a wall-hung poster gets.
+
+**Verdict: 0.84 mm is not enough. The generator should raise the caption to 1.08 mm
+(9 layers) minimum, 1.20 mm (10 layers) preferred.** It costs no extra colour change,
+about 0.1 g of white, and roughly 3 minutes of print time.
+
+#### Precision (Quality → Precision)
+
+| Setting | Scope | Value | Why |
+|---|---|---|---|
+| **Precise Z height** | G | **OFF** | Already off per §1, but here the reason is far sharper: it rescales the **last 5 layers** of an object to hit an exact model height. The caption is **7 layers**. It would rescale 5 of them — the entire visible top of every letter — off the layer grid. |
+| **Precise wall** | G | **ON** (with a test) | Forces the outer wall to exactly one line width instead of letting the slicer fudge it to close gaps, which is what gives crisp glyph edges and correctly-sized counters. Caveat: Bambu issue #8030 reports Precise wall shifting walls inward and shrinking parts. On a 0.72 mm stroke, a 0.05 mm inward shift per side is a 14 % thinner letter. **Print a 30 × 30 mm tile of the caption first and measure a stem**; if letters come out thin, turn it off rather than compensating elsewhere. |
+| **Elephant foot compensation** | G | **0.15 mm** (default) | First-layer only. It touches the black base plate on the bed and cannot reach the caption at z = 10.81. Leave it. Do **not** add a per-part elephant-foot value to the text part hoping to sharpen its base — that setting does not apply there. |
+| **XY hole compensation** | P | **0** to start | Positive values grow holes. Counters (B, R, E, A, O) are the small holes here. If the test tile shows counters closing, go to **+0.05 mm** — but prefer fixing it in the generator (below), because slicer compensation also thins the strokes around the counter. |
+| **XY contour compensation** | P | **0** to start | Negative values erode contours. **−0.03 mm** only if letters print visibly fat after flow calibration. A blanket negative value on a 0.7 mm stroke removes 8 % of it. |
+| Slice resolution (`resolution`) | G | 0.008 mm (default 0.012) | The glyph outlines are 0.1 mm-grid polylines; a slightly finer G-code simplification tolerance keeps the curves curved. Marginal gain, zero cost. |
+| **Arc fitting** | G | **OFF** | As §1 and §7. |
+| Adaptive / variable layer height | G | **OFF** | As §1. Would knock the 7-layer caption off its own arithmetic. |
+| Slow down for curled overhangs | G | OFF | No overhangs on this plate; it only introduces speed changes mid-glyph. |
+| Bambu Studio has **no** "Small perimeters" speed | — | — | That is an Orca/PrusaSlicer setting (`small_perimeter_speed`, `small_perimeter_threshold`). In Bambu Studio use the per-part outer-wall speed below instead. If you slice in Orca: small perimeter speed **50 %**, threshold **3 mm**. |
+
+#### Top surface of the letters (Quality / Strength)
+
+| Setting | Scope | Value | Why |
+|---|---|---|---|
+| **Ironing type** | **P** | **No ironing** | Decisive. A glyph top is 0.6–0.9 mm wide; §5's ironing inset of 0.4 mm leaves 0.1 mm or nothing to iron, and ironing works by dragging a barely-extruding hot nozzle sideways across a surface. On a 0.7 mm-wide white island that means dragging molten white **onto the black ring on both sides of every stroke**. The bow-wave build-up Bambu's own wiki warns about at every ironed region boundary would land, in white, on black, at every letter edge. Off. |
+| Ironing type | **F** | **All top surfaces** (as §5) — with a caveat | The ring top is ironed on the layer where it becomes a top surface, which happens *before* any white is laid, so there is no white-drag risk from ironing the frame. But the letter footprints are not top surface (something is above them), so the ironed region has ~20 letter-shaped holes in it and each gets an inset halo. Raise **Ironing inset to 0.5 mm**. Expect a faint matte outline around each letter on an otherwise glossy ring. **Real trade-off:** if that halo bothers you more than the sheen helps, set the frame part to **No ironing** too — monotonic top fill at 0.12 mm on black already looks good, and it removes the last mechanism that can put material where it shouldn't be. |
+| Top shell layers | **P** | **3** | Moot in practice — two beads *are* the whole stroke, so there is no top-fill region to build. Set anyway so a wide junction (where two stems meet) does not get treated as sparse. |
+| Bottom shell layers | **P** | **1** | The caption sits on solid black. There is nothing to bridge. |
+| Top surface pattern | **P** | **Monotonic line** | Free; applies only at wide junctions. |
+| **Only one wall on top surfaces** | **P** | **OFF** | §2 turns this ON for the relief. On the caption it is destructive: it drops the top layer of every glyph to a single bead and tries to fill the remaining ~0.35 mm with top infill, which at that width is gap fill — a ragged, blobby last layer on exactly the surface you look at. |
+| Only one wall on first layer | G | OFF | |
+| Sparse infill density | **P** | 100 % (or irrelevant) | There is no sparse region. Setting 100 % guarantees a wide junction is solid rather than a 3-line grid. |
+
+#### Speed, temperature & cooling
+
+| Setting | Scope | Value | Why |
+|---|---|---|---|
+| Outer wall speed | **P** | **50 mm/s** | Stock is ~200. On a 5 mm letter the head never reaches 200 anyway — it spends the whole stroke accelerating — so a commanded 200 just means the motion planner is permanently in a transient. 50 mm/s makes the commanded and actual speed agree, which is what makes extrusion consistent around corners. |
+| Inner wall speed | **P** | 80 mm/s | |
+| Top surface speed | **P** | 40 mm/s | |
+| **Outer wall acceleration** | G | **1000 mm/s²** (stock ~5000) | This, not speed, is what rounds small corners and bulges them. Acceleration is plate-scope in Bambu Studio; the frame does not care, so set it globally for this plate. |
+| Outer wall jerk | G | 5 mm/s | Same reason. |
+| **Flow Dynamics Calibration / pressure advance** | G | **run it, per filament** | Under-tuned PA is *the* cause of bulged corners and a gap on the far side of every corner, and a glyph is nothing but corners. Bambu's per-print flow-dynamics calibration handles this automatically — make sure it is not disabled in the send-to-printer dialog. If you use a filament profile you edited, re-run the calibration for it. |
+| Flow ratio (white filament) | G | calibrated; **−2 %** if counters close | Over-extrusion is what fills in the hole in an *e*. This is a filament setting, not a print setting. |
+| Nozzle temperature, **white** | filament | **210 °C** (other layers), 220 first layer | Lower end of PLA. Less ooze between the ~20 letter islands, less corner bulge, crisper edges. It is also the lever that reduced black-into-white bleed in the community threads. |
+| Nozzle temperature, **black** | filament | 220 °C (stock) | Nothing on the black needs babying. |
+| Part cooling fan, white | filament | **100 %**, min fan 100 % | The caption layers are tiny. Each glyph loop must be rigid before the next one lands on it. |
+| **Slow down for layers with short print time** | G | **ON, minimum layer time 8 s** | The 7 caption layers are a few seconds of extrusion each. Without a minimum layer time the nozzle returns to a letter that is still soft and smears it. |
+| Minimum print speed | G | **20 mm/s** | Floor for the above, so the slowdown never drops to a crawl that over-extrudes. |
+| Keep fan always on | filament | ON | |
+
+### 0.2 mm nozzle for the frame plate — no
+
+Estimated cost, this plate: §1's 250 mm frame is 13–16 h; at 170 mm the area scales by
+(170/250)² = 0.46, so **~6–7.5 h on the 0.4 mm nozzle**. A 0.2 mm nozzle forces roughly
+half the layer height and half the line width, and the frame is an area-dominated part
+(169.6 × 179.2 mm of base plate and ring top), so the path length roughly quadruples
+while volumetric flow drops: expect **4–6×, i.e. 28–45 h.**
+
+Estimated gain: printed corner radius falls from ~0.18 mm to ~0.10 mm, and a 0.7 mm
+stroke resolves as 3–4 beads instead of 2. Real, but it is ~0.08 mm on a 5.4 mm cap
+height — about 1.5 % of the letter.
+
+**Verdict: keep the 0.4 mm nozzle.** The same sharpness is available for free by fixing
+the stroke width in the generator (below): going from a 0.7 mm stroke to a 1.1 mm stroke
+buys more legibility than going from 2 beads to 4 beads on a 0.7 mm stroke, and costs
+zero print time. Spending 30 extra hours to render a stroke that is *below the accepted
+minimum for embossed text anyway* is optimising the wrong end.
+
+**One exception:** on an **H2D**, which runs two nozzles of different diameters, assign
+the 0.2 mm nozzle to the white text and keep 0.4 mm on the black frame. That is the only
+configuration where the fine nozzle costs only the caption's print time (minutes) instead
+of the whole plate's. On a single-nozzle X1C/P1S/A1 it is not an option, since the AMS
+feeds one hotend.
+
+### Settings that specifically RUIN small embossed text — must be off
+
+| Setting | What it does to a 0.7 mm × 5 mm glyph |
+|---|---|
+| **Classic wall generator** | Forces fixed-width loops; the 0.1–0.3 mm remainder becomes gap fill down the centre of every stem and closes the counters. |
+| **Precise Z height** | Rescales the last 5 layers — 5 of the caption's 7. |
+| **Scarf joint seam / smart scarf / seam slope** | Taper length exceeds the perimeter length; you get an under-extruded loop instead of a hidden seam. |
+| **Ironing on the "text" part** | Drags molten white sideways off a 0.7 mm island onto the black ring. |
+| **"Only one wall on top surfaces" on the "text" part** | Replaces the top layer of every stroke with gap fill. |
+| **"Flush into this object" on the "text" part** | Fills a white letter with black-tinted purge. |
+| **Prime tower OFF** | 2–4 of 7 caption layers print in transition grey. |
+| **Fuzzy skin** | Obviously. Check it in inherited profiles. |
+| **Arc fitting** | Refits 0.1 mm-grid glyph curves as arcs; visible faceting on bowls. |
+| **Slice gap closing radius at the 0.049 default** | Welds narrow counters shut. |
+| **Adaptive / variable layer height** | Moves the caption off its 7-layer arithmetic and blocks the prime tower. |
+| **Negative XY contour compensation "for sharpness"** | −0.05 mm removes 14 % of a 0.72 mm stroke. Sharpness comes from line width and acceleration, not from shrinking the model. |
+| **Seam position: Random** | 7 scattered pockmarks per letter instead of one tucked corner. |
+| **Retraction disabled / "only retract when crossing perimeters"** | White strings between ~20 letter islands, across black. |
+| **Flow ratio > 1.0 / uncalibrated over-extrusion** | Fills in counters and rounds every corner. Calibrate before blaming the slicer. |
+| **Spiral vase, timelapse Smooth mode** | As §7. |
+
+### Generator-side implications
+
+Numbers are for `size_mm=170` at `layer_mm=0.12`, `FIRST_LAYER_MM=0.2`. Items 1–3 are
+**implemented**; each carries a note on what shipped where it differs from the
+recommendation. 4–6 are recommendations only.
+
+1. **`TEXT_EMBOSS_MM` 0.84 → 1.08 mm (9 layers), prefer 1.20 mm (10 layers).**
+   0.84 mm sits inside the marginal band for white-over-black opacity (0.6 mm minimum,
+   1.0 mm reliable — §3's own finding, and it is the same physics for a proud letter as
+   for a cap). Both candidates are whole layer counts at 0.12 (1.08 = 9, 1.20 = 10), so
+   the existing whole-layer invariant is preserved. Cost: ~0.1 g and ~3 min. There is no
+   argument for staying at 0.84.
+   *Shipped: 1.20 mm.*
+
+2. **The ring top is off the layer grid — fix `resolve()`.** At `size_mm=170` the resolved
+   `frame_height_mm` is 9.96 × 0.68 = **6.7728 mm**, which is 56.44 layers, not a whole
+   number. Ring top = 4.04 + 6.77 = **10.81 mm**, and `(10.81 − 0.2) / 0.12 = 88.42` — the
+   caption's base plane sits **0.05 mm above layer boundary 88** (10.76 mm). Consequences:
+   the ring's top layer is 42 % filled in Z, and the slice plane in the 10.76–10.88 band
+   catches *both* the black ring top and the white caption bottom, so the black/white
+   boundary is decided by a rounding accident rather than by geometry. That is precisely
+   the failure §3 spent pages on, reproduced at the one colour boundary on this plate.
+   **Fix: snap the resolved `frame_height_mm` (and any other scaled Z dimension) with the
+   existing `_snap` helper so `base_mm + frame_height_mm` always lands on
+   `FIRST_LAYER_MM + n × layer_mm`.** At 170 mm that means a ring top of **10.76 mm**
+   (n = 88) and a caption spanning layers 89–97 at 1.08 mm. `base_mm` 4.04 is already on
+   grid (n = 32); `frame_height_mm` 9.96 is a whole layer count only at `size_mm=250` and
+   loses that property at every other size. Worth a test alongside
+   `test_the_text_grid_is_registered_to_the_frame_grid` — the same class of bug, in Z.
+   *Shipped: `resolve()` snaps `frame_height_mm`, `proud_mm` and `relief_mm` (through
+   the exaggeration, which is what reaches the relief ceiling) with `_layers()`, the
+   delta form of `_snap`. Rounded **up**, not to nearest: each of these has a
+   printability floor that rounding down can cross — so the 170 mm ring top is
+   **10.88 mm** (n = 89), not 10.76, and the caption spans layers 89–99. In-plane
+   params are deliberately left alone. Test:
+   `test_resolve_snaps_z_heights_to_the_layer_grid`, at 250/200/170/120 mm.*
+
+3. **Minimum glyph stroke width: floor it at 0.80 mm, target 1.10 mm.** Current 0.6–0.9 mm
+   is *below* the accepted guideline for embossed text on a 0.4 mm nozzle, which is
+   **nozzle Ø × 2.5 = 1.0 mm minimum, 1.5 mm recommended**. Two levers, use both:
+   - **Increase the mask dilation from 1 fine pixel to 2** (the text grid is `TEXT_SUB=4`,
+     so a fine pixel is 0.1 mm). That adds 0.1 mm per side = **+0.2 mm on every stroke**:
+     0.6 → 0.8 mm, 0.9 → 1.1 mm. Exactly the target band, and it is a one-parameter change
+     to machinery that already exists.
+   - **Guard the counters.** Dilation shrinks holes by the same 0.1 mm per side. Add a
+     check that the smallest counter after dilation is **≥ 0.80 mm** (2 × 0.40 outer wall);
+     if it is not, the point size is too small for the face rather than the dilation being
+     too big. A closed counter is a worse failure than a slightly thin stem.
+
+   *Shipped, both levers plus the face: `FONT_PATHS` tries the bold faces first (Arial
+   Bold, Helvetica.ttc index 1, DejaVuSans-Bold) before the regular ones, which is
+   worth ~40 % of stroke width for free; then `_stroke_mm()` measures each line's
+   rendered mask by successive erosion and `_thicken()` dilates it until the stroke
+   clears `MIN_STROKE_MM = 1.0`, capped at a quarter of the cap height so a counter
+   cannot be welded shut (it says so on stdout when the cap engages). Per line, since
+   line 2 is the smaller face and needs the most. Measured at 170 mm: line 1
+   1.07 → 1.33 mm, line 2 0.80 → 1.33 mm. Note the erosion stops at three quarters of
+   the ink gone, not at an empty mask — eroding to empty measures the fattest feature
+   on the line, which on this caption is the head of the "→" (1.60 mm) and would have
+   left every stem unthickened.*
+
+4. **Floor the cap heights.** Guideline minimum character height for embossed text is
+   **4 mm, 6 mm recommended**. At `size_mm=170` the title is 5.4 mm (marginal) and the
+   subtitle is **3.5 mm — below the minimum**. Since `text_mm` auto-scales from its 250 mm
+   base, add floors on the *resolved* values: **title ≥ 6.0 mm, subtitle ≥ 4.5 mm.** With
+   `SUB_RATIO = 0.65` a 6 mm title gives a 3.9 mm subtitle, so either raise `SUB_RATIO`
+   to **0.75** or floor the subtitle independently. Both floors grow the caption block,
+   which grows the auto chin — that is the correct behaviour, and the existing
+   `check_output.py` per-axis footprint rule will catch it if the poster outgrows the plate.
+
+5. **Face selection matters more than any slicer setting.** Sources converge on bold
+   grotesques for printed text — **Roboto Bold, Open Sans Bold, Arial Bold, Overpass** —
+   and explicitly against serif, script and light weights. A Bold weight at 5.4 mm cap
+   height has a ~0.85 mm stem where a Regular has ~0.55 mm; that alone moves the caption
+   from "below minimum" to "acceptable" with no geometry change. If a face must stay small,
+   **set it in all caps** — simpler shapes, no descenders, no tight counters.
+
+6. **Leave the caption as a butt joint at the ring top; do not sink it in.** Sinking the
+   text body one layer into the ring would put black and white on the same layer and add a
+   second tool change (+~1.2 g of purge) in exchange for adhesion the flat black top
+   surface already provides. Keep the single colour change — it is the reason purge on
+   this plate is free. (Once item 2 is fixed and the joint is exactly on a layer boundary,
+   there is nothing left for interlocking to solve.)
+
+7. **State the assumptions in the filename, as §8.10 already recommends** — the caption
+   height and the ring-top Z are now slicer-visible invariants, so
+   `frame_0.12mm_1.08emboss.3mf` (or a one-line README) makes a mis-set profile obvious
+   before the plate is started.
+
+### Sources
+
+- [Introduction to wall generator | Bambu Lab Wiki](https://wiki.bambulab.com/en/software/bambu-studio/wall-generator) — Classic vs Arachne; minimum wall width clamped to 85 % of nozzle Ø (0.34 mm on a 0.4), automatic widening of too-thin features
+- [Wall Generator — OrcaSlicer Wiki](https://www.orcaslicer.com/wiki/print_settings/quality/quality_settings_wall_generator) — `wall_transition_length`, `wall_transition_angle`, `wall_transition_filter_deviation`, `wall_distribution_count`, `min_bead_width`, `min_feature_size`: definitions, units (% of nozzle Ø) and scope
+- [quality_settings_wall_generator · OrcaSlicer Wiki (GitHub)](https://github.com/OrcaSlicer/OrcaSlicer/wiki/quality_settings_wall_generator) — same parameters, plus wall maximum resolution/deviation
+- [Arachne perimeter generator | Prusa Knowledge Base](https://help.prusa3d.com/article/arachne-perimeter-generator_352769) — "features smaller than minimum feature size won't be printed"; transition filter margin "prevents transitioning back and forth"; wedge-angle semantics
+- [Wall Generator Settings — Orca Slicer](https://orcaslicer3d.org/wiki/wall-generator-settings/) and [Wall Generator Settings in Orca Slicer](https://orca-slicer.dev/wiki/wall-generator-settings-in-orca-slicer/) — wall distribution count constrains variation to inner walls; filter margin as hysteresis
+- [Bambu Studio — Arachne Wall Generator — Minimum Wall Length Option?](https://forum.bambulab.com/t/bambu-studio-arachne-wall-generator-minimum-wall-length-option/188995) and [Minimum Wall Length — Arachne Generator (BambuStudio #9006)](https://github.com/bambulab/BambuStudio/issues/9006)
+- [Small features not printing — minimum wall width adjustment | Bambu forum](https://forum.bambulab.com/t/small-features-not-printing-minimum-wall-width-adjustment/197248) — `min_feature_size` 0 behaves as "disabled"; features under ~0.3 mm are at the technology limit; the 59° transition-angle anecdote
+- [Arachne generates LINE_WIDTH up to 57 mm (BambuStudio #9731)](https://github.com/bambulab/BambuStudio/issues/9731) — Bambu Studio Arachne defaults: `min_bead_width` 85 %, `min_feature_size` 25 %, `wall_transition_length` 100 %, `wall_transition_angle` 10°, `wall_transition_filter_deviation` 25 %
+- [Line width | Bambu Lab Wiki](https://wiki.bambulab.com/en/software/bambu-studio/parameter/line-width) — 0.75–1.5 × nozzle Ø guidance, per-feature line widths
+- [Line Width and Nozzle Size: How They Actually Interact — 3DProfileFix](https://www.3dprofilefix.com/guides/line-width-and-nozzle-size-guide.html) — why sub-aperture extrusion wanders rather than gaining precision
+- [Precise Wall moves outer wall inward, incorrectly shrinks printed model (BambuStudio #8030)](https://github.com/bambulab/BambuStudio/issues/8030) — the Precise wall caveat
+- [Precise wall — OrcaSlicer Wiki](https://github.com/SoftFever/OrcaSlicer/wiki/Precise-wall) — what Precise wall changes about the outer/inner wall gap
+- [Scarf Seam Settings for OrcaSlicer, Bambu & Prusa — SpoolHound](https://spoolhound.com/seam-guide) — seam position options; scarf taper length; "if the perimeter is shorter than the taper distance, the ramp cannot develop properly"
+- [The Scarf Seam function in Bambu Studio — 3DJake](https://www.3djake.ie/info/guide/get-rid-of-z-seams-how-to-get-smooth-surfaces-with-scarf-seam) — how the scarf flow ramp works
+- [Black to White Outer Wall Bleed | Bambu forum](https://forum.bambulab.com/t/black-to-white-outer-wall-bleed-i-dont-think-its-a-purging-issue/96483) — black→white flush maxed at 800–999 mm³, lowering nozzle temp, dragging/ooze as a distinct mechanism from purge
+- [How to fix black filament bleeding into white | Bambu forum](https://forum.bambulab.com/t/how-to-fix-black-filament-bleeding-into-white/44081) and [Multi-Color Bleed Through](https://forum.bambulab.com/t/multi-color-bleed-through/3980)
+- [Flushing Volumes in Bambu Studio & OrcaSlicer: Complete Guide](https://www.3dprofilefix.com/guides/flushing-volumes-guide.html) — black→white 500–800 mm³, white→black 100–200 mm³, multiplier 1.0, "never flush into infill on a white or clear model"
+- [Making better use of Flush-into object in Bambu Studio | Bambu forum](https://forum.bambulab.com/t/making-better-use-of-flush-into-object-in-bambu-studio/29422) — per-object flush target must be at least as tall as the last colour change
+- [Reduce Waste during Filament Change | Bambu Lab Wiki](https://wiki.bambulab.com/en/software/bambu-studio/reduce-wasting-during-filament-change) — flush vs prime volume, and the 0.2 mm nozzle flushing-speed penalty
+- [Text and Engravings: Best Practices for Readable 3D Printed Text — Mandarin3D](https://mandarin3d.com/blog/text-and-engravings-best-practices-for-readable-3d-printed-text) — embossed text: line width ≥ 1.0 mm (1.5 mm recommended), height ≥ 0.5 mm (0.8 mm recommended), character height ≥ 4 mm (6 mm recommended); "nozzle Ø × 2.5 for minimum feature width"; recommended faces (Roboto Bold, Open Sans Bold, Arial Bold, Overpass), avoid serif/script/thin; all-caps at small sizes
+- [Printing small letters | UltiMaker community](https://community.ultimaker.com/topic/16535-printing-small-letters/) — practical floor for legible FDM lettering
+- [Letters embedded depth when printing signs causing problems | Bambu forum](https://forum.bambulab.com/t/letters-embedded-depth-when-printing-signs-causing-problems/18797) — emboss/embed depth interacting with the layer grid
+- [Small Perimeter speed is not applied to specific short perimeters in Arachne (OrcaSlicer #8973)](https://github.com/OrcaSlicer/OrcaSlicer/issues/8973) — `small_perimeter_speed` / `small_perimeter_threshold` semantics, and that they are Orca-side
+- [Other layers speed — OrcaSlicer Wiki](https://www.orcaslicer.com/wiki/print_settings/speed/speed_settings_other_layers_speed) — small-perimeter speed as a percentage of outer wall speed
+- [Ironing | Bambu Lab Wiki](https://wiki.bambulab.com/en/software/bambu-studio/parameter/ironing) — ironing inset, bow wave at every ironed-region boundary, lateral force
