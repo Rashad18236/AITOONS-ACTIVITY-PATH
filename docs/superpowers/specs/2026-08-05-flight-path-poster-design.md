@@ -502,3 +502,54 @@ is the practical two-line ceiling; the per-axis y rule is what reports it.
 Re-verified live at 170mm: two-line 169.60 × 179.20mm, chin 9.6mm, text 57874 verts;
 `text2`-only 169.60 × 171.60mm, chin 2.0mm, text 17930 verts. Both **45/45 PASS**, both
 grid-registered exactly, opening and relief still byte-identical to a no-caption build.
+
+---
+
+# Addendum 2026-08-14: three fixed sizes, budgeted against the *print* and not the plate
+
+The shop sells three posters and nothing else. `poster.SIZES_MM = (216, 170, 120)`,
+`Params.size_mm` defaults to the first, `/generate` 400s on anything else and the UI
+size field is a `<select>`. `poster.py` still meshes any size — the tests build 40mm
+posters — so the restriction lives at the API boundary, not in the core.
+
+Picking the three took three goes, and the last one was found on the printer:
+
+1. **250 does not fit with a two-line caption.** The auto chin makes the frame
+   249.6 × 260.0mm. 245 fixes that but is 612.5 `res_mm` pixels, so `_grid`'s
+   truncation prints it at 244.4mm — 0.6mm under nominal, outside `check_output.py`'s
+   ±0.5 rule. Every offered size must be a whole number of pixels; 240 was.
+2. **240 fits the plate and cannot be printed.** This is the one that mattered.
+   `PLATE_MM` (256) was being checked against the bare mesh, and a mesh is not a print:
+   the 5mm brim §6 of `docs/print-settings.md` makes mandatory at this footprint takes
+   the frame to 249.6 × 260.4mm, 4.4mm off the bed, before the prime tower is placed.
+   The tower is not optional for `relief.3mf` — its bodies overlap in z (terrain
+   0–20.60, water 1.04–8.96, snow 19.64–27.92 at 216mm), so hundreds of layers carry
+   two colours.
+3. Hence **`USABLE_MM` = `PLATE_MM - 2*BRIM_MM - TOWER_GAP_MM - TOWER_MM` = 226**, on
+   both axes, and 216 is the largest grid-exact size whose two-line frame lands inside
+   it (215.6 × 226.0mm — exactly on the budget, by construction). Every ceiling moved
+   to it: the `build_poster` guard, `max_size_mm`, `check_output.py` rule 3 and
+   `/dimensions`'s `fits`. `PLATE_MM` stays as the physical bed and is checked against
+   nothing. The tower allowance is charged to *both* axes because the tower is a
+   fixed-orientation rectangle; assuming Studio can rotate it into a side strip buys
+   10mm and a surprise. It also assumes §3's 130mm-wide shallow tower — a 60mm one is
+   twice as deep for the same purge.
+
+`frame.3mf` is the one plate that would not need a tower: frame 0–12.68, text
+12.68–13.88, no overlap, so it is a single filament change. The budget deliberately
+does not exploit that — one number that holds for every plate beats two that have to be
+remembered — and that choice is what costs the large size 20mm.
+
+**`groove_w_mm`'s floor: 1.2 → 1.44.** The part that has to survive the printer is the
+strip, `groove_w_mm - 2*clearance_mm` wide. At the old floor that was 0.60mm — 1.4
+extrusions at a 0.42mm line width — so a 16mm-tall fin printed as a single wobbly bead.
+1.44 − 0.60 = 0.84 = exactly 2 × 0.42, the pure-perimeter case §5 tunes the path plate
+for. Unchanged at 216, where the fin is 1.13mm and Arachne widens two beads to ~0.57mm.
+
+Caption limits are now advertised (30 characters on line 1, 45 on line 2) and pinned by
+`test_the_advertised_caption_maxima_print_at_full_size`: past the width fit `_fit_line`
+shrinks the font, so the promise is geometry and is checkable. Measured headroom is
+33–35 and 52–58 characters.
+
+Verified live at all three sizes against real DEM and Overpass data: `check_output.py`
+45/45 on every trio, and every part fits the plate with its brim and a tower beside it.

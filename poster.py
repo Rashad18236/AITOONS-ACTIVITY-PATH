@@ -1,6 +1,7 @@
 """Flight Path Poster core: track -> heightmap -> printable meshes."""
-import csv, io, json, math, re, urllib.parse
+import csv, functools, io, json, math, re, urllib.parse
 from dataclasses import dataclass, replace
+from pathlib import Path
 import numpy as np
 import requests
 import trimesh
@@ -93,14 +94,14 @@ def _tile_px(x, y, z):
 UA = {"User-Agent": "FlightPathPoster/1.0 (local single-user 3D-print tool)"}
 
 
-def _get(url, timeout=20):
-    for attempt in (1, 2):  # one retry, then raise (spec: 502 upstream)
+def _get(url, timeout=20, tries=2):
+    for attempt in range(1, tries + 1):  # tiles: one retry, then raise (spec: 502 upstream)
         try:
             r = requests.get(url, timeout=timeout, headers=UA)
             r.raise_for_status()
             return r.content
         except Exception:
-            if attempt == 2:
+            if attempt == tries:
                 raise
 
 
@@ -137,33 +138,90 @@ def fetch_elevation(bounds, px_out):
 
 COLORS = {"frame": "#222222", "text": "#FFFFFF", "green": "#4CAF50",
           "water": "#2196F3", "snow": "#9E9E9E", "strip": "#CC2222"}
+# Runways and main roads share the grey band's colour and AMS slot 3 — no new spool.
+COLORS["roads"] = COLORS["snow"]
+
+# Grey roads, picked by zoom. A class is drawn while the poster's ground scale
+# (m per printed mm) is at most its limit, finest first: Blackpool at 36.7 m/mm gets
+# tertiary and up (~8.5% of the plate) plus 0.3% runway; residential would add 15%
+# and read as a grey block. No _link roads, taxiways or aprons.
+ROAD_MM = 1.2       # printed road width: 3 extrusions, clear of the 0.84 colour floor (print-settings.md section 3)
+ROAD_TIERS = (("tertiary", 60), ("secondary", 150), ("primary", 400),
+              ("trunk", 1200), ("motorway", 3000))
+ROAD_MAX_FRAC = 0.15   # grey plate fraction above which the finest class is dropped
+RUNWAY_M = 45.0        # OSM aeroway=runway without a usable width tag
+
+# The relief ceiling spans the terrain range, or the flight's height over the lowest
+# ground clipped to this (m), whichever is larger. See compose_parts.
+FLIGHT_SPAN_M = (300.0, 1000.0)
 
 # Constant z the slot is carved down to, so the level strip seats on a flat floor
 # whatever terrain it crosses. Keeps the relief plate connected under the slot;
 # the slot's *depth* therefore varies with the terrain, its floor does not.
-# 1.04 = 0.2 + 7*0.12, the printable boundary nearest the old 1.0 (see _snap).
-SLOT_FLOOR_MM = 1.04
+# 1.16 = 0.2 + 4*0.24 (see _snap). Not 0.92, the boundary nearer the old 1.0: 0.92 -
+# SLOT_CAP_MM leaves only 0.44mm of green under the cap in the slot.
+SLOT_FLOOR_MM = 1.16
+# Water/road caps drape down into the slot instead of stopping at its edge, so the
+# slot walls and floor are blue over the sea and grey on a road, not a green rim.
+# 2 layers, not cap_mm's 4: 1.16 - 0.96 would leave only the 0.2mm first layer green,
+# while 1.16 - 0.48 = 0.68 = 0.2 + 2*0.24 keeps the green under it on the layer grid.
+SLOT_CAP_MM = 0.48
 
 # The slicer's first layer is thicker than the rest (Bambu: nozzle diameter x 50%),
 # so a printable height is FIRST_LAYER_MM + n*layer_mm, not n*layer_mm.
 FIRST_LAYER_MM = 0.2
 
-# White text body thickness: 10 layers at 0.12. Sits on the (flat) frame ring top.
-# Not 0.84 (7 layers): white PLA over black needs ~1.0mm before it stops reading
+# White text body thickness: 5 layers at 0.24. Sits on the (flat) frame ring top.
+# Not 0.84: white PLA over black needs ~1.0mm before it stops reading
 # warm-grey under a raking lamp, which is the light a wall-hung poster gets. It costs
 # one extra 0.1g of white and no extra filament change — the caption is the only
 # geometry above the ring, so the plate has exactly one black->white change either way.
 TEXT_EMBOSS_MM = 1.20
 
-# Printable stroke floor for a 0.4mm nozzle: below ~0.8mm a glyph stroke is under two
-# extrusion widths and Arachne flips between one and two beads along its length; 1.0mm
-# is the recommended figure. The rendered faces come out at 0.6-0.9mm, so _text_mask
-# dilates each line until it clears this. See docs/print-settings.md.
-MIN_STROKE_MM = 1.0
+# Printable stroke target for a 0.4mm nozzle: below ~0.8mm a glyph stroke is under two
+# extrusion widths and Arachne flips between one and two beads along its length; 0.84
+# is two 0.42 extrusions. A TARGET: _dilation_px stops short of it rather than close a
+# counter or weld an i-dot on. See docs/print-settings.md.
+MIN_STROKE_MM = 0.84
+# Background a counter must keep after the dilation, and survive this much more growth
+# with, before _dilation_px trusts it to come off the printer open.
+MIN_COUNTER_MM = 0.4
 
 # Bambu build plate. The hard ceiling on BOTH frame axes: size_mm is the width, and
 # the chin makes the height size_mm + chin_mm, which is the one that overflows first.
 PLATE_MM = 256.0
+
+# ...but a mesh that fits the bare plate does not fit the PRINT. Measured on a real
+# 240mm trio: the frame meshes 239.6 x 250.4mm, inside 256 on both axes, and Studio
+# still refuses it — the 5mm brim docs/print-settings.md makes mandatory on a plate
+# this size takes it to 249.6 x 260.4mm, 4.4mm off the bed, before the prime tower is
+# placed at all. The tower is not optional either: relief.3mf's bodies overlap in z
+# (caps drape below the terrain top, grey stands on it), so most layers carry two
+# colours and the flush has to go somewhere. So the budget every footprint is
+# really checked against is the plate less the brim, the tower and the gap between
+# them. Both axes, because the tower is a fixed-orientation rectangle Studio parks in
+# a front strip — assuming it can be rotated into a side strip buys 10mm and a
+# surprise. Raise USABLE_MM only against a slicer screenshot, never on arithmetic.
+BRIM_MM = 5.0          # per side, outer brim only (print-settings.md section 6)
+TOWER_MM = 16.0        # 130 x 6mm prime tower + its own 5mm brim (TOWER_W_MM, section 3)
+TOWER_GAP_MM = 4.0     # tower brim to object brim
+USABLE_MM = PLATE_MM - 2 * BRIM_MM - TOWER_GAP_MM - TOWER_MM   # 226.0
+
+# The three sizes the shop sells, and the only ones /generate accepts. Two rules pick
+# them, and the large one is where both bite:
+#   1. Its frame must fit USABLE_MM with EVERY caption it can be ordered with. The
+#      two-line chin decides that — the frame is the tallest deliverable and the only
+#      one that ever busts the budget (a 216mm relief is 194mm square, a lap ahead).
+#   2. It must be a whole number of res_mm pixels. _grid() truncates (N =
+#      int(size_mm/res_mm)), so a size off the grid loses up to a further pixel:
+#      245mm is 612.5px and prints 244.4mm, 0.6mm under nominal and outside
+#      check_output.py's +-0.5 footprint tolerance. 216 is 540px exactly.
+# Hence 216: 215.6 x 226.0mm with two lines, landing exactly on the budget. 240 was
+# shipped before the brim and the tower were counted and could not be printed at all.
+# Pinned by test_every_offered_size_fits_the_plate. poster.py itself still meshes any
+# size — the tests build 40mm posters — the restriction is the shop's, so it lives at
+# the API boundary in app.py.
+SIZES_MM = (216.0, 170.0, 120.0)
 
 # Caption layout. Line 2 is a subtitle at SUB_RATIO of line 1, GAP_RATIO of line 1
 # below it; TEXT_MARGIN_MM of clear ring above and below the block decides the chin.
@@ -193,13 +251,18 @@ def _snap(z, p, rnd=np.round):
 
 # (path, face index), in fallback order. Bold first: a caption stroke has to clear
 # MIN_STROKE_MM and a bold face is ~40% of the way there for free, where dilation
-# pays for it in closed counters. Helvetica.ttc is a collection — index 1 is its Bold
-# face; the .ttf files are single faces, index 0.
+# pays for it in closed counters. Trebuchet MS Bold before Arial/Helvetica Bold: those
+# two set the g's ear, the t's hook and the i-dot under 0.2mm from their stems at 7mm
+# caps, and any dilation welds them; Trebuchet's open forms keep 0.8-1.2mm counters.
+# It has no "→" — _glyph_font takes that one glyph from the next face down.
+# Helvetica.ttc is a collection — index 1 is its Bold face; the .ttf files are single
+# faces, index 0.
 # load_default() is a bitmap font whose strokes are ~1px wide at res 0.4 —
 # masked_slab_mesh needs all four corners of a cell, so those glyphs mesh as slivers
 # or vanish. No new dependency, no bundled font: use what the box has, fall back to
 # the regular faces, and to the bitmap only if it has neither.
-FONT_PATHS = (("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 0),
+FONT_PATHS = (("/System/Library/Fonts/Supplemental/Trebuchet MS Bold.ttf", 0),
+              ("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 0),
               ("/System/Library/Fonts/Helvetica.ttc", 1),
               ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 0),
               ("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf", 0),
@@ -218,6 +281,31 @@ def _font(px):
         except Exception:
             pass
     return ImageFont.load_default(size=px)
+
+
+@functools.lru_cache(maxsize=None)
+def _face(path, index, px):
+    return ImageFont.truetype(path, px, index=index)
+
+
+def _glyph_font(font, ch):
+    """`font`, or the first FONT_PATHS face at its size that has a glyph for `ch`.
+
+    A missing glyph renders as the .notdef box. U+FFFF is a noncharacter no font maps,
+    so its mask IS that box — getmask("") is an empty mask, not the box, and comparing
+    against it never fires."""
+    has = lambda f: not np.array_equal(np.asarray(f.getmask(ch)),
+                                       np.asarray(f.getmask("￿")))
+    if has(font):
+        return font
+    for path, index in FONT_PATHS:
+        try:
+            f = _face(path, index, font.size)
+            if has(f):
+                return f
+        except Exception:   # missing file; Helvetica.ttc below ~8px (see _font)
+            pass
+    return font
 
 
 def _smooth(a, px):
@@ -242,16 +330,45 @@ def _smooth(a, px):
 
 # Water comes from OSM vector polygons via Overpass (free, no key): rasterised at
 # the poster's own resolution it gives crisp shorelines, where a low-zoom raster
-# tile gave 100m stair-steps. Two public mirrors, either one will do.
+# tile gave 100m stair-steps. Four public mirrors, tried in order by _overpass.
 OVERPASS_URLS = ("https://overpass-api.de/api/interpreter",
-                 "https://overpass.kumi.systems/api/interpreter")
+                 "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+                 "https://overpass.kumi.systems/api/interpreter",
+                 "https://overpass.private.coffee/api/interpreter")
 # `out geom` embeds every member way's coordinates, so no second node lookup is
 # needed. Overpass does NOT clip geometry to the bbox — the rasteriser does.
 OVERPASS_QL = ('[out:json][timeout:120][maxsize:536870912][bbox:{s},{w},{n},{e}];'
                '(way["natural"="water"];relation["natural"="water"];'
-               'way["waterway"="riverbank"];relation["waterway"="riverbank"];);'
+               'way["waterway"="riverbank"];relation["waterway"="riverbank"];'
+               'way["natural"="coastline"];way["aeroway"="runway"];{roads});'
                'out geom;')
 MIN_RING_PX2 = 9.0   # ~3x3 px: below this a lake is a printing artefact, not a lake
+
+
+@functools.lru_cache(maxsize=None)
+def _overpass(q):
+    """Overpass elements for query q, as a tuple, from the first mirror that answers
+    in FULL. Overpass answers a query that hits [timeout:] or [maxsize:] with HTTP 200,
+    the elements gathered so far and a `remark` — roads drop out first, then the coast,
+    and a regeneration of the same order printed a different street grid and relief.
+    So a remark is a failure, not data. Cached per query string for the server's life:
+    the same bbox always gets the same answer. lru_cache does not cache a raise, so a
+    total failure is retried on the next call. Tuple, so no caller mutates the cache."""
+    ex = None
+    for base in OVERPASS_URLS:
+        try:
+            data = json.loads(_get(f"{base}?data={urllib.parse.quote(q)}", timeout=150, tries=1))
+        except Exception as e:   # [:80]: an HTTPError's text carries the whole query URL
+            ex = str(e)[:80]
+            print(f"water: {base} failed ({ex}) — trying mirror")
+            continue
+        if data.get("remark") or "elements" not in data:
+            ex = data.get("remark") or "no elements"
+            print(f"water: {base}: {str(ex)[:80]} — partial response, trying mirror")
+            continue
+        return tuple(data["elements"])
+    raise RuntimeError(f"OSM data unavailable — all {len(OVERPASS_URLS)} Overpass mirrors "
+                       f"failed or answered partially (last: {ex}); retry in a few minutes")
 
 
 def _unmerc(x, y):
@@ -298,16 +415,21 @@ def _stitch_rings(segs):
     return rings, broken
 
 
-def _water_mask_from_elements(els, bounds, px_out):
-    """Overpass elements -> bool (px_out, px_out) water mask, row 0 = north."""
+def _to_px(pts, bounds, px_out):
+    """[(lat, lon), ...] -> (K,2) output pixels (x east, y south), row 0 = north."""
     x0, y0, x1, y1 = bounds
+    xy = np.array([_merc(la, lo) for la, lo in pts])
+    return np.stack([(xy[:, 0] - x0) / (x1 - x0) * px_out,
+                     (y1 - xy[:, 1]) / (y1 - y0) * px_out], 1)
+
+
+def _water_mask_from_elements(els, bounds, px_out):
+    """Overpass elements -> bool (px_out, px_out) polygon mask, row 0 = north."""
     img = Image.new("L", (px_out, px_out))
     draw = ImageDraw.Draw(img)
 
     def paint(ring, fill):
-        xy = np.array([_merc(la, lo) for la, lo in ring])
-        px = np.stack([(xy[:, 0] - x0) / (x1 - x0) * px_out,
-                       (y1 - xy[:, 1]) / (y1 - y0) * px_out], 1)
+        px = _to_px(ring, bounds, px_out)
         a, b = px[:, 0], px[:, 1]                      # shoelace, in output pixels
         if abs(a @ np.roll(b, -1) - b @ np.roll(a, -1)) / 2 < MIN_RING_PX2:
             return                                     # pond/pool below print resolution
@@ -337,29 +459,237 @@ def _water_mask_from_elements(els, bounds, px_out):
     return np.asarray(img) > 0
 
 
-def fetch_water_mask(bounds, px_out):
-    """OSM water polygons over bounds -> bool (px_out, px_out), row 0 = north."""
+def _sea_mask(coast, bounds, px_out):
+    """natural=coastline ways -> bool (px_out, px_out) sea mask, row 0 = north.
+
+    OSM has no sea polygons: the coast is a line with land on its LEFT. Every way is
+    drawn as a 1px 8-connected line (Bresenham), which a 4-connected flood cannot
+    cross; the pieces it cuts the grid into are labelled lazily, and each segment
+    votes +1 for the piece on its right and -1 for the one on its left. Votes, not one
+    seed: a pier doubles back within a pixel of itself and a single seed lands across
+    it (one seed flooded 99.8% of Blackpool; voting gives 48.5%). Not the DEM sign: a
+    polder behind dunes is below zero and still land. The line itself stays land.
+    ponytail: pure-Python floodfill, ~0.2 s at 488 px, ~5 s at res 0.2; swap for
+    scipy.ndimage.label if it ever hurts."""
+    img = Image.new("I", (px_out, px_out))
+    draw = ImageDraw.Draw(img)
+    lines = [_to_px([(p["lat"], p["lon"]) for p in el["geometry"]], bounds, px_out)
+             for el in coast if len(el.get("geometry") or ()) >= 2]
+    for q in lines:
+        draw.line([tuple(v) for v in q], fill=-1, width=1)
+    votes, n = {}, 0
+    for q in lines:
+        for a, c in zip(q[:-1], q[1:]):
+            v = c - a
+            L = math.hypot(*v)
+            if L < 1e-9:
+                continue
+            # pixel y points south, so the way's right hand (the sea) is (-vy, vx)
+            right = np.array([-v[1], v[0]]) / L
+            for sgn in (1, -1):
+                x, y = np.rint((a + c) / 2 + sgn * 1.5 * right).astype(int)
+                if not (0 <= x < px_out and 0 <= y < px_out):
+                    continue
+                k = img.getpixel((int(x), int(y)))
+                if k == 0:
+                    n += 1
+                    ImageDraw.floodfill(img, (int(x), int(y)), n)
+                    k = n
+                if k > 0:
+                    votes[k] = votes.get(k, 0) + sgn
+    return np.isin(np.asarray(img), [k for k, s in votes.items() if s > 0])
+
+
+def _road_mask(items, bounds, px_out):
+    """[(pts [(lat, lon), ...], width px), ...] -> bool (px_out, px_out) line mask."""
+    img = Image.new("L", (px_out, px_out))
+    draw = ImageDraw.Draw(img)
+    for pts, w in items:
+        draw.line([tuple(q) for q in _to_px(pts, bounds, px_out)], fill=255, width=w,
+                  joint="curve")
+    return np.asarray(img) > 0
+
+
+def fetch_osm_masks(bounds, px_out, res_mm):
+    """OSM water, sea and grey roads/runways over bounds -> (water, sea, roads), each
+    bool (px_out, px_out), row 0 = north. One Overpass call for all three."""
     w, s = _unmerc(bounds[0], bounds[1])
     e, n = _unmerc(bounds[2], bounds[3])
     if e - w > 4.0:   # a transoceanic track; Overpass would time out on the ocean
         print(f"water: {e - w:.1f}deg bbox is too wide for Overpass — no water drawn")
-        return np.zeros((px_out, px_out), bool)
-    q = OVERPASS_QL.format(s=s, w=w, n=n, e=e)
-    for i, base in enumerate(OVERPASS_URLS):
+        return tuple(np.zeros((px_out, px_out), bool) for _ in range(3))
+    # pseudo-mercator x is longitude in radians: ground metres = dx * R * cos(lat)
+    lat = _unmerc(0, (bounds[1] + bounds[3]) / 2)[1]
+    m_per_mm = (bounds[2] - bounds[0]) * 6371000 * math.cos(math.radians(lat)) / px_out / res_mm
+    classes = [c for c, lim in ROAD_TIERS if m_per_mm <= lim]
+    roads = f'way["highway"~"^({"|".join(classes)})$"];' if classes else ""
+    els = _overpass(OVERPASS_QL.format(s=s, w=w, n=n, e=e, roads=roads))
+    tag = lambda el, k: (el.get("tags") or {}).get(k)
+    kind = lambda el: ("sea" if tag(el, "natural") == "coastline" else
+                       "runway" if tag(el, "aeroway") == "runway" else
+                       # a tunnel is skipped, not "water": a closed roundabout way
+                       # would otherwise reach the polygon rasteriser as a lake
+                       ("road" if tag(el, "highway") in classes and not tag(el, "tunnel")
+                        else None) if tag(el, "highway") else "water")
+    # coastline must never reach the polygon rasteriser: a closed coastline way is an
+    # island, and painted as a polygon it would print as a lake
+    pick = lambda k: [el for el in els if kind(el) == k]
+    pts = lambda el: [(p["lat"], p["lon"]) for p in el.get("geometry") or []]
+    px = lambda mm: round(mm / res_mm) + 1   # vertex width: 4 px at 0.4 -> 3 cells = 1.2mm
+
+    def runway_m(el):   # "45", "45 m", "45;30" -> 45; missing or garbage -> RUNWAY_M
         try:
-            data = json.loads(_get(f"{base}?data={urllib.parse.quote(q)}", timeout=180))
+            return float(re.match(r"\s*([\d.]+)", tag(el, "width")).group(1))
+        except (TypeError, AttributeError, ValueError):
+            return RUNWAY_M
+
+    runways = pick("runway")
+    areas = [el for el in runways if tag(el, "area") == "yes"]   # drawn as an outline polygon
+    runway_items = [(pts(el), px(max(ROAD_MM, runway_m(el) / m_per_mm)))
+                    for el in runways if tag(el, "area") != "yes" and len(pts(el)) >= 2]
+    road_items = [(tag(el, "highway"), (pts(el), px(ROAD_MM)))
+                  for el in pick("road") if len(pts(el)) >= 2]
+    while True:
+        grey = _road_mask(runway_items + [it for c, it in road_items if c in classes],
+                          bounds, px_out)
+        if grey.mean() <= ROAD_MAX_FRAC or not classes:
             break
-        except Exception as ex:
-            if i == len(OVERPASS_URLS) - 1:
-                raise
-            print(f"water: {base} failed ({ex}) — trying mirror")
-    return _water_mask_from_elements(data.get("elements", ()), bounds, px_out)
+        print(f"roads: {classes[0]} would grey {grey.mean():.0%} of the plate — dropped")
+        classes.pop(0)
+    return (_water_mask_from_elements(pick("water"), bounds, px_out),
+            _sea_mask(pick("sea"), bounds, px_out),
+            grey | _water_mask_from_elements(areas, bounds, px_out))
+
+
+# FR24 tracks GA aircraft badly near the ground: the first/last fixes jump into the
+# fields beside the airport. snap_runways cuts them and rolls on the real runway instead.
+RUNWAYS_URL = "https://davidmegginson.github.io/ourairports-data/runways.csv"
+# ponytail: gates fitted to one G-CEFM flight; loosen SNAP_LAT_M / drop SNAP_RUN to 2 if turning departures go undetected
+SNAP_NEAR_M, SNAP_REACH_M, SNAP_LAT_M, SNAP_RUN = 5000, 4000, 120, 3
+LIFTOFF_FRAC, ROLLOUT_FRAC = 0.25, 0.55
+SNAP_MARGIN = 2   # best run must beat the runner-up by this, else the end is "ambiguous"
+_ENDS = ("le_latitude_deg", "le_longitude_deg", "he_latitude_deg", "he_longitude_deg")
+
+
+def _metres(ll, o):
+    """(K,2) lat/lon -> local metres (east, north) about o = (lat, lon)."""
+    return np.c_[(ll[:, 1] - o[1]) * 111320 * math.cos(math.radians(o[0])),
+                 (ll[:, 0] - o[0]) * 110540]
+
+
+def _runway_table(text):
+    """OurAirports runways.csv -> (labels [(apt, le, he)], (K,5) le_lat le_lon he_lat he_lon elev_m)."""
+    labels, rows = [], []
+    for r in csv.DictReader(io.StringIO(text)):
+        if r["closed"] == "1":
+            continue
+        try:
+            ends = [float(r[k]) for k in _ENDS]
+        except ValueError:  # blank coordinates
+            continue
+        elev = float(r["le_elevation_ft"] or r["he_elevation_ft"] or 0) * 0.3048
+        labels.append((r["airport_ident"], r["le_ident"], r["he_ident"]))
+        rows.append(ends + [elev])
+    return labels, np.array(rows, float).reshape(-1, 5)
+
+
+@functools.lru_cache(maxsize=None)
+def _runways():
+    return _runway_table(_get(RUNWAYS_URL, timeout=60).decode())
+
+
+def _find_runway(labels, text):
+    """'egnh 10' -> (row j, end 0=le/1=he). ValueError on anything unknown — never auto."""
+    tok = text.upper().split()
+    for j, (apt, le, he) in enumerate(labels):
+        if len(tok) == 2 and apt == tok[0] and tok[1] in (le, he):
+            return j, int(tok[1] == he)
+    raise ValueError(f"Unknown runway '{text}' — ICAO ident and runway, e.g. EGNH 10")
+
+
+def _fit_end(pts, labels, rws, takeoff, force=None):
+    """pts end at the airport (reverse the track for takeoff) -> (k, name, (2,3) [T, P]) or None.
+
+    k trailing fixes are bogus; [T, P] is the runway roll that replaces them, in flight
+    order. Altitude is never used: FR24 pressure altitude is 100ft-steps and QNH-shifted.
+    force = (j, end) from _find_runway restricts the search to that one direction."""
+    # Only this end's half of the track: a circuit's climb-out lies on the extended
+    # centreline too, and the inward walk would otherwise reach it and cut the flight.
+    pts = pts[len(pts) // 2:]
+    norm = lambda v: np.linalg.norm(v, axis=-1)
+    o = pts[-1, :2]
+    xy = _metres(pts[:, :2], o)
+    near = [force] if force else [
+        (j, e) for j in np.flatnonzero(np.minimum(norm(_metres(rws[:, :2], o)),
+                                                  norm(_metres(rws[:, 2:4], o))) < SNAP_NEAR_M)
+        for e in (0, 1)]
+    found = []   # one (run, k, name, [T, P]) per direction that has an aligned run
+    for j, e in near:
+        Tll, Fll = (rws[j, 2:4], rws[j, :2]) if e else (rws[j, :2], rws[j, 2:4])
+        T, F = _metres(np.array([Tll, Fll]), o)
+        L = norm(F - T)
+        u = (F - T) / L
+        s, x = (xy - T) @ u, (xy - T) @ np.array([-u[1], u[0]])
+        # landing: approach only, so on-runway/taxi fixes are cut and the synthetic
+        # rollout never doubles back; takeoff: from LIFTOFF_FRAC down the runway on
+        lo, hi = (LIFTOFF_FRAC * L, L + SNAP_REACH_M) if takeoff else (-SNAP_REACH_M, 0)
+        ok = (np.abs(x) < SNAP_LAT_M) & (s > lo) & (s < hi)
+        # walk inward from the end: the first SNAP_RUN aligned fixes in a row end the
+        # clean part. Forced: fall back to any aligned fix (a climb-out that turns early).
+        for min_run in ((SNAP_RUN, 1) if force else (SNAP_RUN,)):
+            i = next((i for i in range(len(ok) - 1, min_run - 2, -1)
+                      if ok[i - min_run + 1:i + 1].all()), None)
+            if i is not None:
+                break
+        if i is None:
+            continue
+        j0 = i
+        while j0 > 0 and ok[j0 - 1]:   # extend the run inward: its length is the score
+            j0 -= 1
+        P = Tll + (LIFTOFF_FRAC if takeoff else ROLLOUT_FRAC) * (Fll - Tll)
+        found.append((i - j0 + 1, len(pts) - 1 - i, f"{labels[j][0]} {labels[j][1 + e]}",
+                      np.array([[*Tll, rws[j, 4]], [*P, rws[j, 4]]])))
+    if not found:
+        if force:
+            raise ValueError(f"forced {labels[force[0]][0]} {labels[force[0]][1 + force[1]]}: "
+                             f"no fixes within {SNAP_LAT_M} m of its centreline at the "
+                             f"{'takeoff' if takeoff else 'landing'} end")
+        return None
+    found.sort(key=lambda c: -c[0])
+    if len(found) > 1 and found[0][0] - found[1][0] < SNAP_MARGIN:
+        return 0, (f"ambiguous ({found[0][2]} run {found[0][0]} vs {found[1][2]} run "
+                   f"{found[1][0]}) — force one"), pts[:0]   # k=0, no points: untouched
+    run, k, name, TP = found[0]
+    return k, name + (" (forced)" if force else ""), TP
+
+
+def snap_runways(track, rws=None, takeoff_rwy="", landing_rwy=""):
+    """-> (track, note). Replaces FR24's bogus low-level ends with a straight runway roll.
+
+    Both new points sit at field elevation, which may be under the DEM terrain; the
+    strip's proud_mm clamp lifts them. Runway data failing is non-fatal, like water —
+    unless a runway is forced, which is a ValueError (never a silent auto)."""
+    try:
+        labels, arr = rws or _runways()
+    except Exception as e:
+        if takeoff_rwy.strip() or landing_rwy.strip():
+            raise ValueError(f"runway data unavailable ({e}); cannot force a runway")
+        print(f"runways: {e}")
+        return track, f"runway data unavailable ({e})"
+    fd = _find_runway(labels, takeoff_rwy) if takeoff_rwy.strip() else None
+    fl = _find_runway(labels, landing_rwy) if landing_rwy.strip() else None
+    t = np.asarray(track, float)
+    n = len(t)
+    dep, land = _fit_end(t[::-1], labels, arr, True, fd), _fit_end(t, labels, arr, False, fl)
+    kd, nd, pd = dep or (0, "—", t[:0])
+    kl, nl, pl = land or (0, "—", t[:0])
+    return np.vstack([pd, t[kd:n - kl], pl]), f"Runways: takeoff {nd}, landing {nl}"
 
 
 @dataclass
 class Params:
-    size_mm: float = 250.0
-    base_mm: float = 4.04    # 0.2 + 32*0.12: the layer boundary nearest 4.0
+    size_mm: float = 216.0   # SIZES_MM[0]; the scaled params still read "@250mm"
+    base_mm: float = 4.04    # 0.2 + 16*0.24: the layer boundary nearest 4.0
     relief_mm: float | None = None
     exaggeration: float = 1.5
     margin_pct: float = 15.0
@@ -373,22 +703,32 @@ class Params:
     chin_mm: float | None = None  # extra frame height BELOW the square, for the caption
     res_mm: float = 0.4
     proud_mm: float | None = None
-    cap_mm: float = 0.96     # water cap slab thickness (8 layers); grey is a band, not a cap
-    plate_mm: float = 2.0    # relief plate base thickness (slot floor sits above 0)
+    cap_mm: float = 0.96     # water cap slab thickness (4 layers); grey is a band, not a cap
+    plate_mm: float = 2.12   # relief plate base thickness, 0.2 + 8*0.24 (slot floor sits above 0)
     fit_mm: float = 0.2      # gap per side between relief plate and frame ring
     snow_line_m: float = 2000.0   # grey band from this DEM elevation up
-    layer_mm: float = 0.12   # slicer layer height; terrain snaps to it (0 = don't snap)
+    layer_mm: float = 0.24   # slicer layer height; terrain snaps to it (0 = don't snap)
+    # ponytail: measured 0.06 m residual at Blackpool; a metres-based radius only if a print ever shows speckle
     smooth_px: float = 1.0   # DEM blur radius in pixels, kills sub-layer noise (0 = off)
+    snap_runways: bool = True  # app.py: replace FR24's field-jumping ends with a runway roll
+    takeoff_rwy: str = ""     # force one runway direction, e.g. "EGNH 10" (blank = auto)
+    landing_rwy: str = ""
 
 
 # Visual params: None means "auto" — base value at 250mm, scaled by size, floored so
 # it still prints. Everything else in Params is absolute (stiffness, FDM tolerance,
 # real-world metres, printer layer height) and must not move with the poster size.
-# frame_height_mm (9.96) and proud_mm (0.96) are whole 0.12 layer counts, so ring top
-# = base_mm + frame_height_mm = 14.00 and terrain + proud_mm both stay on the layer grid.
+# proud_mm (0.96) is 4 whole 0.24 layers; frame_height_mm's 9.96 base is not (41.5), so
+# resolve's _layers rounds it up to 10.08 at 250mm: ring top = base_mm + frame_height_mm
+# = 14.12, and terrain + proud_mm both stay on the layer grid.
 # {field: (base@250, floor)}
+# groove_w_mm's floor is 1.44, not 1.2, because what has to print is the STRIP, and the
+# strip is groove_w_mm - 2*clearance_mm wide: at the old floor that left 0.60mm, 1.4
+# extrusions at the 0.42mm line width, so a 16mm-tall fin came out as one wobbly bead
+# with no perimeter pair to brace it. 1.44 - 0.60 = 0.84mm is exactly 2 x 0.42, the
+# "pure perimeter, no gap fill" case docs/print-settings.md section 5 tunes the path for.
 _SCALED = {"frame_mm": (12.0, 4.0), "relief_mm": (20.0, 5.0), "frame_height_mm": (9.96, 3.0),
-           "text_mm": (8.0, 3.0), "groove_w_mm": (2.0, 1.2), "proud_mm": (0.96, 0.4)}
+           "text_mm": (8.0, 3.0), "groove_w_mm": (2.0, 1.44), "proud_mm": (0.96, 0.4)}
 
 
 def _layers(v, p, mul=1.0):
@@ -416,7 +756,7 @@ def resolve(p: Params) -> Params:
                       for k, (base, floor) in _SCALED.items() if getattr(p, k) is None})
     # Scaling lands z heights between layers: at 170mm frame_height_mm came out 6.77,
     # putting the ring top — the black/white colour boundary — 0.05mm above boundary
-    # 88, so which layer it printed on was the slicer's rounding to decide. Snap the
+    # 88 (of the old 0.12 grid), so which layer it printed on was the slicer's rounding to decide. Snap the
     # z-direction params here, once, and every height built on them (ring top, text
     # top, relief ceiling) is on the grid by construction. frame_mm, text_mm,
     # groove_w_mm and chin_mm are XY and are deliberately left alone.
@@ -471,15 +811,15 @@ def footprint_mm(p):
 
 
 def max_size_mm(p):
-    """Largest size_mm, in 0.1mm steps, whose footprint fits the plate with this caption.
+    """Largest size_mm, in 0.1mm steps, whose footprint fits USABLE_MM with this caption.
 
     Takes UNRESOLVED params: the chin follows text_mm and frame_mm, which follow
     size_mm, so shrinking the poster shrinks the chin too and the answer is not
-    simply PLATE_MM - chin_mm."""
+    simply USABLE_MM - chin_mm."""
     # ponytail: 0.1mm linear scan down from the asked-for size — ~50 resolve() calls
     # for the 250mm two-line case, microseconds. Bisect if a caller ever runs it hot.
-    s = min(p.size_mm, PLATE_MM)
-    while s > 0 and max(footprint_mm(resolve(replace(p, size_mm=s)))) > PLATE_MM:
+    s = min(p.size_mm, USABLE_MM)
+    while s > 0 and max(footprint_mm(resolve(replace(p, size_mm=s)))) > USABLE_MM:
         s = round(s - 0.1, 1)
     return s
 
@@ -553,8 +893,37 @@ def _stroke_mm(mask, res):
     return 2 * 32 * res
 
 
-def _dilation_px(mask, cap_px, res):
-    """Fine pixels one caption line must grow by: 1 for the mesher, plus MIN_STROKE_MM.
+def _topology(mask):
+    """(ink blobs, holes) of a glyph mask — what a dilation must not change.
+
+    Blobs are 4-connected, the mesher's own rule: two pixels touching only at a corner
+    share no full cell and print apart. Holes are then counted with an 8-connected
+    background, the only pairing under which a ring is one blob around one hole, and
+    via the Euler number (Gray's bit quads: E = blobs - holes, from 2x2 window counts)
+    rather than a second round of floods — PIL's floodfill is 4-connected only.
+    ponytail: one pure-PIL floodfill per blob, ~20 per line; scipy.ndimage.label if
+    /generate or the tests ever crawl."""
+    ys, xs = np.nonzero(mask)
+    if not len(ys):
+        return 0, 0
+    m = np.pad(mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1], 2)
+    q = m[:-1, :-1].astype(np.int8), m[:-1, 1:], m[1:, :-1], m[1:, 1:]
+    s = q[0] + q[1] + q[2] + q[3]
+    euler = ((s == 1).sum() - (s == 3).sum() + 2 * ((s == 2) & (q[0] == q[3])).sum()) // 4
+    # .copy(): a fromarray() image shares the numpy buffer and floodfill's writes
+    # never show up in the array read back — the fill silently does nothing
+    img = Image.fromarray(np.where(m, 255, 0).astype(np.uint8)).copy()
+    blobs = 0
+    while True:
+        ys, xs = np.nonzero(np.asarray(img) == 255)
+        if not len(ys):
+            return blobs, blobs - int(euler)
+        ImageDraw.floodfill(img, (int(xs[0]), int(ys[0])), 1)
+        blobs += 1
+
+
+def _dilation_px(render, res):
+    """Fine pixels one caption line grows by: 1 for the mesher, plus MIN_STROKE_MM.
 
     The 1px is structural — masked_slab_mesh only meshes cells with all four corners
     set, so a stroke survives only where every glyph pixel is cell-interior, and after
@@ -562,16 +931,24 @@ def _dilation_px(mask, cap_px, res):
     grid that costs 0.1mm of fattening, not the frame grid's 0.4mm. Every pixel past
     the first is bought stroke width.
 
-    Capped at a quarter of the cap height: a dilation wide enough to weld the counter
-    of an R or a B shut turns the letter into a blob, and slightly under the floor
-    prints better than that. The cap engaging is worth knowing about, so it says so."""
-    stroke = _stroke_mm(mask, res)
-    n = 1 + max(math.ceil((MIN_STROKE_MM - stroke) / 2 / res - 1e-9), 0)
-    cap = max(int(0.25 * cap_px), 1)
-    if n > cap:
-        print(f"text: {stroke:.2f}mm strokes want {n}px of dilation, capped at {cap}px "
-              f"({stroke + 2 * (cap - 1) * res:.2f}mm) to keep the counters open")
-        n = cap
+    render(n) is the line tracked by 2n. The stroke target is given up a pixel at a
+    time until the dilated line has the raw render's topology — no letter or i-dot
+    welded on, no counter shut — and every counter survives MIN_COUNTER_MM more growth.
+    Checked on the TRACKED render, so the letter gaps (paid for by tracking) never veto;
+    only the vertical gaps and counters do. n=1 is kept even if it changes something."""
+    raw = render(0)
+    stroke = _stroke_mm(raw, res)
+    want = 1 + max(math.ceil((MIN_STROKE_MM - stroke) / 2 / res - 1e-9), 0)
+    t0, guard = _topology(raw), math.ceil(MIN_COUNTER_MM / 2 / res - 1e-9)
+    for n in range(want, 0, -1):
+        m = render(n)
+        if _topology(_dilate(m, n)) == t0 and _topology(_dilate(m, n + guard))[1] == t0[1]:
+            break
+    else:
+        print(f"text: even the mesher's 1px leaves a counter or gap on this line under "
+              f"{MIN_COUNTER_MM}mm, or changes its topology {t0}")
+    if n < want:
+        print(f"text: {stroke:.2f}mm strokes want {want}px, {n}px keeps every counter and gap open")
     return n
 
 
@@ -593,21 +970,29 @@ def _line_mask(shape, s, font, extra, top):
 
     The cost of drawing glyph by glyph is kerning: per-character advances only, so
     pairs like "VA" sit a shade loose. Loose is the direction this whole function is
-    pushing anyway. `top` is the em-box top, as ImageDraw.text takes it."""
-    xs, x, l, r = [], 0.0, math.inf, -math.inf
+    pushing anyway. `top` is the em-box top, as ImageDraw.text takes it.
+
+    Each glyph comes from _glyph_font, so a character the face lacks ("→" in
+    Trebuchet) is drawn from a fallback face — on the line's baseline, not at `top`:
+    two faces' ascenders differ (Trebuchet 0.95em, Arial 0.91em), and an em-box-top
+    anchor would set the borrowed glyph ~0.4mm high."""
+    xs, fs, x, l, r = [], [], 0.0, math.inf, -math.inf
     for ch in s:
-        b = font.getbbox(ch)
+        f = _glyph_font(font, ch)
+        b = f.getbbox(ch)
         if b[2] > b[0]:                       # ink-bearing: a space moves no bbox
             l, r = min(l, x + b[0]), max(r, x + b[2])
         xs.append(x)
-        x += font.getlength(ch) + extra
+        fs.append(f)
+        x += f.getlength(ch) + extra
     if r < l:
         return np.zeros(shape, bool), 0.0
     img = Image.new("L", (shape[1], shape[0]))
     d = ImageDraw.Draw(img)
     x0 = (shape[1] - 1 - (r - l)) / 2 - l     # centred on the tracked ink, not the em
-    for ch, x in zip(s, xs):
-        d.text((x0 + x, top), ch, fill=255, font=font)
+    base = top + font.getmetrics()[0]         # "la" anchors the em top at ascent above it
+    for ch, x, f in zip(s, xs, fs):
+        d.text((x0 + x, base), ch, fill=255, font=f, anchor="ls")
     return np.asarray(img) > 0, r - l
 
 
@@ -660,7 +1045,7 @@ def _text_mask(H, N, fpx, chin_px, p):
         # walks off the bar. n is not re-measured after that shrink: tracking and
         # dilation must stay the same number, and a hair under MIN_STROKE_MM beats a
         # line whose letters touch.
-        n = _dilation_px(_line_mask((Hf, W), s, font, 0, y - ink[1])[0], h, res)
+        n = _dilation_px(lambda k: _line_mask((Hf, W), s, font, 2 * k, y - ink[1])[0], res)
         glyphs, w = _line_mask((Hf, W), s, font, 2 * n, y - ink[1])
         if w > avail:
             font = _font(max(int(font.size * avail / w), 6))
@@ -681,10 +1066,11 @@ def compose_parts(track, elev, lc, bounds, p):
     rows extends the poster southward); the opening keeps its indices.
     text_mask / text_res: the glyph pixels on their own TEXT_SUB-times finer grid,
     printed as their own white body on top of the ring (empty when no text).
-    green/surface/water/snow/snow_cells/z_snow/track_px: the (M,M) relief plate that
-    drops into the ring, its pre-slot pre-cap top, the water and grey vertex masks,
+    green/surface/water/roads/snow/snow_cells/z_snow/track_px: the (M,M) relief plate
+    that drops into the ring, its pre-slot pre-cap top, the water, road and grey vertex masks,
     the grey band's meshed cells and the horizontal plane it starts from, and the
-    track in relief-plate pixels.
+    track in relief-plate pixels. water_cells/road_cells/cap_top/cap_bot: the caps'
+    meshed cells and the vertex surfaces they span (draped to the slot floor in the groove).
     alt_mm: flight altitude per original track point, on the same vertical scale
     as `surface`, for the path wall."""
     N, M, fpx, chin_px = _grid(p)
@@ -695,7 +1081,13 @@ def compose_parts(track, elev, lc, bounds, p):
     frame[ring] = p.base_mm + p.frame_height_mm
     text_mask, text_res = _text_mask(H, N, fpx, chin_px, p)
     e0, e1 = float(elev.min()), float(elev.max())
-    to_mm = lambda m: p.plate_mm + (m - e0) / max(e1 - e0, 1e-9) * p.relief_mm * p.exaggeration
+    # Terrain range alone stretched 30m of Blackpool coast over the whole relief
+    # (0.86mm/m): flat land read as hills and the 335m circuit hit the strip ceiling
+    # as a flat fence. Spanning the flight too (clipped, so an airliner cannot flatten
+    # the Alps and a low hop over a polder still shows ground) gives 0.077mm/m there;
+    # in the mountains the terrain range wins and nothing changes.
+    span = max(e1 - e0, float(np.clip(np.asarray(track, float)[:, 2].max() - e0, *FLIGHT_SPAN_M)))
+    to_mm = lambda m: p.plate_mm + (m - e0) / span * p.relief_mm * p.exaggeration
     # Snap the terrain to whole slicer layers, before the caps and the slot are cut,
     # so those keep their exact offsets. Sub-layer DEM wobble otherwise slices into
     # scattered single-layer islands all over the flat ground.
@@ -707,8 +1099,8 @@ def compose_parts(track, elev, lc, bounds, p):
     track_px = np.stack([(xy[:, 0] - x0) / (x1 - x0) * M,
                          (y1 - xy[:, 1]) / (y1 - y0) * M], 1)
     gmask = _groove_mask(track_px, (M, M), p)
-    # Both stay off the groove — the strip goes there. The outer vertex ring is a
-    # water-only exclusion: a conformal cap is a thin slab floating at `surface - cap_mm`,
+    # The outer vertex ring is a
+    # cap-only exclusion: a conformal cap is a thin slab floating at `surface - cap_mm`,
     # and on the boundary ring it has nothing under it, so its wall hangs off the plate
     # edge. The band is not a slab, it is a solid from the flat z_snow plane up to the
     # surface, resting on the green below it — it cannot overhang, and a boundary cell's
@@ -718,8 +1110,17 @@ def compose_parts(track, elev, lc, bounds, p):
     # plane on HB-EZE), which is 123 of the 266 layers holding two colours.
     border = np.zeros((M, M), bool)
     border[1:-1, 1:-1] = True
-    water = (lc == 1) & ~gmask & border
-    snow = (lc == 2) & ~gmask
+    # Water and road caps are NOT kept off the groove: they drape into it, cap_top
+    # dropping to the slot floor, so the slot's walls and floor take the cap colour.
+    # Kept off, 0.3mm clearance plus up to 0.4mm of full-height green rim showed on
+    # each side of the strip along the whole path, even over the sea. The strip still
+    # seats on SLOT_FLOOR_MM, now on the cap's top; the cap there is SLOT_CAP_MM thick.
+    water = (lc == 1) & border
+    roads = (lc == 3) & border
+    snow = (lc == 2) & ~gmask              # the band stays out, as before
+    cap_top = np.where(gmask, SLOT_FLOOR_MM, surface)
+    cap_bot = np.where(gmask, SLOT_FLOOR_MM - SLOT_CAP_MM, surface - p.cap_mm)
+    water_cells, road_cells = _slab_cells(water), _slab_cells(roads)
     # Grey is a BAND, not a cap: the terrain solid is split at the horizontal plane
     # z_snow (the snow line on the relief's own scale, on a layer boundary), green
     # below it and grey above. A conformal cap surfaced as a `cap_mm / slope` stripe
@@ -731,12 +1132,18 @@ def compose_parts(track, elev, lc, bounds, p):
     # meshes, or the green top drops to z_snow along a rim the grey does not cover
     # and the assembled surface gains a gash.
     snow_cells = _slab_cells(snow & (surface > z_snow))
-    green = surface - p.cap_mm * water
+    green = surface.copy()
+    # carved only under cells the mesher really meshes: a vertex-mask carve left orphan
+    # pits along every edge a cap's four-corner cell rule drops (a 4px road loses one)
+    cv = _cell_verts(water_cells | road_cells)
+    green[cv] = cap_bot[cv]
     green[_cell_verts(snow_cells)] = z_snow
-    green[gmask] = SLOT_FLOOR_MM        # full-depth slot, constant floor
+    green[gmask & ~cv] = SLOT_FLOOR_MM  # full-depth slot, constant floor
     return dict(frame=frame, text_mask=text_mask, text_res=text_res,
-                green=green, surface=surface,
-                water=water, snow=snow, snow_cells=snow_cells, z_snow=z_snow,
+                green=green, surface=surface, water=water, roads=roads,
+                water_cells=water_cells, road_cells=road_cells,
+                cap_top=cap_top, cap_bot=cap_bot,
+                snow=snow, snow_cells=snow_cells, z_snow=z_snow,
                 track_px=track_px, alt_mm=alt_mm)
 
 
@@ -864,7 +1271,7 @@ def strip_mesh(track_px, alt_mm, surface, p):
     takes over and the wall rides terrain + proud_mm — it never sinks into the relief.
 
     The wall is capped at the relief's own ceiling (a full-scale peak plus proud_mm):
-    an airliner at 12000m over 500m terrain maps to a 722mm wall, which is not a
+    an airliner at 12000m over 500m terrain maps to a 362mm wall, which is not a
     poster. Above the ceiling the flight simply rides a level line over the highest
     ground the relief can show."""
     C, nrm, d, t = _offsets(track_px)  # same centerline _groove_mask() carved the slot from
@@ -906,9 +1313,9 @@ def strip_mesh(track_px, alt_mm, surface, p):
 
 
 def build_poster(track, p=Params()):
-    """Track -> (frame_bodies, relief_bodies, path_strip_stl).
+    """Track -> (frame_bodies, relief_bodies, strip_bodies).
 
-    Both body lists are [(mesh, name, hex_colour, extruder_slot), ...] for write_3mf."""
+    All three are [(mesh, name, hex_colour, extruder_slot), ...] for write_3mf."""
     p0, p = p, resolve(p)   # auto (None) visual params -> concrete mm; all mm below
     # ponytail: reject rather than clamp — a typo'd 2500mm is a mistake to surface,
     # not to silently honour, and N^2 grids OOM the box. Raise the cap if a bigger
@@ -919,20 +1326,31 @@ def build_poster(track, p=Params()):
     # wide, so the height is what overflows first and only check_output.py used to say
     # so — after the 20 minutes of meshing that produced an unprintable file.
     w, h = footprint_mm(p)
-    if max(w, h) > PLATE_MM:
+    if max(w, h) > USABLE_MM:
         alt = {1: ", or drop the caption",
                2: ", or use one caption line"}.get(len(_lines(p)), "")
-        raise ValueError(f"frame would be {w:.1f} x {h:.1f}mm — over the {PLATE_MM:.0f}mm "
-                         f"plate. Reduce poster size to <={max_size_mm(p0):g}mm{alt}.")
+        raise ValueError(f"frame would be {w:.1f} x {h:.1f}mm — over the {USABLE_MM:.0f}mm "
+                         f"printable budget ({PLATE_MM:.0f}mm plate less {BRIM_MM:.0f}mm brim "
+                         f"per side and {TOWER_MM:.0f}mm for the prime tower). Reduce poster "
+                         f"size to <={max_size_mm(p0):g}mm{alt}.")
     for label, v in (("slot floor", SLOT_FLOOR_MM), ("water cap", p.cap_mm)):
         if p.plate_mm <= v:   # slot floor above the plate top / caps push terrain negative
             raise ValueError(f"{label} ({v}mm) must be less than the relief plate "
                              f"thickness ({p.plate_mm}mm)")
     bounds = track_bounds(track, p.margin_pct)
     M = _grid(p)[1]
+    elev = fetch_elevation(bounds, M)
+    # No soft-fail: a poster without its coast keeps the seabed in the DEM and prints
+    # different relief from the same order, so Overpass being down is a 502.
+    water, sea, roads = fetch_osm_masks(bounds, M, p.res_mm)
+    # the sea is flat; terrarium carries bathymetry (Blackpool: -7.85 m seabed,
+    # 45% of the grid). np.where, not in place: fetch_elevation's array is read-only
+    elev = np.where(sea, 0.0, elev)
+    water = water | sea
     # smoothed once here and shared: the snow threshold and the relief surface must
-    # see the same terrain, and blurring twice would wash the mountains out
-    elev = _smooth(fetch_elevation(bounds, M), p.smooth_px)
+    # see the same terrain, and blurring twice would wash the mountains out. After the
+    # sea flatten, so the shore blends land with 0, not with the seabed.
+    elev = _smooth(elev, p.smooth_px)
     lc = np.zeros((M, M), np.uint8)
     # Bare threshold, no morphology: grey is a BAND, so every bit of ground above the
     # snow line is a solid volume that prints fine, however small its footprint. An
@@ -940,17 +1358,16 @@ def build_poster(track, p=Params()):
     # from grey while leaving them in green — green then towered above the z_snow
     # plane and the two colours shared layers. Sub-2-cell blobs still go: _slab_cells.
     lc[elev >= p.snow_line_m] = 2
-    try:   # water last: high Alpine lakes sit above the snow line and stay blue
-        lc[fetch_water_mask(bounds, M)] = 1
-    except Exception as e:
-        print(f"water: Overpass unavailable ({e}) — poster without water")
+    lc[water] = 1   # high Alpine lakes sit above the snow line and stay blue
+    lc[roads & (lc != 2)] = 3   # after water, so a bridge is grey across the river; never over snow
     parts = compose_parts(track, elev, lc, bounds, p)
     bodies = [(heightmap_mesh(parts["green"], p.res_mm), "terrain", COLORS["green"], 1)]
-    # water stays a conformal cap (lakes are flat, so its slices are lake-wide anyway);
-    # grey is a band standing on the z_snow plane, which green's top is clamped to
-    for name, slot, m in (("water", 2, masked_slab_mesh(parts["water"], parts["surface"],
-                                                        p.cap_mm, p.res_mm)),
-                          ("snow", 3, band_mesh(parts, p))):
+    # water and roads stay conformal caps (lakes are flat, so their slices are lake-wide
+    # anyway) draped into the slot; grey is a band standing on the z_snow plane
+    cap = lambda k: _slab_mesh(parts[k], parts["cap_top"], parts["cap_bot"], p.res_mm)
+    for name, slot, m in (("water", 2, cap("water_cells")),
+                          ("snow", 3, band_mesh(parts, p)),
+                          ("roads", 3, cap("road_cells"))):
         if m is not None:
             bodies.append((m, name, COLORS[name], slot))
     ring_top = p.base_mm + p.frame_height_mm
@@ -965,11 +1382,102 @@ def build_poster(track, p=Params()):
     if text is not None:
         frame_bodies.append((text, "text", COLORS["text"], 2))
     strip = strip_mesh(parts["track_px"], parts["alt_mm"], parts["surface"], p)
-    return frame_bodies, bodies, strip.export(file_type="stl")
+    return frame_bodies, bodies, [(strip, "strip", COLORS["strip"], 1)]
 
 
-def write_3mf(bodies):
-    """[(mesh, name, "#RRGGBB", extruder_slot), ...] -> 3MF zip bytes.
+# Every output is a finished OrcaSlicer 2.3.2 project for the Bambu Lab A1, 0.4 nozzle:
+# open, slice, print. Orca fills a project's config from compiled defaults and applies
+# it as "(modified)" edits over the preset print_settings_id names, so a partial config
+# would blank machine_start_gcode and every key it left out. The whole flattened system
+# chain is therefore vendored (orca_profile.py -> orca_a1_pla.json) and these tables go
+# on top. They are the truth; docs/print-settings.md is the why. All values are strings,
+# as Orca writes them; filament lists carry one entry per slot.
+_ORCA = json.loads(Path(__file__).with_name("orca_a1_pla.json").read_text())
+FILAMENT, PRINTER, PROCESS = "Bambu PLA Basic @BBL A1", "Bambu Lab A1 0.4 nozzle", "0.24mm Draft @BBL A1"
+# Tower centred in x at the front of the bed: y BRIM_MM..~11, its brim 0..16 (TOWER_MM),
+# TOWER_GAP_MM clear, then the object's brim. write_3mf centres the object in what is
+# left. Sliced at 0.24 (216 order): the frame's tower is 6.75mm deep, Orca's height-based
+# stability minimum (at 0.12 a 180 tower sliced the same), so widening buys nothing. Its
+# brim reaches y 16.8, 3.6mm short of the frame's own brim.
+TOWER_W_MM = 130
+TOWER_X = (PLATE_MM - TOWER_W_MM) / 2   # 63
+COMMON = {
+    "precise_z_height": "0", "slice_closing_radius": "0.01", "wall_generator": "arachne",
+    "detect_thin_wall": "1", "wall_sequence": "inner-outer-inner wall",
+    "staggered_inner_seams": "1", "seam_slope_type": "none", "enable_arc_fitting": "0",
+    "precise_outer_wall": "1", "reduce_crossing_wall": "1", "reduce_infill_retraction": "0",
+    "timelapse_type": "0", "xy_hole_compensation": "0", "xy_contour_compensation": "0",
+    "line_width": "0.42", "initial_layer_line_width": "0.5", "outer_wall_line_width": "0.4",
+    "inner_wall_line_width": "0.45", "top_surface_line_width": "0.4",
+    "internal_solid_infill_line_width": "0.45", "sparse_infill_line_width": "0.45",
+    "top_shell_thickness": "0", "bottom_shell_thickness": "0",
+    "top_surface_pattern": "monotonicline", "sparse_infill_pattern": "grid",
+    "infill_wall_overlap": "25%", "infill_combination": "0",
+    "detect_narrow_internal_solid_infill": "1", "only_one_wall_top": "1",
+    "enable_prime_tower": "1", "prime_tower_width": str(TOWER_W_MM),
+    "prime_tower_brim_width": "5", "prime_volume": "45",
+    "flush_into_infill": "0", "flush_into_objects": "0", "flush_into_support": "1",
+    "interface_shells": "0", "mmu_segmented_region_max_width": "0",
+    "brim_type": "outer_only", "brim_object_gap": "0", "enable_support": "0",
+    "initial_layer_speed": "50"}
+PLATES = {
+    # 0.24 layers, walls 2, top 3: the user's print-time cut (docs/print-settings.md head)
+    "relief": {"wall_loops": "2", "top_shell_layers": "3", "bottom_shell_layers": "3",
+               "sparse_infill_density": "10%", "ironing_type": "no ironing", "brim_width": "5",
+               "mmu_segmented_region_interlocking_depth": "0.72",
+               "flush_volumes_matrix": ["0", "400", "550", "350", "0", "600", "250", "300", "0"]},
+    # no ironing (it was over half the frame's print time), top 3 x 0.24 = the old 6 x 0.12
+    "frame": {"wall_loops": "2", "top_shell_layers": "3", "bottom_shell_layers": "3",
+              "sparse_infill_density": "7%", "ironing_type": "no ironing",
+              "seam_position": "nearest", "brim_width": "5",
+              "wall_transition_filter_deviation": "50%", "min_feature_size": "10%",
+              "outer_wall_acceleration": "1000", "outer_wall_jerk": "5",
+              "small_perimeter_speed": "50%", "small_perimeter_threshold": "3",
+              "resolution": "0.008", "nozzle_temperature": ["220", "210"],
+              "fan_min_speed": ["60", "100"], "fan_max_speed": ["80", "100"],
+              "slow_down_layer_time": ["8", "8"], "flush_volumes_matrix": ["0", "999", "150", "0"]},
+    # a 28 x 1.1mm fin on the A1's slinging bed: slow walls, capped acceleration
+    "path": {"wall_loops": "2", "sparse_infill_density": "0%", "top_shell_layers": "2",
+             "bottom_shell_layers": "2", "ironing_type": "no ironing", "brim_width": "8",
+             "outer_wall_speed": "50", "inner_wall_speed": "80",
+             "outer_wall_acceleration": "1000", "flush_volumes_matrix": ["0"]}}
+# Per part, on top of the plate: the caption's 1.07-1.33mm strokes as 3 walls at 0.40.
+PART_OVERRIDES = {"text": {
+    "wall_loops": "3", "outer_wall_line_width": "0.4", "inner_wall_line_width": "0.4",
+    "top_surface_line_width": "0.4", "internal_solid_infill_line_width": "0.4",
+    "sparse_infill_line_width": "0.4", "wall_sequence": "inner wall/outer wall",
+    "ironing_type": "no ironing", "top_shell_layers": "3", "bottom_shell_layers": "1",
+    "only_one_wall_top": "0", "sparse_infill_density": "100%", "outer_wall_speed": "50",
+    "inner_wall_speed": "80", "top_surface_speed": "40"}}
+# AMS slot order per plate, fixed: relief.3mf always declares three filaments, even
+# when a dry lowland poster only uses slot 1 (or 1 and 3), so the slots never shift.
+SLOTS = {"relief": ("green", "water", "snow"), "frame": ("frame", "text"), "path": ("strip",)}
+
+
+def _project_settings(plate):
+    """Metadata/project_settings.config for one plate, as a dict."""
+    colours = [COLORS[k] for k in SLOTS[plate]]
+    n = len(colours)
+    cfg = {**_ORCA["machine"], **_ORCA["process"],
+           **{k: v * n if isinstance(v, list) and len(v) == 1 else v
+              for k, v in _ORCA["filament"].items()}}
+    cfg.update(version="2.3.2", **{"from": "project"}, name="project_settings",
+               printer_settings_id=PRINTER, print_settings_id=PROCESS,
+               print_compatible_printers=[PRINTER], filament_settings_id=[FILAMENT] * n,
+               filament_ids=["GFA00"] * n, curr_bed_type="Textured PEI Plate",
+               filament_colour=colours, filament_multi_colour=colours,
+               filament_colour_type=["1"] * n, default_filament_colour=[""] * n,
+               filament_map=["1"] * n, filament_map_mode="Auto For Flush",
+               flush_volumes_vector=["140"] * 2 * n, flush_multiplier=["1"],
+               wipe_tower_rotation_angle="0", wipe_tower_x=[f"{TOWER_X:g}"],
+               wipe_tower_y=[f"{BRIM_MM:g}"])
+    cfg.update(COMMON)
+    cfg.update(PLATES[plate])
+    return cfg
+
+
+def write_3mf(bodies, plate=None):
+    """[(mesh, name, "#RRGGBB", extruder_slot), ...] -> OrcaSlicer project 3MF bytes.
 
     ONE build item: the bodies are components of a single container object, the
     standard 3MF/Bambu multi-part form. One <item> per body made Bambu Studio treat
@@ -978,9 +1486,22 @@ def write_3mf(bodies):
     Per-body <basematerials> stay for the display colour in non-Bambu viewers;
     the filament slots live in Bambu's Metadata/model_settings.config, per <part>
     (the old object-level extruder key left the slots unassigned). Written by hand:
-    trimesh's 3MF support is export-only via lib3mf and carries neither."""
+    trimesh's 3MF support is export-only via lib3mf and carries neither.
+
+    `plate` picks the print settings (PLATES); by default it follows the first body.
+    The bodies keep their local frame — check_output.py measures raw vertices — and
+    the item alone carries the bed placement: centred in x, centred in y in the space
+    behind the prime tower, dropped onto the bed (the strip's own floor is at 1.16)."""
     import zipfile
+    plate = plate or {"frame": "frame", "strip": "path"}.get(bodies[0][1], "relief")
+    cfg = _project_settings(plate)
+    assert max(b[3] for b in bodies) <= len(cfg["filament_colour"]), "slot without a filament"
     assert len(bodies) < 100, "basematerials ids are oid+100 — they'd collide"
+    lo = np.min([m.bounds[0] for m, *_ in bodies], 0)
+    hi = np.max([m.bounds[1] for m, *_ in bodies], 0)
+    tx = PLATE_MM / 2 - (lo[0] + hi[0]) / 2
+    ty = (PLATE_MM + TOWER_MM + TOWER_GAP_MM) / 2 - (lo[1] + hi[1]) / 2   # 138 - h/2
+    tz = 0.0 - lo[2]   # not -lo[2]: that writes "-0.0000" for a body already on the bed
     # ponytail: f-string per vertex/triangle — ~2M lines and a few seconds at default
     # res. Swap in np.savetxt or a binary extension only if generation time hurts.
     objs, comps, parts = [], [], []
@@ -993,21 +1514,28 @@ def write_3mf(bodies):
             f'<mesh><vertices>{vs}</vertices><triangles>{ts}</triangles></mesh></object>')
         # identity transform: the bodies are already meshed in one shared world frame
         comps.append(f'<component objectid="{oid}" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>')
+        over = "".join(f'<metadata key="{k}" value="{v}"/>'
+                       for k, v in PART_OVERRIDES.get(name, {}).items())
         parts.append(f'<part id="{oid}" subtype="normal_part">'
                      f'<metadata key="name" value="{name}"/>'
-                     f'<metadata key="extruder" value="{slot}"/></part>')
+                     f'<metadata key="extruder" value="{slot}"/>{over}</part>')
     cid = len(bodies) + 1
-    top = bodies[0][1] if bodies else "model"
+    top = bodies[0][1]
     objs.append(f'<object id="{cid}" name="{top}" type="model">'
                 f'<components>{"".join(comps)}</components></object>')
-    cfg = ('<?xml version="1.0" encoding="UTF-8"?>\n<config>\n'
-           f'<object id="{cid}"><metadata key="name" value="{top}"/>{"".join(parts)}</object>\n'
-           '</config>')
+    settings = ('<?xml version="1.0" encoding="UTF-8"?>\n<config>\n'
+                f'<object id="{cid}"><metadata key="name" value="{top}"/>'
+                f'<metadata key="flush_into_objects" value="0"/>{"".join(parts)}</object>\n'
+                '</config>')
     model = ('<?xml version="1.0" encoding="UTF-8"?>'
              '<model unit="millimeter" xml:lang="en-US" '
-             'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
+             'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" '
+             'xmlns:BambuStudio="http://schemas.bambulab.com/package/2021">'
+             '<metadata name="Application">BambuStudio-2.3.2</metadata>'
+             '<metadata name="BambuStudio:3mfVersion">1</metadata>'
              f'<resources>{"".join(objs)}</resources>'
-             f'<build><item objectid="{cid}" printable="1"/></build></model>')
+             f'<build><item objectid="{cid}" transform="1 0 0 0 1 0 0 0 1 '
+             f'{tx:.4f} {ty:.4f} {tz:.4f}" printable="1"/></build></model>')
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("[Content_Types].xml",
@@ -1022,7 +1550,8 @@ def write_3mf(bodies):
             '<Relationship Target="/3D/3dmodel.model" Id="rel-1" '
             'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>')
         z.writestr("3D/3dmodel.model", model)
-        z.writestr("Metadata/model_settings.config", cfg)
+        z.writestr("Metadata/model_settings.config", settings)
+        z.writestr("Metadata/project_settings.config", json.dumps(cfg, indent=1))
     return buf.getvalue()
 
 

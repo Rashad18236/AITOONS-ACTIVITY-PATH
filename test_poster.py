@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -9,6 +10,14 @@ import pytest
 from PIL import Image, ImageDraw
 
 import poster
+
+
+@pytest.fixture(autouse=True)
+def _fresh_overpass_cache():
+    """_overpass caches per query string, and the tests reuse one bbox with different
+    fake responses — without this the second test reads the first one's elements."""
+    poster._overpass.cache_clear()
+
 
 KML = """<?xml version="1.0"?><kml xmlns:gx="http://www.google.com/kml/ext/2.2">
 <gx:coord>8.55 47.46 430</gx:coord>
@@ -113,10 +122,10 @@ def test_resolve_at_250_is_the_legacy_defaults():
     p = poster.resolve(poster.Params(size_mm=250))
     assert p.frame_mm == 12.0
     assert p.relief_mm == 20.0
-    assert p.frame_height_mm == 9.96     # was 10.0: whole 0.12 layers, ring top 14.00
+    assert p.frame_height_mm == 10.08    # 9.96 up to 42 whole 0.24 layers, ring top 14.12
     assert p.text_mm == 8.0
     assert p.groove_w_mm == 2.0
-    assert p.proud_mm == 0.96            # was 1.0: 8 layers of 0.12
+    assert p.proud_mm == 0.96            # was 1.0: 4 layers of 0.24
     assert p.chin_mm == 0.0              # no caption -> the frame stays square
 
 
@@ -124,14 +133,14 @@ def test_resolve_scales_and_floors_at_80mm():
     p = poster.resolve(poster.Params(size_mm=80))
     assert p.frame_mm == 4.0            # 3.84 -> floor
     assert p.relief_mm == 6.4           # 20 * 80/250, above its 5.0 floor
-    assert p.frame_height_mm == 3.24    # 9.96 * 80/250 = 3.19, up to 27 whole layers
+    assert p.frame_height_mm == 3.36    # 9.96 * 80/250 = 3.19, up to 14 whole layers
     assert p.text_mm == 3.0             # 2.56 -> floor
-    assert p.groove_w_mm == 1.2         # 0.64 -> floor
-    assert p.proud_mm == 0.48           # 0.31 -> 0.4 floor, up to 4 whole layers
+    assert p.groove_w_mm == 1.44        # 0.64 -> floor (2 x 0.42 of strip core)
+    assert p.proud_mm == 0.48           # 0.31 -> 0.4 floor, up to 2 whole layers
     # absolute params are untouched by size (printer properties, not visual scale)
     assert (p.base_mm, p.plate_mm, p.cap_mm, p.clearance_mm, p.fit_mm, p.res_mm,
-            p.snow_line_m, p.layer_mm, p.smooth_px) == (4.04, 2.0, 0.96, 0.30, 0.2, 0.4,
-                                                        2000.0, 0.12, 1.0)
+            p.snow_line_m, p.layer_mm, p.smooth_px) == (4.04, 2.12, 0.96, 0.30, 0.2, 0.4,
+                                                        2000.0, 0.24, 1.0)
 
 
 def test_resolve_snaps_z_heights_to_the_layer_grid():
@@ -142,7 +151,7 @@ def test_resolve_snaps_z_heights_to_the_layer_grid():
     colour boundary lands on was then decided by the slicer's rounding, not by us.
     In-plane params (frame_mm, text_mm, groove_w_mm, chin_mm) must NOT be snapped:
     the layer grid is a z grid and means nothing in xy."""
-    # 10 layers: white PLA over black only stops reading warm-grey at ~1.0mm
+    # 5 layers: white PLA over black only stops reading warm-grey at ~1.0mm
     assert poster.TEXT_EMBOSS_MM == 1.2
     for size in (250, 200, 170, 120):
         p = poster.resolve(poster.Params(size_mm=size, text="ZURICH", text2="HB-EZE"))
@@ -153,9 +162,23 @@ def test_resolve_snaps_z_heights_to_the_layer_grid():
                           p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm)):
             off = abs(z - poster._snap(z, p))
             assert off < 1e-9, f"{size}mm {label} {z:.4f}mm is {off:.4f}mm off the grid"
-        # xy is not snapped — a frame width forced onto 0.12mm steps would be nonsense
+        # xy is not snapped — a frame width forced onto 0.24mm steps would be nonsense
         assert p.frame_mm == max(4.0, round(12.0 * size / 250, 2))
         assert p.text_mm == max(3.0, round(8.0 * size / 250, 2))
+
+
+def test_fixed_constants_sit_on_the_default_layer_grid():
+    """The literals that are not resolve()d — slot floor, the green under a slot cap,
+    base and plate — must be absolute layer boundaries (0.2 + n*layer), and the slab
+    thicknesses stacked on them whole layers, or a layer_mm change silently leaves
+    them between layers. They are literals on purpose; this is what pins them."""
+    p = poster.resolve(poster.Params())
+    for v in (poster.SLOT_FLOOR_MM, poster.SLOT_FLOOR_MM - poster.SLOT_CAP_MM,
+              p.base_mm, p.plate_mm):
+        assert abs(v - poster._snap(v, p)) < 1e-6, v
+    for v in (p.cap_mm, poster.SLOT_CAP_MM, poster.TEXT_EMBOSS_MM):
+        n = v / p.layer_mm
+        assert abs(n - round(n)) < 1e-6, v
 
 
 def test_resolve_passes_explicit_values_through_and_is_idempotent():
@@ -257,10 +280,11 @@ def test_compose_parts_shapes_and_caps():
     # grey is a band: green stops at the flat z_snow plane, however high the ground is
     assert abs(parts["green"][35, 35] - parts["z_snow"]) < 1e-9
     assert parts["surface"][35, 35] - parts["z_snow"] > p.cap_mm      # a body, not a skin
-    # groove cells are never cap cells — a cap slab there would fight the strip
+    # groove cells are never band cells; water caps drape into the slot instead
     gmask = poster._groove_mask(parts["track_px"], (M, M), p)
     assert gmask[30:40, 30:40].any()      # the groove really does cross the snow square
-    assert not (w | c)[gmask].any()
+    assert not c[gmask].any()
+    assert (parts["cap_top"][gmask] == poster.SLOT_FLOOR_MM).all()
     # so outside the slot and the band every cell drops by at most cap_mm
     band = poster._cell_verts(parts["snow_cells"])
     drop = (parts["surface"] - parts["green"])[~gmask & ~band]
@@ -471,24 +495,25 @@ def _split_lines(tm):
     return tm[:split], tm[split:]
 
 
-def test_caption_strokes_clear_the_printable_stroke_floor():
-    """A 0.4mm nozzle cannot hold a stroke under ~0.8mm (1.0mm recommended): at
-    1.5-2.2 extrusion widths a glyph is pure perimeter, and Arachne flips between one
-    and two beads along the stroke, nicking one edge and blobbing the other
-    (docs/print-settings.md). The rendered strokes were 0.6-0.9mm, so the mask is
-    dilated until the measured stroke clears MIN_STROKE_MM — per line, because line 2
-    is the smaller face and needs the most."""
+def test_caption_strokes_clear_the_printable_stroke_floor(capsys):
+    """A 0.4mm nozzle cannot hold a stroke under ~0.8mm (0.84 target, two 0.42
+    extrusions): at 1.5-2.2 extrusion widths a glyph is pure perimeter, and Arachne
+    flips between one and two beads along the stroke, nicking one edge and blobbing
+    the other (docs/print-settings.md). The rendered strokes were 0.6-0.9mm, so the
+    mask is dilated toward MIN_STROKE_MM — per line, because line 2 is the smaller
+    face and needs the most — unless that would shut a counter, which it says."""
     p, N, fpx, elev, track, bounds = _synthetic()
     q = _params(text="ZURICH", text2="HB-EZE", text_mm=6.0)
     parts = poster.compose_parts(track, elev, np.zeros((_mpx(q), _mpx(q)), np.uint8),
                                  bounds, q)
     tm, res = parts["text_mask"], parts["text_res"]
+    floor = 0.6 if "keeps" in capsys.readouterr().out else poster.MIN_STROKE_MM
     for label, band in zip(("line 1", "line 2"), _split_lines(tm)):
         stroke = poster._stroke_mm(band, res)
-        assert stroke >= poster.MIN_STROKE_MM - 1e-9, f"{label}: {stroke:.2f}mm strokes"
+        assert stroke >= floor - 1e-9, f"{label}: {stroke:.2f}mm strokes"
     # ...and the counters survived. A dilation that welds the hole in an R or a B
     # shut turns the bowl into a blob, which is worse than a thin stroke — hence the
-    # cap on total dilation. R and the two B counters must still be open.
+    # topology guard. R and the two B counters must still be open.
     assert _counter_mm2(tm, res) > 1.0, "the dilation closed the letter counters"
 
 
@@ -504,18 +529,23 @@ def _counter_mm2(mask, res):
     return int((np.array(img) == 0).sum()) * res ** 2
 
 
-def _blobs(mask):
-    """Number of 4-connected ink blobs. floodfill each one out until no ink is left.
-
-    PIL's floodfill rather than a hand-rolled BFS: it is already imported here, it is
-    4-connected, and it is the same flood in C. .copy() for the same reason as above."""
-    img = Image.fromarray(np.where(mask, 255, 0).astype(np.uint8)).copy()
-    for n in range(10000):
-        ys, xs = np.nonzero(np.array(img) == 255)
-        if not len(ys):
-            return n
-        ImageDraw.floodfill(img, (int(xs[0]), int(ys[0])), 1)
-    raise AssertionError("10000 blobs — that is not a caption")
+def test_the_caption_keeps_its_counters_and_dots(monkeypatch):
+    """Arial Bold at 7mm caps sets the g's ear, the t's hook and the i-dot under 0.2mm
+    from their stems, and its 1.33mm dilation welded all three: (17 blobs, 3 holes) in,
+    (17, 6) out on "First Solo Flight". The dilated line must have exactly the raw
+    render's topology — no dot welded on, no counter shut, no new hole pinched off."""
+    raws = []
+    real = poster._dilation_px
+    monkeypatch.setattr(poster, "_dilation_px",
+                        lambda render, res: raws.append(render(0)) or real(render, res))
+    for size in (216.0, 170.0):
+        raws.clear()
+        p = poster.resolve(poster.Params(size_mm=size, text="First Solo Flight",
+                                         text2="11th October 2026"))
+        N, _, fpx, chin_px = poster._grid(p)
+        tm, _ = poster._text_mask(N + chin_px, N, fpx, chin_px, p)
+        for raw, band in zip(raws, _split_lines(tm)):
+            assert poster._topology(band) == poster._topology(raw), size
 
 
 def test_the_stroke_floor_does_not_merge_the_caption_letters():
@@ -536,7 +566,40 @@ def test_the_stroke_floor_does_not_merge_the_caption_letters():
     tm, _ = poster._text_mask(N + chin_px, N, fpx, chin_px, p)
     for s, band in zip((p.text, p.text2), _split_lines(tm)):
         ink = sum(not c.isspace() for c in s)
-        assert _blobs(band) >= ink, f"{s!r}: {_blobs(band)} blobs for {ink} letters"
+        blobs = poster._topology(band)[0]
+        assert blobs >= ink, f"{s!r}: {blobs} blobs for {ink} letters"
+
+
+CAPTION_MAX = {"text": 30, "text2": 45}   # characters, advertised in docs/store-listings.md
+
+
+def test_the_advertised_caption_maxima_print_at_full_size():
+    """The shop promises 30 characters on line 1 and 45 on line 2. That is a promise
+    about geometry, so it is checkable: past what the ring opening can hold, _fit_line
+    shrinks the font to fit, and a shrunk line has thinner strokes than it was designed
+    with. At the advertised length every offered size must still render its designed
+    cap height and clear MIN_STROKE_MM, or 0.6mm where _dilation_px says it held the
+    dilation back to keep a counter open.
+
+    Measured headroom when this shipped: line 1 fits 33-35 characters at full size and
+    line 2 fits 52-58, so 30/45 is the safe round number under the tightest of them."""
+    long = "ZURICH ALTENRHEIN GENEVA LUGANO SAMEDAN BERN SION MEIRINGEN"
+    for size in poster.SIZES_MM:
+        for field, n in CAPTION_MAX.items():
+            s = long[:n].rstrip()
+            assert len(s) >= n - 1
+            p = poster.resolve(poster.Params(size_mm=size, **{field: s}))
+            N, _, fpx, chin_px = poster._grid(p)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                tm, res = poster._text_mask(N + chin_px, N, fpx, chin_px, p)
+            ys = np.where(tm)[0]
+            drawn = (ys.max() - ys.min() + 1) * res
+            want = p.text_mm * (poster.SUB_RATIO if field == "text2" else 1.0)
+            assert drawn > want - 0.25, f"{size}mm {field}: {drawn:.2f}mm caps, want {want:.2f}"
+            # the stroke target gives way to an open counter, and says so
+            floor = 0.6 if "keeps" in out.getvalue() else poster.MIN_STROKE_MM
+            assert poster._stroke_mm(tm, res) >= floor - 1e-9, out.getvalue()
 
 
 def test_heightmap_mesh_watertight():
@@ -634,38 +697,65 @@ def test_compose_parts_maps_altitude_through_the_terrain_scale():
 
 
 def test_strip_is_capped_at_the_relief_ceiling(capsys):
-    """An airliner would print a 722mm wall: 12000m over 500m terrain runs straight
-    off the poster. Above the relief's own ceiling the wall goes level instead."""
+    """An airliner would print a 362mm wall: 12000m over 500m terrain runs straight
+    off the poster even on the clipped 1000m flight span. Above the relief's own ceiling the wall goes level instead."""
     p, N, fpx, _, _, bounds = _synthetic()                 # bounds of the same track
     M = _mpx(p)
     elev = np.tile(np.linspace(0, 500, M), (M, 1))         # 500m of terrain...
     track = np.array([[47.0, 8.0, 0.0], [47.5, 9.0, 12000.0]])   # ...under a jet
     parts = poster.compose_parts(track, elev, np.zeros((M, M), np.uint8), bounds, p)
-    assert abs(parts["alt_mm"].max() - 722.0) < 1e-6       # the raw, unprintable height
+    assert abs(parts["alt_mm"].max() - 362.12) < 1e-6      # 2.12 + 12000/1000*30, unprintable
     m = poster.strip_mesh(parts["track_px"], parts["alt_mm"], parts["surface"], p)
     assert m.is_watertight and m.is_winding_consistent and m.volume > 0
     top = _strip_tops(m, parts["track_px"])
-    ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm      # 32.96mm
-    assert abs(top.max() - ceiling) < 1e-9                 # capped, not 722mm
+    ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm      # 33.08mm
+    assert abs(top.max() - ceiling) < 1e-9                 # capped, not 362mm
     assert np.abs(top - poster._snap(top, p)).max() < 1e-9
     assert "ceiling" in capsys.readouterr().out            # and it says so, once
     # (a flight below the ceiling is untouched — test_strip_follows_the_flight_
-    # altitude_over_flat_terrain tops out at 22.0mm against the same 33.0mm cap)
+    # altitude_over_flat_terrain tops out at 22.12mm against the same 33.08mm cap)
+
+
+def test_flat_land_under_a_circuit_is_scaled_to_the_flight():
+    """Blackpool: 30m of coast stretched over the whole relief read as hills and put
+    the 335m circuit on the strip ceiling as a flat fence. The span is the terrain
+    range or the flight's height over the lowest ground clipped to 300..1000m."""
+    p = _params()
+    M = _mpx(p)
+    elev = np.tile(np.linspace(0, 30, M), (M, 1))
+    full = p.relief_mm * p.exaggeration
+
+    def parts(alts):
+        t = TRACK3.copy()
+        t[:, 2] = alts
+        return poster.compose_parts(t, elev, np.zeros((M, M), np.uint8),
+                                    poster.track_bounds(t, p.margin_pct), p)
+
+    q = parts([0, 335, 0])                                 # span 335m: the flight
+    assert abs(q["alt_mm"].max() - (p.plate_mm + full)) < 1e-6
+    assert q["surface"].max() < p.plate_mm + 0.12 * full    # flat land stays flat
+    q = parts([0, 3000, 0])                                # span clipped to 1000m
+    assert abs(q["alt_mm"].max() - (p.plate_mm + 3 * full)) < 1e-6
+    q = parts([0, 0, 0])                                   # span clipped up to 300m
+    assert abs(q["surface"].max() - poster._snap(p.plate_mm + 30 / 300 * full, p)) < 1e-9
 
 
 TRACK3 = np.array([[47.0, 8.0, 0], [47.2, 8.4, 2000], [47.5, 9.0, 3000]])
 
 
-def _fake_fetches(monkeypatch, water=False, elev_top=500.0):
+def _fake_fetches(monkeypatch, water=False, elev_top=500.0, roads=False):
     monkeypatch.setattr(poster, "fetch_elevation",
                         lambda b, px: np.tile(np.linspace(0, elev_top, px), (px, 1)))
-    monkeypatch.setattr(poster, "fetch_water_mask",
-                        lambda b, px: np.full((px, px), water, bool))
+    monkeypatch.setattr(poster, "fetch_osm_masks",
+                        lambda b, px, res: (np.full((px, px), water, bool),
+                                            np.zeros((px, px), bool),
+                                            np.full((px, px), roads, bool)))
+    monkeypatch.setattr(poster, "_runways", lambda: poster._runway_table(""))
 
 
 def test_build_poster_v2(monkeypatch):
     _fake_fetches(monkeypatch)
-    frame_bodies, bodies, path_stl = poster.build_poster(TRACK3, _params())
+    frame_bodies, bodies, strip = poster.build_poster(TRACK3, _params())
     assert [b[1] for b in frame_bodies] == ["frame"]            # no text asked for
     assert frame_bodies[0][2] == poster.COLORS["frame"] and frame_bodies[0][3] == 1
     assert frame_bodies[0][0].is_watertight and frame_bodies[0][0].volume > 0
@@ -673,7 +763,8 @@ def test_build_poster_v2(monkeypatch):
     assert names == ["terrain"]                  # dry, below the snow line -> no caps
     assert bodies[0][2] == poster.COLORS["green"] and bodies[0][3] == 1
     assert bodies[0][0].is_watertight and bodies[0][0].volume > 0
-    assert path_stl[:5] != b"solid" and len(path_stl) > 84
+    assert [b[1:] for b in strip] == [("strip", poster.COLORS["strip"], 1)]
+    assert strip[0][0].is_watertight and strip[0][0].volume > 0
 
 
 def test_build_poster_text_is_its_own_white_body(monkeypatch):
@@ -729,7 +820,7 @@ def test_build_poster_rejects_a_frame_taller_than_the_plate():
     mx = float(re.search(r"<=([\d.]+)mm", msg).group(1))
     # the suggestion is the real ceiling: it fits, and one 0.1mm step up does not
     fits = lambda s: max(poster.footprint_mm(poster.resolve(replace(p, size_mm=s))))
-    assert fits(mx) <= poster.PLATE_MM < fits(round(mx + 0.1, 1))
+    assert fits(mx) <= poster.USABLE_MM < fits(round(mx + 0.1, 1))
     # and a one-line caption at 250mm is still fine (2.4mm of chin, not 10.4)
     assert poster.footprint_mm(poster.resolve(replace(p, text2=""))) == (249.6, 252.0)
 
@@ -746,53 +837,97 @@ def test_generate_endpoint(monkeypatch):
     import app as appmod
     _fake_fetches(monkeypatch, water=True)     # water everywhere -> relief has 2 bodies
     client = TestClient(appmod.app)
-    params = '{"size_mm": 40, "frame_mm": 4, "res_mm": 0.5, "text": "ZRH-GVA"}'
+    # 120 is the smallest size the shop sells; frame_mm/res_mm are pinned coarse so
+    # the endpoint test stays fast. Any other size_mm is a 400 (see the test below).
+    params = '{"size_mm": 120, "frame_mm": 4, "res_mm": 0.5, "text": "ZRH-GVA"}'
     r = client.post("/generate", files={"file": ("f.kml", KML.encode())},
                     data={"params": params})
     assert r.status_code == 200
     import base64
     j = r.json()
-    assert set(j) == {"frame", "relief", "path", "resolved"}
+    assert set(j) == {"frame", "relief", "path", "resolved", "runways"}
+    assert j["runways"] == "Runways: takeoff —, landing —"   # empty table: nothing snapped
     assert j["resolved"]["frame_mm"] == 4 and j["resolved"]["text"] == "ZRH-GVA"
     frame, relief, path = (base64.b64decode(j[k]) for k in ("frame", "relief", "path"))
-    assert path[:5] != b"solid" and len(path) > 84
-    assert frame[:2] == b"PK" and relief[:2] == b"PK"      # both 3MFs are zips
+    assert frame[:2] == relief[:2] == path[:2] == b"PK"     # all three are 3MF zips
     assert [b[0] for b in poster.read_3mf(frame)] == ["frame", "text"]
     assert [b[0] for b in poster.read_3mf(relief)] == ["terrain", "water"]
+    assert [b[0] for b in poster.read_3mf(path)] == ["strip"]
 
 
-def test_generate_endpoint_auto_scales_at_80mm(monkeypatch):
-    """Empty scaled params at 80mm: the ring really is the resolved 4mm, not 12mm,
-    and the response carries the resolved values for the preview's assembly maths."""
+def test_generate_endpoint_auto_scales_at_the_small_size(monkeypatch):
+    """Empty scaled params at the 120mm size: the ring really is the resolved 5.76mm,
+    not 12mm, and the response carries the resolved values for the preview's maths."""
     from fastapi.testclient import TestClient
     import app as appmod
     _fake_fetches(monkeypatch)
     r = TestClient(appmod.app).post(
         "/generate", files={"file": ("f.kml", KML.encode())},
-        data={"params": '{"size_mm": 80, "res_mm": 0.5}'})
+        data={"params": '{"size_mm": 120, "res_mm": 0.5}'})
     assert r.status_code == 200
     j = r.json()
-    assert j["resolved"]["frame_mm"] == 4.0 and j["resolved"]["relief_mm"] == 6.4
+    assert j["resolved"]["frame_mm"] == 5.76 and j["resolved"]["relief_mm"] == 9.6
     import base64
     V = poster.read_3mf(base64.b64decode(j["relief"]))[0][1]
     ext = V[:, 0].max() - V[:, 0].min()
-    # 80 - 2*(4.0 ring + 0.5 ceil'd fit) = 71, less one grid pixel = 70.5.
-    # At the old fixed 12mm ring this would be 54.5.
-    assert abs(ext - 70.5) < 0.5
+    # 120 - 2*(11px ring + 1px ceil'd fit) = 216px, less one grid pixel = 107.5mm.
+    # At the old fixed 12mm ring this would be 93.5.
+    assert abs(ext - 107.5) < 0.5
 
 
-def test_generate_refuses_a_poster_over_the_plate():
-    """The whole refusal has to reach the UI: the front end prints `detail` verbatim.
+def test_generate_only_sells_the_three_offered_sizes():
+    """The shop's size list is enforced server-side, not just by the <select>.
 
-    No monkeypatched fetches on purpose — the guard fires before any network call."""
+    No monkeypatched fetches: the check fires before any network call or meshing."""
     from fastapi.testclient import TestClient
     import app as appmod
+    client = TestClient(appmod.app)
+    post = lambda params: client.post("/generate", files={"file": ("f.kml", KML.encode())},
+                                      data={"params": params})
+    r = post('{"size_mm": 250}')      # the old default, over the plate with two lines
+    assert r.status_code == 400 and "216, 170, 120mm" in r.json()["detail"]
+    assert post('{"size_mm": 200}').status_code == 400
+    # A params-less POST falls back to the dataclass default, so that has to be one
+    # of the three. An offered size getting all the way through is test_generate_endpoint.
+    assert poster.Params.size_mm in poster.SIZES_MM
+
+
+def test_every_offered_size_fits_the_plate():
+    """Why SIZES_MM[0] is 240 and not 245 or 250 — the two rules that pick the sizes.
+
+    1. It prints with every caption it can be ordered with (the two-line chin is what
+       overflows). 2. It is a whole number of res_mm pixels, or _grid()'s truncation
+       shaves a further part-pixel and the poster comes out under nominal: 245mm is
+       612.5px and measures 244.4mm, which check_output.py's +-0.5 rule FAILs."""
+    for size in poster.SIZES_MM:
+        assert round(size / poster.Params.res_mm, 6).is_integer(), f"{size}mm off-grid"
+        for kw in ({}, {"text": "ZURICH → GENEVA"},
+                   {"text": "ZURICH → GENEVA", "text2": "HB-EZE · 12.07.2026"}):
+            p = poster.resolve(poster.Params(size_mm=size, **kw))
+            w, h = poster.footprint_mm(p)
+            assert max(w, h) <= poster.USABLE_MM, f"{size}mm {kw}: {w} x {h}mm"
+            assert size - w == pytest.approx(p.res_mm), f"{size}mm: width {w}mm"
+    assert max(poster.footprint_mm(poster.resolve(poster.Params(
+        size_mm=250.0, text="ZURICH", text2="HB-EZE")))) > poster.USABLE_MM
+
+
+def test_generate_refuses_a_poster_over_the_plate(monkeypatch):
+    """The whole refusal has to reach the UI: the front end prints `detail` verbatim.
+
+    An offered size can no longer overflow on its own (that is what SIZES_MM buys),
+    so the remaining way in is an explicit chin — the guard still has to catch it.
+    No monkeypatched DEM/water on purpose — it fires before those network calls. The
+    runway snap runs earlier still, so that one table is stubbed out."""
+    from fastapi.testclient import TestClient
+    import app as appmod
+    monkeypatch.setattr(poster, "_runways", lambda: poster._runway_table(""))
     r = TestClient(appmod.app).post(
         "/generate", files={"file": ("f.kml", KML.encode())},
-        data={"params": '{"size_mm": 250, "text": "ZURICH", "text2": "HB-EZE"}'})
+        data={"params": '{"size_mm": 216, "text": "ZURICH", "text2": "HB-EZE",'
+                        ' "chin_mm": 20}'})
     assert r.status_code == 502          # same generic handler the other guards use
     detail = r.json()["detail"]
-    assert "249.6 x 260.0mm" in detail and "256mm plate" in detail and "<=" in detail
+    assert "215.6 x 235.6mm" in detail and "prime tower" in detail and "<=" in detail
 
 
 def test_dimensions_endpoint():
@@ -807,14 +942,19 @@ def test_dimensions_endpoint():
     assert over["fits"] is False
     assert over["max_size_mm"] < 250     # and it is a size that actually fits
     assert max(poster.footprint_mm(poster.resolve(poster.Params(
-        size_mm=over["max_size_mm"], text="ZURICH", text2="HB-EZE")))) <= poster.PLATE_MM
+        size_mm=over["max_size_mm"], text="ZURICH", text2="HB-EZE")))) <= poster.USABLE_MM
 
     ok = get(size_mm=170, text="ZURICH", text2="HB-EZE")
     assert (ok["width"], ok["height"], ok["fits"]) == (169.6, 179.2, True)
 
     bare = get(size_mm=250)              # no caption -> no chin, still square
-    assert (bare["width"], bare["height"], bare["chin_mm"], bare["fits"]) == \
-        (249.6, 249.6, 0.0, True)
+    assert (bare["width"], bare["height"], bare["chin_mm"]) == (249.6, 249.6, 0.0)
+    assert bare["fits"] is False         # ...and 249.6 is still over USABLE_MM: the
+    # budget is the plate less the brim and the prime tower, so "fits" means "slices",
+    # not "is under 256mm". A caption is no longer what decides it at this size.
+
+    big = get(size_mm=216, text="ZURICH", text2="HB-EZE")   # the largest offered size
+    assert (big["width"], big["height"], big["fits"]) == (215.6, 226.0, True)
 
 
 def test_generate_bad_file():
@@ -834,6 +974,121 @@ def test_generate_bad_params_json():
                        data={"params": "not-json"}).status_code == 400
     assert client.post("/generate", files=files,   # valid JSON, not an object
                        data={"params": "5"}).status_code == 400
+
+
+RUNWAYS_CSV = """\
+id,airport_ref,airport_ident,length_ft,width_ft,surface,lighted,closed,le_ident,le_latitude_deg,le_longitude_deg,le_elevation_ft,le_heading_degT,le_displaced_threshold_ft,he_ident,he_latitude_deg,he_longitude_deg,he_elevation_ft,he_heading_degT,he_displaced_threshold_ft
+239532,2441,"EGNH",2621,98,"ASP",0,1,"07",53.77239990234375,-3.041330099105835,33,67.8,126,"25",53.77510070800781,-3.030100107192993,29,247.8,325
+239533,2441,"EGNH",6129,148,"ASP",1,0,"10",53.772202,-3.04269,32,95,,"28",53.770901,-3.01444,28,275,
+1,1,"XXXX",1000,50,"GRS",0,0,"09",,,,,,"27",,,,,
+239534,2441,"EGNH",3274,78,"ASP",1,0,"13",53.774502,-3.04373,32,127,478,"31",53.7686,-3.03074,30,307,
+"""
+LE10, HE10 = np.array([53.772202, -3.04269]), np.array([53.770901, -3.01444])
+LE13, HE13 = np.array([53.774502, -3.04373]), np.array([53.7686, -3.03074])
+on = lambda f, alt, dlat=0.0: [*(LE10 + f * (HE10 - LE10) + [dlat, 0]), alt]   # 10/28 line
+on13 = lambda f, alt: [*(LE13 + f * (HE13 - LE13)), alt]                         # 13/31 line
+
+
+def test_snap_runways_cuts_the_field_ends_and_rolls_on_the_runway():
+    """FR24 drops a GA aircraft's first/last fixes into the fields beside the runway.
+    They are cut, and a straight roll on the real runway (field elevation) replaces them."""
+    rws = poster._runway_table(RUNWAYS_CSV)
+    assert [l[1] for l in rws[0]] == ["10", "13"]      # closed 07/25 and blank row skipped
+    le, he = LE10, HE10
+    bogus = [on(0.5, 0, 0.008)] + [on(f, 0, 0.006) for f in (-0.5, -0.4, -0.3, -0.2)]
+    track = np.array([bogus[0]]
+                     + [on(f, a) for f, a in zip((0.5, 0.7, 0.9, 1.3, 1.8, 2.5),
+                                                 (10, 30, 60, 150, 300, 500))]
+                     + [on(f, a) for f, a in zip((-1.6, -1.3, -1.0, -0.7), (400, 300, 200, 100))]
+                     + bogus[1:])
+    out, note = poster.snap_runways(track, rws)
+    assert note == "Runways: takeoff EGNH 10, landing EGNH 10"
+    assert len(out) == len(track) - 5 + 4
+    for row, f in ((0, 0.0), (1, 0.25), (-2, 0.0), (-1, 0.55)):
+        assert np.allclose(out[row, :2], le + f * (he - le))
+        assert out[row, 2] == pytest.approx(32 * 0.3048)
+    assert not any(np.allclose(r, b) for r in out for b in bogus)
+
+    far = track + [1.0, 0, 0]                          # no runway within SNAP_NEAR_M
+    out, note = poster.snap_runways(far, rws)
+    assert note == "Runways: takeoff —, landing —" and np.array_equal(out, far)
+
+    # A circuit off and back onto 28: the climb-out lies on 10's approach line, with
+    # more fixes than the real approach. Searching the whole track, landing "10" won
+    # and cut everything after the climb-out; each end only searches its own half.
+    circuit = np.array([on(f, 100) for f in (0.6, 0.4, 0.2, -0.2, -0.5, -0.8, -1.1, -1.4, -1.7)]
+                       + [on(f, 300, 0.01) for f in (-1.0, 0.0, 1.0, 2.0)]       # downwind
+                       + [on(f, 100) for f in (2.6, 2.3, 2.0, 1.7)] + bogus[3:])
+    out, note = poster.snap_runways(circuit, rws)
+    assert note == "Runways: takeoff EGNH 28, landing EGNH 28"
+    assert np.allclose(out[-1, :2], he + 0.55 * (le - he)) and len(out) == len(circuit) + 2
+
+
+def _g_cefm_landing(approach=(-1.6, -1.5, -1.4, -1.3, -1.2, -1.1)):
+    """G-CEFM's landing end in miniature, with a first half 1deg north (no takeoff)."""
+    land = ([on13(f, 300) for f in (-2.0, -1.9, -1.8, -1.7, -1.6)]   # downwind crosses 13's line
+            + [on(f, 400 - 50 * i) for i, f in enumerate(approach)]   # the real approach on 10
+            + [on(-0.8, 100, 0.006), on(-0.5, 100)]                   # off-line bogus, fluke on 10
+            + [on13(f, 0) for f in (-0.4, -0.3, -0.2)])               # alt-0 tail on 13's line
+    return np.array([[la + 1.0, lo, a] for la, lo, a in land] + land)
+
+
+def test_snap_runways_scores_the_run_not_the_count():
+    """The bogus tail in the field is itself a 3-run on 13's extended centreline and
+    the downwind leg crosses that line: 13 has more aligned fixes (8 vs 7), but 10 has
+    the longer run ending the clean part (6 vs 3). A near-tie is left alone."""
+    rws = poster._runway_table(RUNWAYS_CSV)
+    track = _g_cefm_landing()
+    out, note = poster.snap_runways(track, rws)
+    assert note == "Runways: takeoff —, landing EGNH 10"
+    assert len(out) == len(track) - 5 + 2
+    assert np.allclose(out[-3], on(-1.1, 150))                       # last real approach fix
+    assert np.allclose(out[-2, :2], LE10) and np.allclose(out[-1, :2], LE10 + 0.55 * (HE10 - LE10))
+
+    track = _g_cefm_landing((-1.4, -1.3, -1.2, -1.1))                # run 4 vs 3: under SNAP_MARGIN
+    out, note = poster.snap_runways(track, rws)
+    assert "landing ambiguous (EGNH 10 run 4 vs EGNH 13 run 3)" in note
+    assert np.array_equal(out, track)
+
+
+def test_snap_runways_forced_runway(monkeypatch):
+    rws = poster._runway_table(RUNWAYS_CSV)
+    base = _g_cefm_landing()
+    auto, _ = poster.snap_runways(base, rws)
+    out, note = poster.snap_runways(base, rws, landing_rwy="egnh 10")
+    assert np.array_equal(out, auto) and note.endswith("landing EGNH 10 (forced)")
+
+    # A climb-out that turns before three fixes line up: auto leaves it, a force rolls it
+    approach = [on(f, a) for f, a in zip((-1.6, -1.3, -1.0, -0.7), (400, 300, 200, 100))]
+    early = np.array([on(0.5, 0, 0.008), on(0.5, 10), on(0.7, 30), on(0.9, 60, 0.01),
+                      on(1.3, 150, 0.02), on(1.8, 300, 0.03), on(2.5, 500, 0.04)] + approach)
+    assert poster.snap_runways(early, rws)[1].startswith("Runways: takeoff —")
+    out, note = poster.snap_runways(early, rws, takeoff_rwy="EGNH 10")
+    assert np.allclose(out[0, :2], LE10) and np.allclose(out[1, :2], LE10 + 0.25 * (HE10 - LE10))
+    assert np.allclose(out[2], on(0.5, 10)) and "takeoff EGNH 10 (forced)" in note
+
+    for bad in ("EGNH 99", "EGNH", "EGNH 10 28"):                    # never a silent auto
+        with pytest.raises(ValueError, match="Unknown runway"):
+            poster.snap_runways(base, rws, landing_rwy=bad)
+    with pytest.raises(ValueError, match="no fixes within"):        # 28's approach is east
+        poster.snap_runways(np.array(approach), rws, landing_rwy="EGNH 28")
+
+    def down():
+        raise OSError("offline")
+    monkeypatch.setattr(poster, "_runways", down)
+    with pytest.raises(ValueError, match="cannot force"):
+        poster.snap_runways(base, landing_rwy="EGNH 10")
+    assert poster.snap_runways(base)[1] == "runway data unavailable (offline)"
+
+
+def test_generate_rejects_an_unknown_forced_runway(monkeypatch):
+    from fastapi.testclient import TestClient
+    import app as appmod
+    monkeypatch.setattr(poster, "_runways", lambda: poster._runway_table(RUNWAYS_CSV))
+    r = TestClient(appmod.app).post(
+        "/generate", files={"file": ("f.kml", KML.encode())},
+        data={"params": '{"size_mm": 120, "landing_rwy": "EGNH 99"}'})
+    assert r.status_code == 400 and "Unknown runway 'EGNH 99'" in r.json()["detail"]
 
 
 
@@ -960,6 +1215,69 @@ def test_3mf_roundtrip_skips_the_container():
     assert [g[0] for g in got] == ["terrain", "water", "snow"]
     for (m, name, _, _), (_, V, F) in zip(bodies, got):
         assert np.allclose(V, m.vertices, atol=1e-3) and (F == m.faces).all()
+
+
+def test_3mf_is_a_finished_orca_project():
+    """Each file opens in OrcaSlicer as a finished A1 0.4 project: the whole flattened
+    system config (a partial one blanks the start G-code), the plate's overrides, the
+    caption's own walls per part, and the bed placement on the build item alone."""
+    import zipfile, io as _io, xml.etree.ElementTree as ET
+    m = poster.heightmap_mesh(np.full((5, 3), 2.0), 1.0)              # 2 x 4mm, z from 0
+    lifted = m.copy()
+    lifted.apply_translation([0, 0, poster.SLOT_FLOOR_MM])           # the strip's own floor
+    for plate, bodies, walls in (
+            ("relief", [(m, "terrain", "#4CAF50", 1)], "2"),
+            ("frame", [(m, "frame", "#222222", 1), (m, "text", "#FFFFFF", 2)], "2"),
+            ("path", [(lifted, "strip", "#CC2222", 1)], "2")):
+        z = zipfile.ZipFile(_io.BytesIO(poster.write_3mf(bodies)))
+        cfg = json.loads(z.read("Metadata/project_settings.config"))
+        n = len(poster.SLOTS[plate])                     # relief: 3 even with 1 body used
+        assert cfg["printer_settings_id"] == poster.PRINTER and cfg["layer_height"] == "0.24"
+        assert "machine: A1 =" in cfg["machine_start_gcode"]           # the flatten got there
+        assert len(cfg["filament_colour"]) == n == len(cfg["flush_volumes_matrix"]) ** 0.5
+        assert len(cfg["filament_type"]) == n                          # filament lists tiled
+        assert cfg["wall_loops"] == walls and cfg["prime_tower_width"] == "130"
+        assert cfg["wipe_tower_x"] == ["63"] and cfg["wipe_tower_y"] == ["5"]
+        model = z.read("3D/3dmodel.model").decode()
+        assert "BambuStudio:3mfVersion" in model
+        tx, ty, tz = map(float, re.search(r'<item [^>]*transform="1 0 0 0 1 0 0 0 1 '
+                                          r'(\S+) (\S+) ([^"]+)"', model).groups())
+        w, h = m.extents[:2]
+        assert (tx, ty, tz) == (128 - w / 2, 138 - h / 2, -bodies[0][0].bounds[0][2])
+        obj = ET.fromstring(z.read("Metadata/model_settings.config")).find("object")
+        assert obj.find('metadata[@key="flush_into_objects"]').get("value") == "0"
+        if plate == "frame":
+            text = {e.get("key"): e.get("value") for e in obj.findall("part")[1]}
+            assert text["extruder"] == "2" and text["wall_loops"] == "3"
+            assert text["ironing_type"] == "no ironing"
+        # placement is the item's alone: the meshes still read back in their local frame
+        assert np.allclose(poster.read_3mf(z.fp.getvalue())[0][1], bodies[0][0].vertices,
+                           atol=1e-3)
+
+
+ORCA = "/Applications/OrcaSlicer.app/Contents/MacOS/OrcaSlicer"
+
+
+@pytest.mark.skipif(not os.path.exists(ORCA), reason="OrcaSlicer not installed")
+def test_orca_slices_every_plate(monkeypatch, tmp_path):
+    """The real slicer, headless: every project slices with the settings it carries."""
+    import subprocess, zipfile
+    _fake_fetches(monkeypatch, water=True)
+    p = _params(text="HB", text_mm=3.0)
+    for plate, bodies in zip(("frame", "relief", "path"), poster.build_poster(TRACK3, p)):
+        f, out = tmp_path / f"{plate}.3mf", tmp_path / plate
+        f.write_bytes(poster.write_3mf(bodies))
+        out.mkdir()
+        r = subprocess.run([ORCA, "--debug", "1", "--slice", "0", "--export-3mf", "sliced.3mf",
+                            "--outputdir", str(out), str(f)], capture_output=True, timeout=600)
+        assert r.returncode == 0, r.stdout[-2000:]
+        g = zipfile.ZipFile(out / "sliced.3mf").read("Metadata/plate_1.gcode").decode()
+        cfg = dict(re.findall(r"^; (\w+) = (.*)$", g, re.M))
+        assert cfg["layer_height"] == "0.24" and cfg["prime_tower_width"] == "130"
+        # Orca switches the tower off itself for a one-filament plate (path)
+        assert cfg["enable_prime_tower"] == ("1" if len(poster.SLOTS[plate]) > 1 else "0")
+        assert cfg["wall_loops"] == poster.PLATES[plate]["wall_loops"]
+        assert cfg["filament_colour"] == ";".join(poster.COLORS[k] for k in poster.SLOTS[plate])
 
 
 def _text_body(**kw):
@@ -1095,13 +1413,13 @@ def test_check_output_passes_on_freshly_built_files(monkeypatch, tmp_path, text,
     import check_output
     _fake_fetches(monkeypatch, water=True)
     p = _params(text=text, text2=text2, text_mm=3.0)
-    frame_bodies, bodies, path_stl = poster.build_poster(TRACK3, p)
+    frame_bodies, bodies, strip = poster.build_poster(TRACK3, p)
     (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
     (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
-    (tmp_path / "path.stl").write_bytes(path_stl)
+    (tmp_path / "path.3mf").write_bytes(poster.write_3mf(strip))
     params = json.dumps(asdict(p))   # the checker is handed exactly what was built
     assert check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
-                              str(tmp_path / "path.stl"), "--params", params]) == 0
+                              str(tmp_path / "path.3mf"), "--params", params]) == 0
 
 
 def test_check_output_passes_on_a_relief_with_a_grey_band(monkeypatch, tmp_path):
@@ -1110,13 +1428,13 @@ def test_check_output_passes_on_a_relief_with_a_grey_band(monkeypatch, tmp_path)
     import check_output
     _fake_fetches(monkeypatch, elev_top=4000.0)              # dry ramp through 2000m
     p = _params()
-    frame_bodies, bodies, path_stl = poster.build_poster(TRACK3, p)
+    frame_bodies, bodies, strip = poster.build_poster(TRACK3, p)
     assert [b[1] for b in bodies] == ["terrain", "snow"]
     (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
     (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
-    (tmp_path / "path.stl").write_bytes(path_stl)
+    (tmp_path / "path.3mf").write_bytes(poster.write_3mf(strip))
     assert check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
-                              str(tmp_path / "path.stl"),
+                              str(tmp_path / "path.3mf"),
                               "--params", json.dumps(asdict(p))]) == 0
 
 
@@ -1125,12 +1443,12 @@ def test_check_output_flags_a_missing_text_body(monkeypatch, tmp_path, capsys):
     not a hint — the body is recoverable from the mesh, unlike the old emboss."""
     import check_output
     _fake_fetches(monkeypatch)
-    frame_bodies, bodies, path_stl = poster.build_poster(TRACK3, _params())   # no text
+    frame_bodies, bodies, strip = poster.build_poster(TRACK3, _params())   # no text
     (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
     (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
-    (tmp_path / "path.stl").write_bytes(path_stl)
+    (tmp_path / "path.3mf").write_bytes(poster.write_3mf(strip))
     rc = check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
-                            str(tmp_path / "path.stl"),
+                            str(tmp_path / "path.3mf"),
                             "--params", json.dumps(asdict(_params(text="HB-EZE")))])
     assert rc == 1 and "text body" in capsys.readouterr().out
 
@@ -1146,13 +1464,13 @@ def test_check_output_flags_a_chin_that_overflows_the_plate(monkeypatch, tmp_pat
     # test_build_poster_rejects_a_frame_taller_than_the_plate. Lift the ceiling for
     # the generation step only: check_output binds PLATE_MM at import, so the checker
     # below still measures the exported mesh against the real 256mm plate.
-    monkeypatch.setattr(poster, "PLATE_MM", 1e6)
-    frame_bodies, bodies, path_stl = poster.build_poster(TRACK3, p)
+    monkeypatch.setattr(poster, "USABLE_MM", 1e6)
+    frame_bodies, bodies, strip = poster.build_poster(TRACK3, p)
     (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
     (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
-    (tmp_path / "path.stl").write_bytes(path_stl)
+    (tmp_path / "path.3mf").write_bytes(poster.write_3mf(strip))
     rc = check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
-                            str(tmp_path / "path.stl"), "--params", json.dumps(asdict(p))])
+                            str(tmp_path / "path.3mf"), "--params", json.dumps(asdict(p))])
     out = capsys.readouterr().out
     assert rc == 1
     assert "FAIL  frame y footprint" in out       # 290mm > the 256mm plate
@@ -1273,45 +1591,201 @@ def test_water_mask_skips_sub_pixel_ponds():
     assert poster._water_mask_from_elements([lake], B, 100).any()
 
 
-def test_fetch_water_mask_uses_the_mirror_when_the_first_fails(monkeypatch, capsys):
+def test_fetch_osm_masks_uses_the_mirror_when_the_first_fails(monkeypatch, capsys):
     calls = []
 
-    def fake_get(url, timeout=20):
-        calls.append((url, timeout))
+    def fake_get(url, timeout=20, tries=2):
+        calls.append((url, timeout, tries))
         if len(calls) == 1:
             raise RuntimeError("overpass busy")
         return b'{"elements": []}'
 
     monkeypatch.setattr(poster, "_get", fake_get)
-    m = poster.fetch_water_mask(B, 16)
+    m = poster.fetch_osm_masks(B, 16, 0.4)[0]
     assert m.shape == (16, 16) and not m.any()
     assert len(calls) == 2
     assert calls[0][0].startswith(poster.OVERPASS_URLS[0])
     assert calls[1][0].startswith(poster.OVERPASS_URLS[1])
-    assert calls[0][1] == 180                               # Overpass is slow, not 20s
+    assert calls[0][1:] == (150, 1)       # Overpass is slow, not 20s; next mirror, not a retry
     assert "natural" in calls[0][0] and "8.1" in calls[0][0]  # query + bbox in the URL
     assert "mirror" in capsys.readouterr().out.lower()
 
 
-def test_fetch_water_mask_skips_transoceanic_spans(monkeypatch, capsys):
+def test_fetch_osm_masks_rejects_a_partial_overpass_response(monkeypatch, capsys):
+    """A query that hits [timeout:] answers 200 with what it had so far and a remark.
+    That half-answer must never be drawn: the next mirror's full one is."""
+    a = _way(_ring(47.02, 8.02, 47.04, 8.04), tags={"natural": "water"})
+    b = _way(_ring(47.06, 8.06, 47.08, 8.08), tags={"natural": "water"})
+    answers = [{"elements": [a], "remark": 'runtime error: Query timed out in "query" '
+                                          'at line 1 after 120 seconds.'},
+               {"elements": [a, b]}]
+    calls = []
+    monkeypatch.setattr(poster, "_get", lambda url, **k: calls.append(url)
+                        or json.dumps(answers[len(calls) - 1]).encode())
+    water = poster.fetch_osm_masks(B, 100, 0.4)[0]
+    assert water[_rc(B, 47.03, 8.03, 100)] and water[_rc(B, 47.07, 8.07, 100)]
+    assert len(calls) == 2
+    assert "partial" in capsys.readouterr().out
+
+
+def test_overpass_responses_are_cached_per_query(monkeypatch):
+    """Same order, same poster: a regeneration must not re-ask a public mirror that
+    may answer differently this minute. A failure is not cached — the next call retries."""
+    calls = []
+    monkeypatch.setattr(poster, "_get", lambda url, **k: calls.append(url) or b'{"elements": []}')
+    poster.fetch_osm_masks(B, 16, 0.4)
+    poster.fetch_osm_masks(B, 16, 0.4)
+    assert len(calls) == 1
+    poster.fetch_osm_masks(_wbounds(47.0, 8.0, 47.2, 8.2), 16, 0.4)
+    assert len(calls) == 2
+
+    poster._overpass.cache_clear()
+    down = [True]
+
+    def flaky(url, **k):
+        if down[0]:
+            raise RuntimeError("all down")
+        return b'{"elements": []}'
+
+    monkeypatch.setattr(poster, "_get", flaky)
+    with pytest.raises(RuntimeError, match="Overpass"):
+        poster.fetch_osm_masks(B, 16, 0.4)
+    down[0] = False
+    assert not poster.fetch_osm_masks(B, 16, 0.4)[0].any()
+
+
+def test_fetch_osm_masks_skips_transoceanic_spans(monkeypatch, capsys):
     monkeypatch.setattr(poster, "_get",
                         lambda *a, **k: pytest.fail("must not query Overpass"))
-    m = poster.fetch_water_mask(_wbounds(40.0, -70.0, 50.0, 10.0), 32)
+    m = poster.fetch_osm_masks(_wbounds(40.0, -70.0, 50.0, 10.0), 32, 0.4)[0]
     assert m.shape == (32, 32) and not m.any()
     assert "water" in capsys.readouterr().out.lower()
 
 
-def test_build_poster_soft_fails_to_terrain_when_overpass_is_down(monkeypatch, capsys):
+def test_sea_is_the_right_hand_side_of_the_coastline_and_prints_flat(monkeypatch):
+    """OSM keeps land on the coastline's LEFT: a northbound coast has the sea east.
+    And terrarium's seabed (Blackpool: -7.85m) is flattened to 0 before smoothing."""
+    m = poster._sea_mask([_way([(47.0, 8.05), (47.1, 8.05)])], B, 100)
+    assert m[_rc(B, 47.05, 8.08, 100)] and not m[_rc(B, 47.05, 8.02, 100)]
+    assert 0.4 < m.mean() < 0.6
+    m = poster._sea_mask([_way([(47.1, 8.05), (47.0, 8.05)])], B, 100)   # reversed
+    assert not m[_rc(B, 47.05, 8.08, 100)] and m[_rc(B, 47.05, 8.02, 100)]
+
+    def elev(b, px):   # land ramp 0..30m west, a sloping seabed -8..-1m east
+        e = np.tile(np.linspace(0, 30, px), (px, 1))
+        e[:, px // 2:] = np.linspace(-8, -1, px - px // 2)
+        return e
+
+    east = lambda px: np.tile(np.arange(px) >= px // 2, (px, 1))
+    zeros = lambda px: np.zeros((px, px), bool)
+    monkeypatch.setattr(poster, "fetch_elevation", elev)
+    monkeypatch.setattr(poster, "fetch_osm_masks", lambda b, px, res: (zeros(px), east(px), zeros(px)))
+    seen, real = {}, poster.compose_parts
+    monkeypatch.setattr(poster, "compose_parts", lambda *a: seen.setdefault("p", real(*a)))
+    t = TRACK3.copy()
+    t[:, 2] = [0, 100, 200]                    # low hop: 300m span, so 7m of seabed is ~6 layers
+    p = _params()
+    _, bodies, _ = poster.build_poster(t, p)
+    assert [b[1] for b in bodies] == ["terrain", "water"]
+    q = seen["p"]
+    M = q["surface"].shape[0]
+    sea = q["water"].copy()
+    sea[:, :M // 2 + 2] = False                # past the shore column the blur blends
+    assert sea.any() and np.ptp(q["surface"][sea]) == 0      # one level...
+    assert abs(q["surface"][sea][0] - p.plate_mm) < 1e-9     # ...at 0m, the lowest land
+
+
+def test_fetch_osm_masks_draws_roads_and_runways_by_scale(monkeypatch, capsys):
+    """Grey is runways plus the road classes the zoom can hold. B at 100 px is ~189 m
+    per printed mm at res 0.4, so primary and up; tertiary is not even asked for.
+    A closed coastline way is still an island, never a lake."""
+    assert "landuse" not in poster.OVERPASS_QL and "coastline" in poster.OVERPASS_QL
+    hw = lambda c, **t: {"highway": c, **t}
+    coast = {"natural": "coastline"}
+    els = [_way([(47.02, 8.02), (47.08, 8.08)], tags=hw("primary")),
+           _way([(47.02, 8.08), (47.08, 8.02)], tags=hw("tertiary")),
+           _way([(47.01, 8.05), (47.09, 8.05)], tags=hw("motorway", tunnel="yes")),
+           _way([(47.05, 8.02), (47.05, 8.08)], tags={"aeroway": "runway", "width": "45"}),
+           _way([(47.0, 8.06), (47.1, 8.06)], tags=coast),            # sea east of 8.06
+           _way(_ring(47.03, 8.075, 47.045, 8.09), tags=coast),       # CCW: an island
+           _way(_ring(47.085, 8.005, 47.098, 8.02), tags={"natural": "water"})]
+    seen = []
+    monkeypatch.setattr(poster, "_get", lambda url, **k: seen.append(url)
+                        or json.dumps({"elements": els}).encode())
+    water, sea, roads = poster.fetch_osm_masks(B, 100, 0.4)
+    assert "primary" in seen[0] and "tertiary" not in seen[0]
+    at = lambda m, la, lo: m[_rc(B, la, lo, 100)]
+    assert at(roads, 47.03, 8.03) and at(roads, 47.05, 8.03)       # primary, runway
+    assert at(roads, 47.05, 8.05)                                   # where they cross
+    assert not at(roads, 47.03, 8.07)                               # tertiary: out of band
+    assert not at(roads, 47.07, 8.05)                               # tunnel: underground
+    r, c = _rc(B, 47.05, 8.025, 100)
+    assert roads[r - 3:r + 4, c].sum() >= 3                         # runway is 3+ px wide
+    assert at(water, 47.09, 8.012) and at(sea, 47.07, 8.08)
+    assert not at(water, 47.0375, 8.0825) and not at(sea, 47.0375, 8.0825)   # island: land
+    assert 0 < roads.mean() < poster.ROAD_MAX_FRAC
+
+    # a dense grid of one class would grey the plate: that class goes, with a note
+    els = [_way([(47.005 + 0.0015 * i, 8.0), (47.005 + 0.0015 * i, 8.1)], tags=hw("primary"))
+           for i in range(60)]
+    poster._overpass.cache_clear()                                  # same bbox, new answer
+    roads = poster.fetch_osm_masks(B, 100, 0.4)[2]
+    assert roads.mean() <= poster.ROAD_MAX_FRAC
+    assert "dropped" in capsys.readouterr().out
+
+
+def test_caps_follow_the_slot(monkeypatch, tmp_path):
+    """Water/road caps drape into the groove: the slot is blue over the sea, not a
+    green rim, and the strip still seats on the one flat SLOT_FLOOR_MM."""
+    p, N, fpx, elev, track, bounds = _synthetic()
+    M = _mpx(p)
+    lc = np.ones((M, M), np.uint8)
+    parts = poster.compose_parts(track, elev, lc, bounds, p)
+    gmask = poster._groove_mask(parts["track_px"], (M, M), p)
+    assert (parts["cap_top"][gmask] == poster.SLOT_FLOOR_MM).all()
+    under = gmask & poster._cell_verts(parts["water_cells"])
+    assert under.any()
+    assert np.allclose(parts["green"][under], poster.SLOT_FLOOR_MM - poster.SLOT_CAP_MM)
+    z = poster.SLOT_FLOOR_MM - poster.SLOT_CAP_MM
+    assert abs(z - poster._snap(z, p)) < 1e-9                       # 0.68: on the grid
+
+    import check_output
+    _fake_fetches(monkeypatch, water=True)
+    p = _params()
+    frame_bodies, bodies, strip = poster.build_poster(TRACK3, p)
+    assert [b[1] for b in bodies] == ["terrain", "water"]
+    w = bodies[1][0]
+    assert w.is_watertight and w.is_winding_consistent
+    assert abs(w.bounds[0][2] - z) < 1e-9
+    assert (np.abs(w.vertices[:, 2] - poster.SLOT_FLOOR_MM) < 1e-9).any()
+    path = poster.write_3mf(strip)
+    assert abs(poster.read_3mf(path)[0][1][:, 2].min() - poster.SLOT_FLOOR_MM) < 1e-4
+    for name, data in (("frame.3mf", poster.write_3mf(frame_bodies)),
+                       ("relief.3mf", poster.write_3mf(bodies)), ("path.3mf", path)):
+        (tmp_path / name).write_bytes(data)
+    assert check_output.main([str(tmp_path / n) for n in ("frame.3mf", "relief.3mf", "path.3mf")]
+                             + ["--params", json.dumps(asdict(p))]) == 0
+
+    # roads are the same cap, grey, in the snow band's slot
+    _fake_fetches(monkeypatch, roads=True)
+    _, bodies, _ = poster.build_poster(TRACK3, p)
+    assert [b[1] for b in bodies] == ["terrain", "roads"]
+    assert bodies[1][2] == poster.COLORS["snow"] and bodies[1][3] == 3
+    assert bodies[1][0].is_watertight and bodies[1][0].is_winding_consistent
+
+
+def test_build_poster_fails_loudly_when_overpass_is_down(monkeypatch):
+    """A poster without its coast keeps the seabed in the DEM: different relief from
+    the same order. Overpass down is an error (app.py: 502), never a water-less poster."""
     monkeypatch.setattr(poster, "fetch_elevation",
                         lambda b, px: np.tile(np.linspace(0, 500, px), (px, 1)))
 
-    def boom(url, timeout=20):
+    def boom(url, timeout=20, tries=2):
         raise RuntimeError("overpass down")
 
     monkeypatch.setattr(poster, "_get", boom)
-    _, bodies, _ = poster.build_poster(TRACK3, _params())
-    assert [b[1] for b in bodies] == ["terrain"]           # a water-less poster, not a 502
-    assert "water" in capsys.readouterr().out.lower()
+    with pytest.raises(RuntimeError, match="Overpass"):
+        poster.build_poster(TRACK3, _params())
 
 
 def test_get_sends_an_identifying_user_agent(monkeypatch):
@@ -1332,7 +1806,7 @@ def test_get_sends_an_identifying_user_agent(monkeypatch):
 
 @pytest.mark.skipif(not os.environ.get("LIVE"), reason="hits the live Overpass API")
 def test_live_lake_zug_water_mask():
-    m = poster.fetch_water_mask(_wbounds(47.08, 8.42, 47.20, 8.55), 256)
+    m = poster.fetch_osm_masks(_wbounds(47.08, 8.42, 47.20, 8.55), 256, 0.4)[0]
     assert 0.05 < m.mean() < 0.6, m.mean()
 
 
@@ -1362,7 +1836,8 @@ def test_a_small_peak_above_the_snow_line_is_a_solid_grey_body(monkeypatch):
         return e
 
     monkeypatch.setattr(poster, "fetch_elevation", elev)
-    monkeypatch.setattr(poster, "fetch_water_mask", lambda b, px: np.zeros((px, px), bool))
+    monkeypatch.setattr(poster, "fetch_osm_masks",
+                        lambda b, px, res: tuple(np.zeros((px, px), bool) for _ in range(3)))
     _, bodies, _ = poster.build_poster(TRACK3, _params())
     assert [b[1] for b in bodies] == ["terrain", "snow"]   # the peak survives...
     m = bodies[1][0]
@@ -1395,8 +1870,8 @@ def _banded(snow_line_m=600.0, lc_all=False, **kw):
 
 
 def test_snap_lands_on_the_first_layer_grid():
-    """The printer lays a 0.2mm first layer and 0.12mm ones after it, so a printable
-    height is 0.2 + n*0.12 — not n*0.12, which is what round(z/layer) gave."""
+    """The printer lays a 0.2mm first layer and 0.24mm ones after it, so a printable
+    height is 0.2 + n*0.24 — not n*0.24, which is what round(z/layer) gave."""
     p = _params()
     z = np.array([0.21, 0.25, 0.26, 1.0, 5.0, 31.7])
     s = poster._snap(z, p)

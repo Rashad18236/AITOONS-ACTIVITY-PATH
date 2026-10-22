@@ -1,10 +1,83 @@
 # Bambu Studio print settings — Flight Path Poster
 
 Target: Bambu X1C / P1S / H2D class, 256×256 plate, 0.4 mm nozzle, AMS, PLA.
-Three plates: `relief.3mf` (3 colours), `frame.3mf` (2 colours), `path.stl` (1 colour).
+Three plates: `relief.3mf` (3 colours), `frame.3mf` (2 colours), `path.3mf` (1 colour;
+`path.stl` in the sections below, written before it became a project).
 
 Written against Bambu Studio 1.10 / 2.x setting names. Where a name differs in
 Orca Slicer it is noted.
+
+---
+
+## What the generator embeds (A1 0.4)
+
+The target is now the **Bambu Lab A1, 0.4 nozzle, only**: an open bed-slinger with
+the AMS lite, so every door / chamber row below does not apply. All three files are
+finished OrcaSlicer 2.3.2 projects: open, slice, print. Each carries the full
+flattened system chain (`Bambu Lab A1 0.4 nozzle` / `0.24mm Draft @BBL A1` / `Bambu PLA
+Basic @BBL A1`, vendored as `orca_a1_pla.json`) with `COMMON`, `PLATES` and
+`PART_OVERRIDES` from `poster.py` on top. Those tables are the truth; this file is the
+why. Where they differ from the sections below:
+
+- **Layer height 0.24 mm, not 0.12.** The user measured the 0.12 prints as far too
+  long, and the decision is final. Sliced on the 216 order (D-EMFE) with the Orca 2.3.2
+  CLI, the relief changes filament once per layer, because the roads drape into the
+  slot, so halving the layer count halves the changes too. The terrain step becomes
+  7.6 m instead of 3.8 m, which the user accepted. The generator's grid follows:
+  every z is `0.2 + n*0.24` (slot floor 1.16, plate 2.12). Measured variants (Orca CLI
+  estimate):
+
+  | Plate | Variant | Time | Changes |
+  |---|---|---|---|
+  | frame | base (0.12, ironing on) | 8.29 h | 1 |
+  | frame | no ironing | 3.92 h | 1 |
+  | frame | no ironing + 0.24 | 3.46 h | 1 |
+  | relief | base (0.12, walls 3 / top 5 / 15 %) | 18.84 h | 155 |
+  | relief | walls 2 + top 3 | 16.36 h | 155 |
+  | relief | flush × 0.6 | 18.00 h | 155 |
+  | relief | flush into infill | 18.44 h | 155 |
+  | relief | 0.24 | 11.29 h | 79 |
+  | relief | 0.24 + walls 2 + top 3 | 9.72 h | 79 |
+
+  Flushing is not where the time goes; layer count and ironing are.
+- **Frame: ironing off, 7 % infill.** Ironing was over half the frame's time. Walls
+  2, seam `nearest`.
+- **Relief: walls 2, top 3, 10 % infill** (the user's numbers); MMU interlocking depth
+  0.72 = 3 layers.
+- **Shells as thickness**, so the change of layer height reads honestly. A bottom
+  shell starts with the 0.2 first layer.
+
+  | Plate | Top / bottom layers | Top | Bottom | Was at 0.12 |
+  |---|---|---|---|---|
+  | frame | 3 / 3 | 0.72 mm | 0.68 mm | 6 / 4 = 0.72 / 0.56 |
+  | relief | 3 / 3 | 0.72 mm | 0.68 mm | 5 / 4 = 0.60 / 0.56 |
+  | path | 2 / 2 | 0.48 mm | 0.44 mm | 3 / 3 = 0.36 / 0.44 |
+- **Caption walls: 3 loops at 0.40 mm** (per part, text only), not 2 at 0.36. The 0.36
+  was tuned for the old 0.6–0.9 mm strokes; the floored strokes are 1.07–1.33 mm now.
+  `inner wall/outer wall`, 100 % infill, no ironing on the text.
+- **`flush_into_infill` OFF on the frame too.** The caption section wins over §3.
+- **Prime tower 130 mm wide at x 63 / y 5**, behind which `write_3mf` centres the
+  object (x centred, y centred in 20–256). Sliced at 0.24 on the 216 order, the frame's
+  tower is 6.75 mm deep. That is Orca's height-based stability minimum, not purge
+  volume: at 0.12 a 180 mm tower sliced the same depth, so it stays at 130. The tower's
+  brim and stabilising cone reach y 16.8 (frame) / 17.3 (relief); the objects' brims
+  start at y 20.4 / 36.0. `path.3mf` has one filament and no tower.
+- **Path on the slinger:** outer wall 50, inner 80 mm/s, outer-wall acceleration
+  1000 for a 28 × 1.1 mm fin on a moving bed; brim 8 mm.
+- **Not embedded:** the per-layer filament print order (set it by hand if wanted).
+  Thumbnails, `plate_1.json` and `slice_info.config` are left out because Orca
+  regenerates them.
+
+Orca also reports three warnings, and the unmodified system preset gives the same three:
+"bed temperature higher than the filament's vitrification temperature" (PLA Basic 65 °C
+textured plate vs 45 °C, a closed-door warning that does not apply to the open A1) and
+two "traditional timelapse not supported". It also logs "precise wall ignored for
+inner-outer-inner": `precise_outer_wall` only takes effect on the caption, whose
+sequence is `inner wall/outer wall`.
+
+Sliced, 216 order (D-EMFE), at 0.24 with these settings: frame 2.69 h / 131 g (1
+change), relief 9.55 h / 156 g (77 changes), path 0.86 h / 9.4 g. At 0.12 it was
+8.29 h / 147 g, 18.84 h / 210 g (155 changes) and 1.43 h / 9.6 g.
 
 ---
 
@@ -12,7 +85,7 @@ Orca Slicer it is noted.
 
 | Question | Verdict |
 |---|---|
-| Layer height | **0.12 mm** ("0.12 mm Fine" preset, 0.4 nozzle). Not 0.2, not 0.08. |
+| Layer height | **0.12 mm** ("0.12 mm Fine" preset, 0.4 nozzle). Not 0.2, not 0.08. **Superseded — see the head section** (0.24 since the measured A1 print times). |
 | Nozzle | **Keep 0.4 mm.** A 0.2 mm nozzle is actively wrong for this print (see §4). |
 | Adaptive / variable layer height | **OFF.** It destroys the layer-multiple quantisation the generator relies on, and it constrains the prime tower. |
 | Ironing on the relief | **OFF.** Ironing only helps flat tops; a quantised heightmap is thousands of tiny terraces. |
@@ -140,7 +213,7 @@ inside your print.
 | Prime tower | Process → Others | **ON** | Non-negotiable. Without it the first millimetres of every new colour land on the model. It is also a hard prerequisite: *"flush into object" and "flush into infill" are unavailable when the prime tower is disabled.* |
 | Prime tower **Width** | Process → Others | **130 mm** | This is the fix for "the tower doesn't fit next to a 250×225 poster". Tower depth = `(turns × line width) × changes per layer`, where `turns = (prime volume ÷ (layer height × line width)) ÷ width`. At 45 mm³ prime, 0.12 mm layers, 0.42 mm lines and 2 changes/layer: 893 mm of path ÷ 130 mm ≈ 7 turns ≈ 2.9 mm depth per change ≈ **5.8 mm total depth**. A long, shallow tower fits the ~30 mm strip left in front of the poster; a default square one does not. |
 | Prime tower **Brim width** | Process → Others | **5 mm** | A 130 × 6 mm tower 32 mm tall is tippy. |
-| Prime tower position | drag on the plate | front strip, ≥15 mm from the plate edge | Studio enforces a 15 mm keep-out around the plate edge. If the tower still won't place, drop `size_mm` from 250 → 240. |
+| Prime tower position | drag on the plate | front strip, ≥15 mm from the plate edge | Studio enforces a 15 mm keep-out around the plate edge. The generator now budgets for this instead of leaving it to the slicer: `poster.USABLE_MM` = 256 − 2×5 mm brim − 4 mm gap − 16 mm tower-plus-its-brim = **226 mm**, on *both* axes, and no size that busts it can be ordered. If your tower comes out deeper than 6 mm (more than 2 changes per layer), lower `USABLE_MM` and the sizes with it. |
 | Filament change volume ("Prime volume" pre-2.0) | Filament settings, **per filament** (BS 2.0+) | **45 mm³** default, **60 mm³ for grey** | Grey is the light colour being contaminated by two darker ones. |
 | Flushing volumes → **Multiplier** | Project Filaments → Flushing volumes | **1.0** while diagnosing | Bambu's auto values are deliberately conservative. Do not reduce until the grey is clean. Once clean, 0.8–0.9 saves a lot (see waste note below). |
 | Flushing volumes → per-pair | same dialog | see table below | |
@@ -240,7 +313,7 @@ layer height **0.12 mm**, Arachne, and slice gap closing radius **0.01**.
 
 ## 5. Per-part overrides
 
-### relief.3mf — terrain body + 2 caps, 250×225 mm, 3 extruders
+### relief.3mf — terrain + water/road caps + grey band, 194.8 mm square at the 216 size, 3 extruders
 
 | Setting | Value |
 |---|---|
@@ -251,12 +324,12 @@ layer height **0.12 mm**, Arachne, and slice gap closing radius **0.01**.
 | Top surface pattern | Monotonic line |
 | Ironing | **No ironing** |
 | Flush into objects' infill | **OFF** |
-| Flush into this object (all three bodies) | **OFF** |
+| Flush into this object (all bodies) | **OFF** |
 | Brim type / width | Outer brim only, **5 mm** |
 | Support | None |
-| Orientation | Long axis (250) along X, flat back on the plate. Leave the front strip free for the prime tower. |
+| Orientation | Flat back on the plate. Leave the front strip free for the prime tower. |
 
-### frame.3mf — black backplate + ring + white text, 250 mm, 14 mm, 2 extruders
+### frame.3mf — black backplate + ring + white text, 215.6 × 226.0 mm, 13.9 mm, 2 extruders
 
 | Setting | Value |
 |---|---|
@@ -270,7 +343,7 @@ layer height **0.12 mm**, Arachne, and slice gap closing radius **0.01**.
 | Flushing volume white → black | 150 mm³ |
 | Brim type / width | Outer brim only, 5 mm |
 
-### path.stl — 1.7 mm × 5–16 mm × ~250 mm ribbon, 1 extruder
+### path.stl — 0.84–1.13 mm × up to 28 mm × up to 150 mm ribbon, 1 extruder
 
 The ribbon follows a curved plan path, so it **cannot** be laid flat on its side —
 a curved-in-plan vertical ribbon is not a planar shape. Print it standing, as designed.
@@ -280,7 +353,7 @@ instead of 133, 10× the bed contact, and the height profile becomes a crisp XY 
 | Setting | Value | Why |
 |---|---|---|
 | Layer height | 0.12 mm | Matches the relief it's glued into; the layer lines are adjacent and visible. |
-| Wall loops | **2** | 2 loops × 2 sides × 0.425 mm = **1.7 mm exactly**. The ribbon becomes pure perimeter — no infill, no gap fill, maximum strength, no under-extruded core. Do not use 1 or 3. |
+| Wall loops | **2** | The ribbon is `groove_w_mm - 2*clearance_mm` wide, and `groove_w_mm`'s floor was raised to 1.44 mm so that comes to **0.84 mm — exactly 2 × 0.42** at the 120 and 170 sizes. Pure perimeter: no infill, no gap fill, no under-extruded core. At 216 the core is 1.13 mm and Arachne widens the same two beads to ~0.57 mm, which is still inside the 0.75–1.5 × nozzle band. Do not use 1 or 3. *(Was "1.7 mm exactly" — that was measured before the sizes and the clearance moved, and at the 1.2 mm floor the fin was 0.60 mm, a single wobbly bead 16 mm tall.)* |
 | Wall generator | Arachne | Absorbs the ±0.05 mm the slot clearance leaves. |
 | Sparse infill density | 0 % (nothing left to fill) | |
 | Top / bottom shell layers | 3 / 3 | |
@@ -337,7 +410,8 @@ Recommendations only — no code. Defaults as they stood when this was written
 (`layer_mm=0.2`, `cap_mm=0.6`, `res_mm=0.4`, `relief_mm=20.0`, `text_mm` scaled,
 `snow_min_mm=3.0` at 250 mm). **Since implemented:** `layer_mm=0.12` on the
 `0.2 + n*0.12` grid, `cap_mm=0.96`, and grey is now an elevation band, not a cap —
-`snow_min_mm` and its morphology are gone (item 4 below no longer applies to grey).
+`snow_min_mm` and its morphology are gone (item 4 below no longer applies to grey);
+then 0.24, see top.
 
 1. **`layer_mm` default → 0.12.** Everything below assumes it. This single change
    multiplies the terrain's vertical quantisation levels by 1.67 over the same relief
@@ -391,16 +465,22 @@ Recommendations only — no code. Defaults as they stood when this was written
    dropped or fuzzy. Snap it: **0.72 mm (6 layers)** or **0.84 mm (7 layers)**. Same
    treatment for `proud_mm` and `SLOT_FLOOR_MM` (1.0 mm is 8.33 layers → use 0.96 mm).
 
-8. **Slot clearance vs. wall arithmetic.** `path.stl` at 1.7 mm is exactly 4 × 0.425 mm
-   extrusions, which is why it prints as pure perimeter. Keep the ribbon width an
-   **even multiple of ~0.42 mm** (1.68, 2.10, 2.52 mm) as `size_mm` scales, rather than
-   a round number — an odd remainder forces gap-fill down the centre of the fin and
-   halves its strength.
+8. **Slot clearance vs. wall arithmetic.** ~~`path.stl` at 1.7 mm is exactly 4 × 0.425 mm
+   extrusions~~ — stale; the fin is `groove_w_mm - 2*clearance_mm`, which the sizes and
+   the clearance have both moved since. **Done in part:** `groove_w_mm`'s floor is 1.44,
+   so the fin is 0.84 mm = exactly 2 × 0.42 at the 120 and 170 sizes. It is 1.13 mm at
+   216, which Arachne prints as two 0.57 mm beads — not gap-filled, but not the
+   whole-bead ideal either. Snapping the fin to whole beads at *every* size is still
+   open, and would widen the visible path line on the large poster.
 
-9. **Reserve plate space for the prime tower.** A 250 × 225 mm relief plus a prime tower
-   is tight on 256 × 256 with Studio's 15 mm edge keep-out. Either document "set prime
-   tower width to 130 mm and place it in the front strip", or default `size_mm` to
-   **240** so a conventional tower fits without fuss.
+9. ~~**Reserve plate space for the prime tower.**~~ **Done, and it was worse than this
+   said.** The rule was never just the tower: a 240 mm poster's frame meshes 239.6 ×
+   250.4 mm — inside the bare 256 plate, which is all `PLATE_MM` ever checked — and the
+   5 mm brim alone takes it to 249.6 × **260.4 mm**, off the bed before the tower is
+   placed. `poster.USABLE_MM` (226 mm) is now the budget every footprint is measured
+   against, in the generator's guard, in `check_output.py` and in the live UI line, and
+   `SIZES_MM` is `(216, 170, 120)` because 216 is the largest grid-exact size whose
+   two-line frame lands inside it (215.6 × 226.0 mm exactly).
 
 10. **Emit the recommended profile alongside the files.** Since the geometry now encodes
     `layer_mm` and `cap_mm` assumptions, the download should state them (a one-line
@@ -451,8 +531,8 @@ section wins, and the contradiction is called out.
 **Since implemented** (items 1–3 of *Generator-side implications* below): the caption is
 **1.20 mm** proud (10 layers), resolved Z dimensions are snapped to whole layers so the
 ring top at `size_mm=170` is **10.88 mm** (`0.2 + 89 × 0.12`) and the caption spans
-layers 89–99, and the caption is set in the box's **bold** face with a measured
-stroke floor of 1.0 mm. Read 0.84 mm and 10.81 mm below as the numbers that motivated
+layers 89–99, and the caption is set in **Trebuchet MS Bold, 0.84 mm target,
+topology-guarded**. Read 0.84 mm and 10.81 mm below as the numbers that motivated
 the change, not as what the generator emits. Item 4 (cap-height floors) is **not**
 implemented: at 170 mm the subtitle is still 3.5 mm, and the stroke floor thickens it
 to the point where its letters touch — raise `size_mm`, `text_mm` or `SUB_RATIO` if
@@ -536,7 +616,7 @@ rounding error and should be maximised, not economised.
 | Setting | Scope | Value | Why |
 |---|---|---|---|
 | Prime tower | G | **ON** | Mandatory. It is the only place the transition filament can go, and it re-stabilises nozzle pressure before the first white bead. Height only needs to reach 11.65 mm here, so it is cheap. |
-| Prime tower width | G | 60 mm is plenty | A 170 mm poster leaves room; §5's 130 mm long-and-shallow trick is a 250 mm-plate problem. |
+| Prime tower width | G | 60 mm is plenty | A 170 mm poster leaves room; §5's 130 mm long-and-shallow trick is a large-plate problem. **Scope note:** `poster.USABLE_MM` budgets 16 mm of plate for the tower, which is the *130 mm-wide* tower plus its brim. A 60 mm tower is ~2× deeper for the same purge, so on the 216 mm size use the wide one — that budget is what makes the largest poster fit at all. |
 | **Flushing volume black → white** | G | **999 mm³ (the maximum)** | Overrides §5's 700. It happens **once**, so the entire cost is ≈ 1.0 cm³ ≈ **1.24 g** of PLA. There is no reason to tune it: black→white is the worst direction (a trace of black pigment tints white grey immediately, while the reverse is invisible), community-recommended range is 500–800 mm³, and users chasing black-into-white bleed routinely max the field at 999. Spend the gram. |
 | Flushing volume white → black | G | 150 mm³ | Never occurs on this plate (white is last), but keep it sane. |
 | Flushing multiplier | G | **1.0** | Do not reduce. |
@@ -710,7 +790,13 @@ recommendation. 4–6 are recommendations only.
    worth ~40 % of stroke width for free; then `_stroke_mm()` measures each line's
    rendered mask by successive erosion and `_thicken()` dilates it until the stroke
    clears `MIN_STROKE_MM = 1.0`, capped at a quarter of the cap height so a counter
-   cannot be welded shut (it says so on stdout when the cap engages). Per line, since
+   cannot be welded shut (it says so on stdout when the cap engages).
+   **Superseded (round 3):** the face is now Trebuchet MS Bold — Arial Bold's g ear,
+   t hook and i-dot sit under 0.2 mm from their stems and any dilation welded them —
+   with "→" borrowed per glyph from Arial Bold; `MIN_STROKE_MM` is a 0.84 mm *target*,
+   and `_dilation_px` only grows a line while its blob/hole topology is unchanged and
+   every counter survives 0.4 mm (`MIN_COUNTER_MM`) more growth. The quarter-cap cap
+   is gone. Measured: 1.07 mm on both lines at 216 and 170 mm. Per line, since
    line 2 is the smaller face and needs the most. Measured at 170 mm: line 1
    1.07 → 1.33 mm, line 2 0.80 → 1.33 mm. Note the erosion stops at three quarters of
    the ink gone, not at an empty mask — eroding to empty measures the fattest feature

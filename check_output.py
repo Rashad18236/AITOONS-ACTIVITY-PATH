@@ -1,10 +1,11 @@
 """Check generated files against the Flight Path Poster spec.
 
-    uv run python check_output.py frame.3mf relief.3mf path.stl
-    uv run python check_output.py frame.3mf relief.3mf path.stl --params '{"size_mm":200}'
+    uv run python check_output.py frame.3mf relief.3mf path.3mf
+    uv run python check_output.py frame.3mf relief.3mf path.3mf --params '{"size_mm":200}'
 
-frame.3mf (black frame + white text) and relief.3mf (green/blue/grey) are multi-body
-coloured 3MFs; path.stl is a binary STL.
+frame.3mf (black frame + white text), relief.3mf (green/blue/grey) and path.3mf (the
+red strip) are OrcaSlicer project 3MFs. Bodies are measured in their local frame:
+read_3mf ignores the build item's bed placement.
 --params takes the same JSON override format as the app: Params field names only,
 unknown keys dropped. Exit 0 if every rule passes, 1 otherwise.
 
@@ -20,21 +21,10 @@ import argparse, json, sys
 from dataclasses import fields
 import numpy as np
 import trimesh
-from poster import (PLATE_MM, SLOT_FLOOR_MM, TEXT_EMBOSS_MM, Params, _grid, _snap,
+from poster import (SLOT_FLOOR_MM, TEXT_EMBOSS_MM, USABLE_MM, Params, _grid, _snap,
                     read_3mf, resolve)
 
 TEXT_MM = TEXT_EMBOSS_MM     # build_poster() white text body thickness
-
-
-def _load(path):
-    """Binary STL -> Trimesh, or raise."""
-    with open(path, "rb") as f:
-        if f.read(5) == b"solid":
-            raise ValueError("ASCII STL, expected binary")
-    m = trimesh.load(path, file_type="stl")
-    if not isinstance(m, trimesh.Trimesh) or len(m.faces) == 0:
-        raise ValueError(f"no mesh loaded ({type(m).__name__})")
-    return m
 
 
 def _load_3mf(path, first):
@@ -53,7 +43,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("frame_3mf")
     ap.add_argument("relief_3mf")
-    ap.add_argument("path_stl")
+    ap.add_argument("path_3mf")
     ap.add_argument("--params", default="{}", help="JSON overrides, Params field names")
     a = ap.parse_args(argv)
     allowed = {f.name for f in fields(Params)}
@@ -68,14 +58,14 @@ def main(argv=None):
     # 1. all three files load
     strip = None
     bodies = frame_bodies = []
-    for label, path, load in (("strip", a.path_stl, _load),
-                              ("frame", a.frame_3mf, lambda q: _load_3mf(q, "frame")),
-                              ("relief", a.relief_3mf, lambda q: _load_3mf(q, "terrain"))):
+    for label, path, first in (("strip", a.path_3mf, "strip"),
+                               ("frame", a.frame_3mf, "frame"),
+                               ("relief", a.relief_3mf, "terrain")):
         try:
-            got = load(path)
+            got = _load_3mf(path, first)
             if label == "strip":
-                strip = got
-                chk("strip loads", True, f"{len(got.faces)} faces", "binary STL")
+                strip = got[0][1]
+                chk("strip loads", True, f"{len(strip.faces)} faces", "3MF, strip first")
             else:
                 names = ", ".join(n for n, _ in got)
                 if label == "frame":
@@ -116,9 +106,12 @@ def main(argv=None):
         for i, (axis, want) in enumerate((("x", p.size_mm),
                                           ("y", p.size_mm + p.chin_mm))):
             ext = hi[i] - lo[i]
+            # ...and against USABLE_MM, not the bare 256 plate: a 240mm frame measured
+            # 250.4mm in y, passed a 256 rule, and could not be sliced — the mandatory
+            # 5mm brim alone put it 4.4mm off the bed. See poster.USABLE_MM.
             chk(f"frame {axis} footprint",
-                abs(ext - want) <= 0.5 and ext <= PLATE_MM,
-                f"{ext:.2f}mm", f"{want}mm +-0.5, <= {PLATE_MM}mm plate")
+                abs(ext - want) <= 0.5 and ext <= USABLE_MM,
+                f"{ext:.2f}mm", f"{want}mm +-0.5, <= {USABLE_MM}mm printable")
 
         # 4. flat back at z=0 (bounds min is the lowest vertex, so nothing is below it)
         chk("frame flat back", abs(lo[2]) <= 0.01, f"z_min {lo[2]:.4f}mm", "0 +-0.01")
@@ -202,7 +195,7 @@ def main(argv=None):
         # follows the *flight altitude* now, so it is no longer bounded by the terrain
         # the track happens to cross — but strip_mesh caps it at the relief's own
         # ceiling (a full-scale peak plus proud_mm), and that bound catches the unit
-        # mixup a raw altitude would produce (12000m over 500m terrain -> 722mm).
+        # mixup a raw altitude would produce (12000m over 500m terrain -> 362mm).
         ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm
         chk("strip seats on slot floor", abs(slo[2] - SLOT_FLOOR_MM) <= 0.01,
             f"{slo[2]:.3f}mm", f"{SLOT_FLOOR_MM:.2f}mm +-0.01")
@@ -214,12 +207,11 @@ def main(argv=None):
         # 11. layer snapping: every relief z lands on a printable layer boundary, so
         # flat ground slices as uniform layers instead of ragged single-layer islands.
         # The grid is first_layer + n*layer_mm (the printer's first layer is thicker),
-        # plus z=0, which is the plate itself. Tolerances are the file formats':
-        # 3MF writes %.3f, binary STL is float32.
+        # plus z=0, which is the plate itself. 3MF writes %.3f, so a snapped z is exact.
         if p.layer_mm > 0:
             for label, m, tol in ([("terrain", terrain, 1e-6)]
                                   + [(n, c, 1e-6) for n, c in caps]
-                                  + [("strip", strip, 1e-4)]):
+                                  + [("strip", strip, 1e-6)]):
                 z = m.vertices[:, 2]
                 z = z[np.abs(z) > tol]                    # z=0 is the build plate
                 off = float(np.abs(z - _snap(z, p)).max()) if len(z) else 0.0
