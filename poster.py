@@ -1442,12 +1442,15 @@ PLATES = {
              "outer_wall_speed": "50", "inner_wall_speed": "80",
              "outer_wall_acceleration": "1000", "flush_volumes_matrix": ["0"]}}
 # Per part, on top of the plate: the caption's 1.07-1.33mm strokes as 3 walls at 0.40.
+# Caption top = one outline + a monotonic top surface, the user's proven "AIToons Sopra"
+# look. 3 walls with only_one_wall_top off filled the 1.1-1.3mm strokes with beads alone:
+# no top surface was ever generated and Orca showed hollow outline letters.
 PART_OVERRIDES = {"text": {
-    "wall_loops": "3", "outer_wall_line_width": "0.4", "inner_wall_line_width": "0.4",
+    "wall_loops": "2", "outer_wall_line_width": "0.4", "inner_wall_line_width": "0.4",
     "top_surface_line_width": "0.4", "internal_solid_infill_line_width": "0.4",
     "sparse_infill_line_width": "0.4", "wall_sequence": "inner wall/outer wall",
-    "ironing_type": "no ironing", "top_shell_layers": "3", "bottom_shell_layers": "1",
-    "only_one_wall_top": "0", "sparse_infill_density": "100%", "outer_wall_speed": "50",
+    "ironing_type": "no ironing", "top_shell_layers": "5", "bottom_shell_layers": "1",
+    "only_one_wall_top": "1", "sparse_infill_density": "100%", "outer_wall_speed": "50",
     "inner_wall_speed": "80", "top_surface_speed": "40"}}
 # AMS slot order per plate, fixed: relief.3mf always declares three filaments, even
 # when a dry lowland poster only uses slot 1 (or 1 and 3), so the slots never shift.
@@ -1473,6 +1476,22 @@ def _project_settings(plate):
                wipe_tower_y=[f"{BRIM_MM:g}"])
     cfg.update(COMMON)
     cfg.update(PLATES[plate])
+    # Orca's GUI only treats the keys listed here as "(modified)" over the named system
+    # presets: [print, filament 1..n, printer]. Left out, the first edit + save in the GUI
+    # wrote the bare 0.24mm Draft preset back (classic walls, 35mm tower, 15% crosshatch)
+    # with only the user's own change on top. The CLI slices the full config either way.
+    first = lambda v: v[0] if isinstance(v, list) else v
+    over = {k for k in {**COMMON, **PLATES[plate]} if k != "flush_volumes_matrix"}  # project-level
+    fil = {k for k in over if k in _ORCA["filament"]}
+    mach = {k for k in over - fil if k in _ORCA["machine"]}
+    proc = over - fil - mach
+    diff = lambda keys, base, i=None: ";".join(sorted(
+        k for k in keys if str(cfg[k][i] if i is not None else first(cfg[k])) != str(first(base.get(k)))))
+    cfg["different_settings_to_system"] = (
+        [diff(proc, _ORCA["process"])]
+        + [diff({k for k in fil if isinstance(cfg[k], list)}, _ORCA["filament"], i) for i in range(n)]
+        + [diff(mach, _ORCA["machine"])])
+    cfg["inherits_group"] = [""] * (n + 2)   # all three are system presets, nothing inherited
     return cfg
 
 

@@ -52,9 +52,15 @@ why. Where they differ from the sections below:
   | frame | 3 / 3 | 0.72 mm | 0.68 mm | 6 / 4 = 0.72 / 0.56 |
   | relief | 3 / 3 | 0.72 mm | 0.68 mm | 5 / 4 = 0.60 / 0.56 |
   | path | 2 / 2 | 0.48 mm | 0.44 mm | 3 / 3 = 0.36 / 0.44 |
-- **Caption walls: 3 loops at 0.40 mm** (per part, text only), not 2 at 0.36. The 0.36
-  was tuned for the old 0.6–0.9 mm strokes; the floored strokes are 1.07–1.33 mm now.
-  `inner wall/outer wall`, 100 % infill, no ironing on the text.
+- **Caption: 2 walls at 0.40 mm, 5 top layers, only one wall on top surfaces ON** (per
+  part, text only), the user's own "AIToons Sopra" look. This **supersedes** the caption
+  section below (2 loops at 0.36, only-one-wall-top OFF) and an interim 3 loops at 0.40:
+  with only-one-wall-top OFF the 1.07–1.33 mm strokes were filled by beads alone, no top
+  surface was ever generated, and Orca showed hollow outline letters on the 216 order.
+  Now the top layer is one outline plus a monotonic top surface, so the letters read
+  filled; measured gap area in the top layer is the same (7.4 vs 6.7 mm² for the whole
+  caption). `inner wall/outer wall`, 100 % infill, no ironing on the text.
+  `test_orca_slices_every_plate` asserts the frame's last layer has a top surface.
 - **`flush_into_infill` OFF on the frame too.** The caption section wins over §3.
 - **Prime tower 130 mm wide at x 63 / y 5**, behind which `write_3mf` centres the
   object (x centred, y centred in 20–256). Sliced at 0.24 on the 216 order, the frame's

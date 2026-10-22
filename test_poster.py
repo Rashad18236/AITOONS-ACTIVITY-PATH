@@ -1238,6 +1238,13 @@ def test_3mf_is_a_finished_orca_project():
         assert len(cfg["filament_type"]) == n                          # filament lists tiled
         assert cfg["wall_loops"] == walls and cfg["prime_tower_width"] == "130"
         assert cfg["wipe_tower_x"] == ["63"] and cfg["wipe_tower_y"] == ["5"]
+        # Orca's GUI keeps only the keys listed as modified: [print, filament 1..n, printer].
+        # Missing, a GUI edit + save reverted every override to the bare system preset.
+        mod = cfg["different_settings_to_system"]
+        assert len(mod) == n + 2 and cfg["inherits_group"] == [""] * (n + 2)
+        assert {"prime_tower_width", "wall_generator"} <= set(mod[0].split(";"))
+        if plate == "frame":
+            assert "nozzle_temperature" in mod[2].split(";")   # the white text, 210 not 220
         model = z.read("3D/3dmodel.model").decode()
         assert "BambuStudio:3mfVersion" in model
         tx, ty, tz = map(float, re.search(r'<item [^>]*transform="1 0 0 0 1 0 0 0 1 '
@@ -1248,7 +1255,8 @@ def test_3mf_is_a_finished_orca_project():
         assert obj.find('metadata[@key="flush_into_objects"]').get("value") == "0"
         if plate == "frame":
             text = {e.get("key"): e.get("value") for e in obj.findall("part")[1]}
-            assert text["extruder"] == "2" and text["wall_loops"] == "3"
+            assert text["extruder"] == "2" and text["wall_loops"] == "2"
+            assert text["only_one_wall_top"] == "1"   # the caption gets a filled top surface
             assert text["ironing_type"] == "no ironing"
         # placement is the item's alone: the meshes still read back in their local frame
         assert np.allclose(poster.read_3mf(z.fp.getvalue())[0][1], bodies[0][0].vertices,
@@ -1278,6 +1286,8 @@ def test_orca_slices_every_plate(monkeypatch, tmp_path):
         assert cfg["enable_prime_tower"] == ("1" if len(poster.SLOTS[plate]) > 1 else "0")
         assert cfg["wall_loops"] == poster.PLATES[plate]["wall_loops"]
         assert cfg["filament_colour"] == ";".join(poster.COLORS[k] for k in poster.SLOTS[plate])
+        if plate == "frame":   # bead-only caption tops read as hollow outline letters in Orca
+            assert "; FEATURE: Top surface" in g.split("; CHANGE_LAYER")[-1]
 
 
 def _text_body(**kw):
