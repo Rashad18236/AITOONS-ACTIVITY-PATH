@@ -1238,6 +1238,9 @@ def test_3mf_is_a_finished_orca_project():
         assert len(cfg["filament_type"]) == n                          # filament lists tiled
         assert cfg["wall_loops"] == walls and cfg["prime_tower_width"] == "130"
         assert cfg["wipe_tower_x"] == ["63"] and cfg["wipe_tower_y"] == ["5"]
+        assert cfg["top_surface_speed"] == "50"                        # the user's standard
+        if plate != "path":   # Draft's 200/230 less 50; the path keeps its own slower walls
+            assert (cfg["outer_wall_speed"], cfg["inner_wall_speed"]) == ("150", "180")
         # Orca's GUI keeps only the keys listed as modified: [print, filament 1..n, printer].
         # Missing, a GUI edit + save reverted every override to the bare system preset.
         mod = cfg["different_settings_to_system"]

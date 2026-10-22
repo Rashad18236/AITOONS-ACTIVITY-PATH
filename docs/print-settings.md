@@ -61,6 +61,12 @@ why. Where they differ from the sections below:
   filled; measured gap area in the top layer is the same (7.4 vs 6.7 mm² for the whole
   caption). `inner wall/outer wall`, 100 % infill, no ironing on the text.
   `test_orca_slices_every_plate` asserts the frame's last layer has a top surface.
+- **Speeds: the user's standard is 50 mm/s under the A1 Draft preset, top surfaces at
+  50 mm/s** (`SLOWER_MM_S` in `poster.py`): outer wall 200 → 150, inner wall / sparse /
+  internal solid / gap infill 230 → 180, first-layer infill 105 → 55. Speeds already at or
+  under 50–80 (first layer, bridges, the path's walls, the caption's 50/80/40) stay as they
+  are. Sliced on the 216 order: frame 2.70 → 3.64 h, relief 9.55 → 9.83 h, path unchanged
+  at 0.86 h (its walls were already slow).
 - **`flush_into_infill` OFF on the frame too.** The caption section wins over §3.
 - **Prime tower 130 mm wide at x 63 / y 5**, behind which `write_3mf` centres the
   object (x centred, y centred in 20–256). Sliced at 0.24 on the 216 order, the frame's

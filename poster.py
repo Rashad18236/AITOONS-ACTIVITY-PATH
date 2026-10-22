@@ -1419,7 +1419,14 @@ COMMON = {
     "flush_into_infill": "0", "flush_into_objects": "0", "flush_into_support": "1",
     "interface_shells": "0", "mmu_segmented_region_max_width": "0",
     "brim_type": "outer_only", "brim_object_gap": "0", "enable_support": "0",
-    "initial_layer_speed": "50"}
+    "initial_layer_speed": "50", "top_surface_speed": "50"}
+# User's standard: every print speed 50 mm/s under the A1 Draft preset (200/230 -> 150/180,
+# first-layer infill 105 -> 55), top surfaces at 50. Already-slow speeds (first layer and
+# bridges at 50, the path's and the caption's own) are left alone rather than zeroed.
+SLOWER_MM_S = 50
+COMMON.update({k: str(int(_ORCA["process"][k][0]) - SLOWER_MM_S) for k in (
+    "outer_wall_speed", "inner_wall_speed", "sparse_infill_speed",
+    "internal_solid_infill_speed", "gap_infill_speed", "initial_layer_infill_speed")})
 PLATES = {
     # 0.24 layers, walls 2, top 3: the user's print-time cut (docs/print-settings.md head)
     "relief": {"wall_loops": "2", "top_shell_layers": "3", "bottom_shell_layers": "3",
