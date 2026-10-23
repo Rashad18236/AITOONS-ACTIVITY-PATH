@@ -1,4 +1,6 @@
 import datetime as dt
+import io
+import zipfile
 
 import numpy as np
 import pytest
@@ -70,6 +72,34 @@ def _fit(sessions, t0=T0):
                                  "sport": sport, "message_index": i})
         t, lon0 = end, lon0 + n * 1e-4
     return e.close()
+
+
+def _health_zip(workouts, hr, pad_cda=4096):
+    """iPhone-style export.zip from workouts [(type, "YYYY-MM-DD HH:MM:SS +ZZZZ", n)] and HR
+    records [(date, bpm)]: export.xml with its DOCTYPE, one route GPX per workout with n > 0
+    fixes 1 s apart (UTC, no HR), and an export_cda.xml of pad_cda bytes stored uncompressed."""
+    fmt = "%Y-%m-%d %H:%M:%S %z"
+    recs = "".join(f' <Record type="HKQuantityTypeIdentifierHeartRate" sourceName="Watch" '
+                   f'unit="count/min" creationDate="{d}" startDate="{d}" endDate="{d}" value="{v}"/>\n'
+                   for d, v in hr)
+    buf, wos = io.BytesIO(), ""
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for i, (ty, start, n) in enumerate(workouts):
+            t0 = dt.datetime.strptime(start, fmt)
+            end = (t0 + dt.timedelta(seconds=max(n, 60))).strftime(fmt)
+            route = ""
+            if n:
+                z.writestr(f"apple_health_export/workout-routes/route_{i}.gpx",
+                           _gpx([(None, _pts(n, hr=None, t0=t0.astimezone(dt.timezone.utc)))]))
+                route = (f'\n  <WorkoutRoute sourceName="Watch" startDate="{start}" endDate="{end}">'
+                         f'\n   <FileReference path="/workout-routes/route_{i}.gpx"/>\n  </WorkoutRoute>\n ')
+            wos += (f' <Workout workoutActivityType="HKWorkoutActivityType{ty}" duration="{max(n, 60) / 60}" '
+                    f'durationUnit="min" sourceName="Watch" startDate="{start}" endDate="{end}">{route}</Workout>\n')
+        z.writestr("apple_health_export/export.xml",
+                   '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE HealthData [<!ELEMENT HealthData ANY>]>\n'
+                   f'<HealthData locale="en_CH">\n{recs}{wos}</HealthData>\n')
+        z.writestr("apple_health_export/export_cda.xml", b" " * pad_cda, compress_type=zipfile.ZIP_STORED)
+    return buf.getvalue()
 
 
 @pytest.mark.parametrize("raw,fam", [
@@ -145,3 +175,57 @@ def test_parse_fit_refuses_a_non_fit_file():
 def test_parse_fit_reports_a_damaged_file_as_a_value_error_naming_it():
     with pytest.raises(ValueError, match="cut.fit"):
         activity.parse_fit(_fit([("running", 3, 150)])[:-5], "cut.fit")
+
+RUN_0800 = ("Running", "2026-05-01 08:00:00 +0200", 60)
+EVERY_5S = [(f"2026-05-01 08:00:{s:02d} +0200", 150) for s in range(0, 60, 5)]
+
+def test_health_export_takes_the_workout_and_joins_hr_by_time():
+    leg = activity.parse_health_zip(io.BytesIO(_health_zip([RUN_0800], EVERY_5S)), "2026-05-01")
+    assert leg.sport == "run" and len(leg.lat) == 60 and np.allclose(leg.hr, 150)
+    assert leg.source == "Health: Running 2026-05-01 08:00"
+
+def test_health_export_never_guesses_between_two_workouts():
+    z = _health_zip([("Running", "2026-05-01 08:00:00 +0200", 30),
+                     ("Cycling", "2026-05-01 17:45:00 +0200", 30)], [])
+    with pytest.raises(ValueError) as e:
+        activity.parse_health_zip(io.BytesIO(z), "2026-05-01")
+    assert "08:00" in str(e.value) and "17:45" in str(e.value)
+    assert activity.parse_health_zip(io.BytesIO(z), "2026-05-01", "17:40").sport == "bike"
+
+def test_health_export_refuses_a_day_without_a_route():
+    z = _health_zip([("Running", "2026-05-01 08:00:00 +0200", 0)], [])
+    with pytest.raises(ValueError, match="no workout with a route"):
+        activity.parse_health_zip(io.BytesIO(z), "2026-05-01")
+
+def test_health_export_leaves_hr_gaps_missing():
+    recs = [(f"2026-05-01 08:00:{s:02d} +0200", 150) for s in (0, 5, 10, 55)]
+    leg = activity.parse_health_zip(io.BytesIO(_health_zip([RUN_0800], recs)), "2026-05-01")
+    assert np.isfinite(leg.hr[:15]).all() and np.isnan(leg.hr[30])
+
+def test_health_export_keeps_hr_after_local_midnight():
+    recs = [(f"2026-05-01 23:5{m}:00 +0200", 140) for m in range(10)] + [("2026-05-02 00:05:00 +0200", 140)]
+    z = _health_zip([("Walking", "2026-05-01 23:50:00 +0200", 1200)], recs)
+    leg = activity.parse_health_zip(io.BytesIO(z), "2026-05-01")
+    assert leg.hr[900] == 140          # 00:05:00, the next calendar day
+
+def test_health_export_refuses_an_apple_watch_triathlon():
+    z = _health_zip([("SwimBikeRun", "2026-05-01 08:00:00 +0200", 30)], [])
+    with pytest.raises(ValueError, match="Strava or HealthFit"):
+        activity.parse_health_zip(io.BytesIO(z), "2026-05-01")
+
+def test_health_export_needs_the_workout_date():
+    with pytest.raises(ValueError, match="workout date"):
+        activity.parse_health_zip(io.BytesIO(_health_zip([], [])), "")
+
+def test_health_export_takes_the_exact_start_when_two_workouts_are_close():
+    z = _health_zip([("Running", "2026-05-01 07:45:00 +0200", 30),
+                     ("Running", "2026-05-01 08:05:00 +0200", 30)], [])
+    with pytest.raises(ValueError, match="07:45 Running, 08:05 Running"):
+        activity.parse_health_zip(io.BytesIO(z), "2026-05-01", "08:00")
+    assert activity.parse_health_zip(io.BytesIO(z), "2026-05-01", "08:05").source.endswith("08:05")
+    with pytest.raises(ValueError, match="within 30 minutes"):
+        activity.parse_health_zip(io.BytesIO(z), "2026-05-01", "12:00")
+
+def test_health_export_refuses_a_file_that_is_not_a_zip():
+    with pytest.raises(ValueError, match="export.zip: not a readable"):
+        activity.parse_health_zip(io.BytesIO(b"hello"), "2026-05-01", name="export.zip")

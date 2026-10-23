@@ -2,11 +2,15 @@
 import bisect
 import datetime as dt
 import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass
+from typing import BinaryIO
 import numpy as np
 from garmin_fit_sdk import Decoder, Stream
 
 HR_WINDOW_S = 30.0  # rolling heart-rate window: optical sensors spike and drop out
+HR_GAP_S = 15.0  # a Health route point further than this from every HR record stays NaN
+_HK = "HKWorkoutActivityType"
 
 
 @dataclass
@@ -135,3 +139,82 @@ def parse_fit(data: bytes, name: str = "") -> list[Leg]:
         if i >= 0 and j < len(real):
             out[real[j]].append(row)
     return [_leg(sports[i], out[i], name) for i in real]
+
+
+def parse_health_zip(f: BinaryIO, workout_date: str, workout_time: str = "", name: str = "") -> Leg:
+    """One workout out of an Apple Health export.zip, read in place (never extracted) in one
+    streaming pass over export.xml. The workout is the one with a route that started on
+    workout_date, picked by workout_time (within 30 min, an exact minute breaking a tie) when
+    the day has several; anything else is refused with the candidates listed, never guessed.
+    The route GPX has no heart rate, so each point takes the HR records interpolated by time."""
+    pre = f"{name}: " if name else ""
+    if not workout_date:
+        raise ValueError(f"{pre}Apple Health export: give the workout date")
+    try:
+        day = dt.date.fromisoformat(workout_date)
+        at = dt.time.fromisoformat(workout_time) if workout_time else None
+    except ValueError:
+        raise ValueError(f"{pre}Apple Health export: the workout date is YYYY-MM-DD "
+                         "and the start time HH:MM") from None
+    date, days = str(day), {str(day + dt.timedelta(days=k)) for k in (-1, 0, 1)}
+    try:
+        with zipfile.ZipFile(f) as z:
+            xml = max((i for i in z.infolist() if i.filename.endswith(".xml") and "cda" not in i.filename),
+                      key=lambda i: i.file_size, default=None)  # by size: the name follows the locale
+            if xml is None:
+                raise ValueError(f"{pre}not an Apple Health export, the zip holds no export.xml")
+            recs, found = [], []
+            with z.open(xml) as x:
+                it = ET.iterparse(x, ("start", "end"))
+                _, root = next(it)
+                depth = 0
+                for ev, el in it:
+                    depth += 1 if ev == "start" else -1
+                    if ev == "start" or depth:
+                        continue  # only the root's children, each once it is complete
+                    start = el.get("startDate", "")
+                    if (el.tag == "Record" and el.get("type") == "HKQuantityTypeIdentifierHeartRate"
+                            and start[:10] in days):  # ±1 day: a workout can run past midnight
+                        recs.append((dt.datetime.strptime(start, "%Y-%m-%d %H:%M:%S %z").timestamp(),
+                                     float(el.get("value"))))
+                    elif el.tag == "Workout" and start[:10] == date:
+                        ref = el.find("WorkoutRoute/FileReference")
+                        if ref is not None and ref.get("path"):
+                            found.append((start, el.get("workoutActivityType", ""), ref.get("path")))
+                    root.clear()  # memory stays flat on a multi-GB export
+            start, ty, path = _pick_workout(found, date, at, pre)
+            member = next((n for n in z.namelist() if n.endswith(path)), None)
+            if member is None:
+                raise ValueError(f"{pre}the export lacks the workout's route {path}")
+            legs = parse_gpx(z.read(member), name)
+    except (zipfile.BadZipFile, ET.ParseError) as e:
+        raise ValueError(f"{pre}not a readable Apple Health export.zip ({e})") from None
+    lat, lon, t = (np.concatenate([getattr(l, k) for l in legs]) for k in ("lat", "lon", "t"))
+    hr = np.full(len(t), np.nan)
+    if recs:
+        rt, rv = np.array(sorted(recs)).T
+        j = np.searchsorted(rt, t)
+        gap = np.minimum(abs(t - rt[np.maximum(j - 1, 0)]), abs(rt[np.minimum(j, len(rt) - 1)] - t))
+        hr = np.where(gap <= HR_GAP_S, np.interp(t, rt, rv), np.nan)
+    return Leg(sport_family(ty), lat, lon, t, hr, f"Health: {ty.removeprefix(_HK)} {date} {start[11:16]}")
+
+
+def _pick_workout(found, date, at, pre):
+    """(startDate, type, route path) of the one workout meant; ValueError listing the rest."""
+    if not found:
+        raise ValueError(f"{pre}no workout with a route on {date}")
+    listing = lambda ws: ", ".join(f"{s[11:16]} {ty.removeprefix(_HK)}" for s, ty, _ in ws)
+    if at is not None:
+        off = lambda s: abs(int(s[11:13]) * 60 + int(s[14:16]) - at.hour * 60 - at.minute)
+        near = [w for w in found if off(w[0]) <= 30]
+        if not near:
+            raise ValueError(f"{pre}no workout with a route starts within 30 minutes of "
+                             f"{at:%H:%M} on {date}, the day has {listing(found)}")
+        found = [w for w in near if off(w[0]) == 0] or near
+    if len(found) > 1:
+        raise ValueError(f"{pre}{len(found)} workouts with a route on {date} ({listing(found)}): "
+                         "give the exact start time of the one to print")
+    if "SwimBikeRun" in found[0][1]:
+        raise ValueError(f"{pre}Apple Watch triathlon: send the Strava or HealthFit files "
+                         "for each leg instead")
+    return found[0]
