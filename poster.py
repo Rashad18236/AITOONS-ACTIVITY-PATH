@@ -6,6 +6,7 @@ import numpy as np
 import requests
 import trimesh
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
+import activity
 
 
 def parse_track(name: str, data: bytes) -> np.ndarray:
@@ -578,6 +579,7 @@ class Params:
     chin_mm: float | None = None  # extra frame height BELOW the square, for the caption
     res_mm: float = 0.4
     proud_mm: float | None = None
+    wall_mm: float | None = None   # wall height above proud_mm across HR_SCALE_BPM
     cap_mm: float = 0.96     # water cap slab thickness (4 layers); grey is a band, not a cap
     plate_mm: float = 2.12   # relief plate base thickness, 0.2 + 8*0.24 (slot floor sits above 0)
     fit_mm: float = 0.2      # gap per side between relief plate and frame ring
@@ -600,7 +602,8 @@ class Params:
 # with no perimeter pair to brace it. 1.44 - 0.60 = 0.84mm is exactly 2 x 0.42, the
 # "pure perimeter, no gap fill" case docs/print-settings.md section 5 tunes the path for.
 _SCALED = {"frame_mm": (12.0, 4.0), "relief_mm": (20.0, 5.0), "frame_height_mm": (9.96, 3.0),
-           "text_mm": (8.0, 3.0), "groove_w_mm": (2.0, 1.44), "proud_mm": (0.96, 0.4)}
+           "text_mm": (8.0, 3.0), "groove_w_mm": (2.0, 1.44), "proud_mm": (0.96, 0.4),
+           "wall_mm": (12.0, 3.0)}   # a starting value, tuned on the first test print
 
 
 def _layers(v, p, mul=1.0):
@@ -633,7 +636,7 @@ def resolve(p: Params) -> Params:
     # top, relief ceiling) is on the grid by construction. frame_mm, text_mm,
     # groove_w_mm and chin_mm are XY and are deliberately left alone.
     p = replace(p, frame_height_mm=_layers(p.frame_height_mm, p),
-                proud_mm=_layers(p.proud_mm, p),
+                proud_mm=_layers(p.proud_mm, p), wall_mm=_layers(p.wall_mm, p),
                 relief_mm=_layers(p.relief_mm, p, p.exaggeration))
     if p.chin_mm is None:
         # Auto chin: whatever the caption needs beyond the bottom bar it already has.
@@ -1031,6 +1034,59 @@ def _offsets(track_px):
     tang = np.gradient(C, axis=0)
     tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-12
     return C, np.stack([-tang[:, 1], tang[:, 0]], 1), d, t
+
+
+# One heart-rate scale for every customer, so a relaxed run prints low, a race tall,
+# and two posters compare. At or under the low end (or no HR) the wall is proud_mm.
+HR_SCALE_BPM = (100.0, 200.0)
+# The walls are rasterised on a grid this much finer than res_mm, like TEXT_SUB: a
+# 1.4mm strip is 3.5 px at 0.4mm and would stair-step by a third of its width.
+WALL_SUB = 4
+# Fine pixels added to the drawn strip width: rasterising and the four-corner cell rule
+# each shave about a pixel off a drawn width, and the meshed strip must never come out
+# under its core groove_w_mm - 2*clearance_mm (spec 6.5 allows "a couple" of pixels).
+WALL_PAD_PX = 2
+
+
+def wall_height(hr: np.ndarray, p: Params) -> np.ndarray:
+    """mm above the ground under each station: proud_mm, plus wall_mm across HR_SCALE_BPM."""
+    lo, hi = HR_SCALE_BPM
+    return p.proud_mm + np.nan_to_num(np.clip((hr - lo) / (hi - lo), 0, 1)) * p.wall_mm
+
+
+def _wall_dims(p: Params) -> tuple[float, float, int, float]:
+    """(res_f, W_mm, dil_px, lane_mm) for rasterising the walls of a RESOLVED p.
+
+    res_f   fine-grid pixel, res_mm / WALL_SUB.
+    W_mm    the drawn strip width: the strip core groove_w_mm - 2*clearance_mm plus
+            WALL_PAD_PX fine pixels, so the meshed strip never comes out under the core.
+    dil_px  fine pixels the crossing cut grows a wall by, clearance_mm rounded UP.
+    lane_mm centre-to-centre spacing of side-by-side walls: one W_mm strip plus its
+            dil_px cut plus one fine pixel, so a neighbour's cut never bites this wall."""
+    res_f = p.res_mm / WALL_SUB
+    W = p.groove_w_mm - 2 * p.clearance_mm + WALL_PAD_PX * res_f
+    dil = math.ceil(round(p.clearance_mm / res_f, 6))   # 0.3/0.1 is 2.9999999999999996
+    return res_f, W, dil, W + (dil + 1) * res_f
+
+
+def legs_bounds(legs: list[activity.Leg], margin_pct: float) -> tuple:
+    """track_bounds over every point of every leg: one square map for the whole order."""
+    return track_bounds([(la, lo, 0.0) for l in legs for la, lo in zip(l.lat, l.lon)],
+                        margin_pct)
+
+
+def leg_stations(leg: activity.Leg, bounds, M: int) -> tuple[np.ndarray, np.ndarray]:
+    """(P (k,2) relief-plate px about 1 px apart, hr (k,) smoothed bpm, NaN where none).
+
+    HR is carried as a weighted interpolation: the NaN-zeroed signal and its finite
+    weight v are interpolated separately and divided, so a station keeps the finite
+    neighbours' bpm where they carry at least half the weight, and is NaN (the low
+    line) where the gap does. A plain interp of s would smear NaN one fix wide."""
+    C, _, d, t = _offsets(_to_px(zip(leg.lat, leg.lon), bounds, M))
+    s = activity.smooth_hr(leg.t, leg.hr)
+    v = np.interp(t, d, np.isfinite(s))
+    return C, np.divide(np.interp(t, d, np.nan_to_num(s)), v,
+                        out=np.full(len(t), np.nan), where=v >= 0.5)
 
 
 def _grid_faces(idx):

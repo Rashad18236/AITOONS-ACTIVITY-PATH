@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
+import activity
 import poster
 
 
@@ -113,7 +114,7 @@ def _params(**kw):
     return poster.resolve(poster.Params(**{
         "size_mm": 40.0, "frame_mm": 4.0, "res_mm": 0.5, "relief_mm": 20.0,
         "frame_height_mm": 9.96, "text_mm": 8.0, "groove_w_mm": 2.0,
-        "proud_mm": 0.96, **kw}))
+        "proud_mm": 0.96, "wall_mm": 12.0, **kw}))
 
 
 def test_resolve_at_250_is_the_legacy_defaults():
@@ -126,6 +127,7 @@ def test_resolve_at_250_is_the_legacy_defaults():
     assert p.text_mm == 8.0
     assert p.groove_w_mm == 2.0
     assert p.proud_mm == 0.96            # was 1.0: 4 layers of 0.24
+    assert p.wall_mm == 12.0             # 50 layers: the 100-200 bpm range of the wall
     assert p.chin_mm == 0.0              # no caption -> the frame stays square
 
 
@@ -200,6 +202,39 @@ def test_resolve_rejects_a_slot_too_narrow_to_print():
 def _mpx(p):
     """Relief-grid side M: full grid minus the frame ring and the fit gap, per side."""
     return poster._grid(p)[1]
+
+
+def _leg(sport, n, hr, t0=0.0, lat0=47.0, lon0=8.0, dlon=1e-4):
+    """An activity.Leg heading east, 1 s per point; hr is a bpm or a callable of the index."""
+    i = np.arange(n)
+    hr = np.array([hr(k) for k in i], float) if callable(hr) else np.full(n, float(hr))
+    return activity.Leg(sport, np.full(n, lat0), lon0 + i * dlon, t0 + i.astype(float), hr)
+
+
+def test_wall_mm_auto_scales_in_whole_layers():
+    for size, want in ((250, 12.0), (216, 10.56), (120, 5.76)):
+        assert poster.resolve(poster.Params(size_mm=size)).wall_mm == want
+
+
+def test_wall_height_follows_the_fixed_bpm_scale():
+    h = poster.wall_height(np.array([90, 100, 150, 200, 230, np.nan]), _params())
+    assert np.allclose(h, [0.96, 0.96, 6.96, 12.96, 12.96, 0.96])
+
+
+def test_wall_dims_keep_neighbouring_lanes_clear_of_the_crossing_cut():
+    for res in (0.5, 0.4, 0.25):
+        p = _params(res_mm=res)
+        res_f, W, dil, lane = poster._wall_dims(p)
+        assert W >= p.groove_w_mm - 2 * p.clearance_mm
+        assert lane - W > dil * res_f
+
+
+def test_leg_stations_resample_one_per_pixel_and_carry_smoothed_hr():
+    p = _params()
+    leg = _leg("run", 300, lambda i: 120.0 if i < 150 else np.nan)
+    P, hr = poster.leg_stations(leg, poster.legs_bounds([leg], p.margin_pct), _mpx(p))
+    assert len(P) > 8 and abs(np.hypot(*np.diff(P, axis=0).T).mean() - 1.0) < 0.05
+    assert np.allclose(hr[: len(hr) // 3], 120) and np.isnan(hr[-1])
 
 
 def test_relief_plate_clears_the_frame_ring():
