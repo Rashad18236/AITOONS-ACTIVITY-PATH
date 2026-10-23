@@ -1089,6 +1089,93 @@ def leg_stations(leg: activity.Leg, bounds, M: int) -> tuple[np.ndarray, np.ndar
                         out=np.full(len(t), np.nan), where=v >= 0.5)
 
 
+def _rows(m, n):
+    """Row slices of an (m, n) pairwise job, ~2M cells each, so memory stays flat."""
+    # ponytail: O(n^2) in chunks; grid buckets if a wall ever passes ~20k stations
+    step = max(1, 2_000_000 // max(n, 1))
+    return [slice(s, s + step) for s in range(0, m, step)]
+
+
+def _near(X, Y, r):
+    """Yield (rows, |X[rows] - Y| < r) as a (rows, len(Y)) bool block."""
+    for sl in _rows(len(X), len(Y)):
+        yield sl, np.hypot(X[sl, :1] - Y[:, 0], X[sl, 1:] - Y[:, 1]) < r
+
+
+def _nearest_on_segments(Q: np.ndarray, A: np.ndarray, B: np.ndarray
+                         ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(feet (m,2), dist (m,), segment index (m,)) of each Q on its nearest A[k]-B[k].
+
+    A segment with A == B is a point; the index is how a caller finds the direction."""
+    AB, feet = B - A, np.empty((len(Q), 2))
+    L2, dist, k = (AB ** 2).sum(1), np.empty(len(Q)), np.empty(len(Q), int)
+    for sl in _rows(len(Q), len(A)):
+        q = Q[sl, None]
+        t = ((q - A) * AB).sum(-1)
+        t = np.clip(np.divide(t, L2, out=np.zeros_like(t), where=L2 > 0), 0, 1)
+        F = A + t[..., None] * AB
+        d = np.hypot(*(q - F).transpose(2, 0, 1))
+        k[sl] = j = d.argmin(1)
+        r = np.arange(len(j))
+        feet[sl], dist[sl] = F[r, j], d[r, j]
+    return feet, dist, k
+
+
+def _ramp(mask: np.ndarray, piece: np.ndarray, k: int) -> np.ndarray:
+    """Per station, min(1, d/k), d the index distance to the nearest False of its own piece.
+
+    Eases a snap in and out over k stations instead of kinking the wall. False is 0, a
+    piece with no False is all 1: a piece end is not False, so a pass that starts or
+    ends on a shared road needs no ramp there."""
+    d = np.full(len(mask), np.inf)
+    for g in np.unique(piece):
+        s = np.flatnonzero(piece == g)
+        f = np.flatnonzero(~mask[s])
+        if len(f):
+            x = np.arange(len(s))
+            j = np.searchsorted(f, x)
+            d[s] = np.minimum(abs(x - f[np.maximum(j - 1, 0)]), abs(f[np.minimum(j, len(f) - 1)] - x))
+    return np.minimum(1.0, d / k)
+
+
+def collapse_passes(pieces: list[tuple[np.ndarray, np.ndarray]], r_px: float, ramp: int
+                    ) -> list[tuple[np.ndarray, np.ndarray]]:
+    """One wall's (P, hr) pieces, in time order -> the same shapes, repeats collapsed.
+
+    A station within r_px of an earlier one (another piece, or more than 3*r_px
+    stations back in its own) is a repeat pass: it snaps, eased by _ramp, onto the
+    polyline of the non-repeats, so a lap or an out-and-back prints one wall, never two
+    offset by GPS drift (spec 6.5). Every station's hr is then the mean of the finite
+    hr within r_px of its new position: no-HR passes do not dilute it, and a stretch
+    no pass has HR on stays NaN, the low line."""
+    n_k = [len(q) for q, _ in pieces]
+    P = np.concatenate([q for q, _ in pieces]).astype(float)
+    hr = np.concatenate([h for _, h in pieces]).astype(float)
+    g = np.repeat(np.arange(len(pieces)), n_k)
+    a = np.concatenate([np.arange(m) for m in n_k])
+    i = np.arange(len(P))
+    rep = np.zeros(len(P), bool)
+    for sl, near in _near(P, P, r_px):
+        rep[sl] = (near & (i < i[sl, None])
+                   & ((g != g[sl, None]) | (a[sl, None] - a > 3 * r_px))).any(1)
+    canon = ~rep
+    seg = np.flatnonzero(canon[:-1] & canon[1:] & (g[:-1] == g[1:]))
+    lone = canon.copy(); lone[seg] = lone[seg + 1] = False   # no canonical neighbour
+    lone = np.flatnonzero(lone)
+    new = P.copy()
+    if rep.any():
+        foot = _nearest_on_segments(P[rep], P[np.r_[seg, lone]], P[np.r_[seg + 1, lone]])[0]
+        new[rep] += _ramp(rep, g, ramp)[rep, None] * (foot - P[rep])
+    ok = np.isfinite(hr)
+    hw = np.stack([np.where(ok, hr, 0.0), ok], 1)
+    out = np.full(len(P), np.nan)
+    for sl, near in _near(new, new, r_px):
+        s, c = (near @ hw).T
+        out[sl] = np.divide(s, c, out=np.full(len(c), np.nan), where=c > 0)
+    cut = np.cumsum(n_k)[:-1]
+    return list(zip(np.split(new, cut), np.split(out, cut)))
+
+
 def _grid_faces(idx):
     a = idx[:-1, :-1].ravel(); b = idx[:-1, 1:].ravel()
     c = idx[1:, 1:].ravel(); d = idx[1:, :-1].ravel()

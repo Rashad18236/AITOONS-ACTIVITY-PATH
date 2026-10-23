@@ -237,6 +237,61 @@ def test_leg_stations_resample_one_per_pixel_and_carry_smoothed_hr():
     assert np.allclose(hr[: len(hr) // 3], 120) and np.isnan(hr[-1])
 
 
+def _line(x0, x1, y, hr):
+    """A station piece stepping 1 px along x from x0 to x1 inclusive, at height y."""
+    x = np.linspace(x0, x1, abs(x1 - x0) + 1)
+    return np.stack([x, np.full(len(x), y)], 1), np.full(len(x), float(hr))
+
+
+def _arc(cx, cy, R, hr):
+    """One lap of a circle from angle 0, stations 1 px apart along it."""
+    th = np.arange(int(np.ceil(2 * np.pi * R))) / R
+    return np.stack([cx + R * np.cos(th), cy + R * np.sin(th)], 1), np.full(len(th), float(hr))
+
+
+def _cat(*pieces):
+    return np.concatenate([P for P, _ in pieces]), np.concatenate([h for _, h in pieces])
+
+
+def test_an_out_and_back_collapses_onto_one_line_at_the_average_hr():
+    (P, hr), = poster.collapse_passes([_cat(_line(10, 90, 50.0, 120), _line(90, 10, 50.6, 160))], r_px=4, ramp=4)
+    back, xb = P[81:], P[81:, 0]
+    assert np.all(back[(xb >= 12) & (xb <= 75), 1] == 50.0)
+    xo = P[:81, 0]
+    assert np.allclose(hr[:81][(xo >= 16) & (xo <= 74)], 140)
+
+
+def test_passes_without_hr_do_not_dilute_the_average():
+    (P, hr), = poster.collapse_passes([_cat(_line(10, 90, 50.0, 120), _line(90, 10, 50.6, np.nan))], r_px=4, ramp=4)
+    xo = P[:81, 0]
+    assert np.allclose(hr[:81][(xo >= 16) & (xo <= 74)], 120)
+
+
+def test_a_stretch_without_hr_on_any_pass_stays_missing():
+    (_, hr), = poster.collapse_passes([_line(10, 90, 50.0, np.nan)], r_px=4, ramp=4)
+    assert np.isnan(hr).all()
+
+
+def test_roads_further_apart_than_r_stay_separate():
+    piece = _cat(_line(10, 90, 50.0, 120), _line(90, 10, 58.0, 160))
+    (P, hr), = poster.collapse_passes([piece], r_px=4, ramp=4)
+    assert np.array_equal(P, piece[0]) and np.allclose(hr, piece[1])
+
+
+def test_the_same_activity_sent_twice_is_one_wall():
+    a, b = _line(10, 90, 50.0, 130), _line(10, 90, 50.3, 130)
+    (Pa, _), (Pb, hb) = poster.collapse_passes([a, b], r_px=4, ramp=4)
+    assert np.array_equal(Pa, a[0]) and np.allclose(Pb, Pa) and np.allclose(hb, 130)
+
+
+def test_three_laps_collapse_onto_the_first_at_the_mean_hr():
+    laps = [_arc(30, 30, 20 + 0.3 * k, hr) for k, hr in enumerate((120, 150, 180))]
+    (P, hr), = poster.collapse_passes([_cat(*laps)], r_px=4, ramp=4)
+    n = len(laps[0][0])
+    assert poster._nearest_on_segments(P[n:], P[:n - 1], P[1:n])[1].max() < 1e-6
+    assert np.allclose(hr[12:n - 12], 150, atol=3)
+
+
 def test_relief_plate_clears_the_frame_ring():
     """The relief plate must be at least fit_mm smaller than the ring opening per
     side, at every resolution — a gap that rounds down to zero is an interference
