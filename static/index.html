@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Flight Path Poster</title>
+<title>Activity Path Poster</title>
 <style>
   body { font: 14px system-ui; margin: 0; display: flex; height: 100vh; }
   #panel { width: 300px; padding: 16px; overflow-y: auto; background: #f4f4f4; }
@@ -23,7 +23,7 @@
 </head>
 <body>
 <div id="panel">
-  <h3>Flight Path Poster</h3>
+  <h3>Activity Path Poster</h3>
   <label>FR24 track (KML/CSV)</label><input type="file" id="file" accept=".kml,.csv">
   <label>Text (bottom frame bar)</label><input id="text" placeholder="ZURICH → GENEVA">
   <label>Second line (smaller)</label><input id="text2" placeholder="HB-EZE · 12.07.2026">
@@ -39,10 +39,6 @@
   <label>Path slot width mm</label><input id="groove_w_mm" type="number" step="0.1" placeholder="auto">
   <label>Grey caps above [m]</label><input id="snow_line_m" type="number" step="100" value="2000">
   <label>Layer height mm</label><input id="layer_mm" type="number" step="0.02" value="0.24">
-  <label><input type="checkbox" id="snap_runways" checked style="width:auto">
-    Snap takeoff/landing to the runway</label>
-  <label>Takeoff runway</label><input id="takeoff_rwy" placeholder="auto — e.g. EGNH 10">
-  <label>Landing runway</label><input id="landing_rwy" placeholder="auto — e.g. EGNH 10">
   <p style="font-size:11px;opacity:.7;margin:4px 0">"auto" fields scale with the poster
   size (12mm frame / 20mm relief / 2mm slot at 250mm), floored so they still print.</p>
   <button id="go">Generate</button>
@@ -142,22 +138,13 @@ for (const id of ['size_mm', 'text', 'text2'])
   });
 refreshDims();   // show the height before any typing — the chin appears with the caption
 
-// Snapping off: grey out the runway overrides so a typed runway can't be silently ignored.
-document.getElementById('snap_runways').addEventListener('change', e => {
-  for (const id of ['takeoff_rwy', 'landing_rwy'])
-    document.getElementById(id).disabled = !e.target.checked;
-});
-
 document.getElementById('go').onclick = async () => {
   const f = document.getElementById('file').files[0];
   const status = document.getElementById('status');
   if (!f) { status.textContent = 'Pick a KML/CSV file first.'; return; }
   status.textContent = 'Generating… (terrain download + meshing, ~10-30s)';
   const params = { text: document.getElementById('text').value,
-                   text2: document.getElementById('text2').value,
-                   snap_runways: document.getElementById('snap_runways').checked,
-                   takeoff_rwy: document.getElementById('takeoff_rwy').value,
-                   landing_rwy: document.getElementById('landing_rwy').value };
+                   text2: document.getElementById('text2').value };
   for (const id of ['size_mm','relief_mm','exaggeration','margin_pct','groove_w_mm',
                     'snow_line_m','layer_mm']) {
     const v = parseFloat(document.getElementById(id).value);
@@ -190,8 +177,7 @@ document.getElementById('go').onclick = async () => {
     dl(document.getElementById('dlPath'), sb, 'path.3mf', 'model/3mf');
     status.textContent = 'Done. Three ready-to-print OrcaSlicer projects (Bambu A1, 0.4 nozzle): '
       + 'frame.3mf black + white text on AMS slots 1/2, relief.3mf green/blue/grey on 1/2/3, '
-      + 'path.3mf red on its own. Open, slice, print.'
-      + (j.runways ? '\n' + j.runways : '');
+      + 'path.3mf red on its own. Open, slice, print.';
   } catch (e) {
     status.textContent = 'Request failed: ' + e;
   }

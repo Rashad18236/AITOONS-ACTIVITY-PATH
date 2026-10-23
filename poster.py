@@ -1,4 +1,4 @@
-"""Flight Path Poster core: track -> heightmap -> printable meshes."""
+"""Activity Path Poster core: activity -> heightmap -> printable meshes."""
 import csv, functools, io, json, math, re, urllib.parse
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -91,7 +91,7 @@ def _tile_px(x, y, z):
 
 # Identifying User-Agent on every request: overpass-api.de answers python-requests'
 # default UA with a bare 406, and it is what public-tile policies ask for anyway.
-UA = {"User-Agent": "FlightPathPoster/1.0 (local single-user 3D-print tool)"}
+UA = {"User-Agent": "ActivityPathPoster/1.0 (local single-user 3D-print tool)"}
 
 
 def _get(url, timeout=20, tries=2):
@@ -561,131 +561,6 @@ def fetch_osm_masks(bounds, px_out, res_mm):
             grey | _water_mask_from_elements(areas, bounds, px_out))
 
 
-# FR24 tracks GA aircraft badly near the ground: the first/last fixes jump into the
-# fields beside the airport. snap_runways cuts them and rolls on the real runway instead.
-RUNWAYS_URL = "https://davidmegginson.github.io/ourairports-data/runways.csv"
-# ponytail: gates fitted to one G-CEFM flight; loosen SNAP_LAT_M / drop SNAP_RUN to 2 if turning departures go undetected
-SNAP_NEAR_M, SNAP_REACH_M, SNAP_LAT_M, SNAP_RUN = 5000, 4000, 120, 3
-LIFTOFF_FRAC, ROLLOUT_FRAC = 0.25, 0.55
-SNAP_MARGIN = 2   # best run must beat the runner-up by this, else the end is "ambiguous"
-_ENDS = ("le_latitude_deg", "le_longitude_deg", "he_latitude_deg", "he_longitude_deg")
-
-
-def _metres(ll, o):
-    """(K,2) lat/lon -> local metres (east, north) about o = (lat, lon)."""
-    return np.c_[(ll[:, 1] - o[1]) * 111320 * math.cos(math.radians(o[0])),
-                 (ll[:, 0] - o[0]) * 110540]
-
-
-def _runway_table(text):
-    """OurAirports runways.csv -> (labels [(apt, le, he)], (K,5) le_lat le_lon he_lat he_lon elev_m)."""
-    labels, rows = [], []
-    for r in csv.DictReader(io.StringIO(text)):
-        if r["closed"] == "1":
-            continue
-        try:
-            ends = [float(r[k]) for k in _ENDS]
-        except ValueError:  # blank coordinates
-            continue
-        elev = float(r["le_elevation_ft"] or r["he_elevation_ft"] or 0) * 0.3048
-        labels.append((r["airport_ident"], r["le_ident"], r["he_ident"]))
-        rows.append(ends + [elev])
-    return labels, np.array(rows, float).reshape(-1, 5)
-
-
-@functools.lru_cache(maxsize=None)
-def _runways():
-    return _runway_table(_get(RUNWAYS_URL, timeout=60).decode())
-
-
-def _find_runway(labels, text):
-    """'egnh 10' -> (row j, end 0=le/1=he). ValueError on anything unknown — never auto."""
-    tok = text.upper().split()
-    for j, (apt, le, he) in enumerate(labels):
-        if len(tok) == 2 and apt == tok[0] and tok[1] in (le, he):
-            return j, int(tok[1] == he)
-    raise ValueError(f"Unknown runway '{text}' — ICAO ident and runway, e.g. EGNH 10")
-
-
-def _fit_end(pts, labels, rws, takeoff, force=None):
-    """pts end at the airport (reverse the track for takeoff) -> (k, name, (2,3) [T, P]) or None.
-
-    k trailing fixes are bogus; [T, P] is the runway roll that replaces them, in flight
-    order. Altitude is never used: FR24 pressure altitude is 100ft-steps and QNH-shifted.
-    force = (j, end) from _find_runway restricts the search to that one direction."""
-    # Only this end's half of the track: a circuit's climb-out lies on the extended
-    # centreline too, and the inward walk would otherwise reach it and cut the flight.
-    pts = pts[len(pts) // 2:]
-    norm = lambda v: np.linalg.norm(v, axis=-1)
-    o = pts[-1, :2]
-    xy = _metres(pts[:, :2], o)
-    near = [force] if force else [
-        (j, e) for j in np.flatnonzero(np.minimum(norm(_metres(rws[:, :2], o)),
-                                                  norm(_metres(rws[:, 2:4], o))) < SNAP_NEAR_M)
-        for e in (0, 1)]
-    found = []   # one (run, k, name, [T, P]) per direction that has an aligned run
-    for j, e in near:
-        Tll, Fll = (rws[j, 2:4], rws[j, :2]) if e else (rws[j, :2], rws[j, 2:4])
-        T, F = _metres(np.array([Tll, Fll]), o)
-        L = norm(F - T)
-        u = (F - T) / L
-        s, x = (xy - T) @ u, (xy - T) @ np.array([-u[1], u[0]])
-        # landing: approach only, so on-runway/taxi fixes are cut and the synthetic
-        # rollout never doubles back; takeoff: from LIFTOFF_FRAC down the runway on
-        lo, hi = (LIFTOFF_FRAC * L, L + SNAP_REACH_M) if takeoff else (-SNAP_REACH_M, 0)
-        ok = (np.abs(x) < SNAP_LAT_M) & (s > lo) & (s < hi)
-        # walk inward from the end: the first SNAP_RUN aligned fixes in a row end the
-        # clean part. Forced: fall back to any aligned fix (a climb-out that turns early).
-        for min_run in ((SNAP_RUN, 1) if force else (SNAP_RUN,)):
-            i = next((i for i in range(len(ok) - 1, min_run - 2, -1)
-                      if ok[i - min_run + 1:i + 1].all()), None)
-            if i is not None:
-                break
-        if i is None:
-            continue
-        j0 = i
-        while j0 > 0 and ok[j0 - 1]:   # extend the run inward: its length is the score
-            j0 -= 1
-        P = Tll + (LIFTOFF_FRAC if takeoff else ROLLOUT_FRAC) * (Fll - Tll)
-        found.append((i - j0 + 1, len(pts) - 1 - i, f"{labels[j][0]} {labels[j][1 + e]}",
-                      np.array([[*Tll, rws[j, 4]], [*P, rws[j, 4]]])))
-    if not found:
-        if force:
-            raise ValueError(f"forced {labels[force[0]][0]} {labels[force[0]][1 + force[1]]}: "
-                             f"no fixes within {SNAP_LAT_M} m of its centreline at the "
-                             f"{'takeoff' if takeoff else 'landing'} end")
-        return None
-    found.sort(key=lambda c: -c[0])
-    if len(found) > 1 and found[0][0] - found[1][0] < SNAP_MARGIN:
-        return 0, (f"ambiguous ({found[0][2]} run {found[0][0]} vs {found[1][2]} run "
-                   f"{found[1][0]}) — force one"), pts[:0]   # k=0, no points: untouched
-    run, k, name, TP = found[0]
-    return k, name + (" (forced)" if force else ""), TP
-
-
-def snap_runways(track, rws=None, takeoff_rwy="", landing_rwy=""):
-    """-> (track, note). Replaces FR24's bogus low-level ends with a straight runway roll.
-
-    Both new points sit at field elevation, which may be under the DEM terrain; the
-    strip's proud_mm clamp lifts them. Runway data failing is non-fatal, like water —
-    unless a runway is forced, which is a ValueError (never a silent auto)."""
-    try:
-        labels, arr = rws or _runways()
-    except Exception as e:
-        if takeoff_rwy.strip() or landing_rwy.strip():
-            raise ValueError(f"runway data unavailable ({e}); cannot force a runway")
-        print(f"runways: {e}")
-        return track, f"runway data unavailable ({e})"
-    fd = _find_runway(labels, takeoff_rwy) if takeoff_rwy.strip() else None
-    fl = _find_runway(labels, landing_rwy) if landing_rwy.strip() else None
-    t = np.asarray(track, float)
-    n = len(t)
-    dep, land = _fit_end(t[::-1], labels, arr, True, fd), _fit_end(t, labels, arr, False, fl)
-    kd, nd, pd = dep or (0, "—", t[:0])
-    kl, nl, pl = land or (0, "—", t[:0])
-    return np.vstack([pd, t[kd:n - kl], pl]), f"Runways: takeoff {nd}, landing {nl}"
-
-
 @dataclass
 class Params:
     size_mm: float = 216.0   # SIZES_MM[0]; the scaled params still read "@250mm"
@@ -710,9 +585,6 @@ class Params:
     layer_mm: float = 0.24   # slicer layer height; terrain snaps to it (0 = don't snap)
     # ponytail: measured 0.06 m residual at Blackpool; a metres-based radius only if a print ever shows speckle
     smooth_px: float = 1.0   # DEM blur radius in pixels, kills sub-layer noise (0 = off)
-    snap_runways: bool = True  # app.py: replace FR24's field-jumping ends with a runway roll
-    takeoff_rwy: str = ""     # force one runway direction, e.g. "EGNH 10" (blank = auto)
-    landing_rwy: str = ""
 
 
 # Visual params: None means "auto" — base value at 250mm, scaled by size, floored so

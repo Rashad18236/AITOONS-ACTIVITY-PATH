@@ -750,7 +750,6 @@ def _fake_fetches(monkeypatch, water=False, elev_top=500.0, roads=False):
                         lambda b, px, res: (np.full((px, px), water, bool),
                                             np.zeros((px, px), bool),
                                             np.full((px, px), roads, bool)))
-    monkeypatch.setattr(poster, "_runways", lambda: poster._runway_table(""))
 
 
 def test_build_poster_v2(monkeypatch):
@@ -845,8 +844,7 @@ def test_generate_endpoint(monkeypatch):
     assert r.status_code == 200
     import base64
     j = r.json()
-    assert set(j) == {"frame", "relief", "path", "resolved", "runways"}
-    assert j["runways"] == "Runways: takeoff —, landing —"   # empty table: nothing snapped
+    assert set(j) == {"frame", "relief", "path", "resolved"}
     assert j["resolved"]["frame_mm"] == 4 and j["resolved"]["text"] == "ZRH-GVA"
     frame, relief, path = (base64.b64decode(j[k]) for k in ("frame", "relief", "path"))
     assert frame[:2] == relief[:2] == path[:2] == b"PK"     # all three are 3MF zips
@@ -911,16 +909,14 @@ def test_every_offered_size_fits_the_plate():
         size_mm=250.0, text="ZURICH", text2="HB-EZE")))) > poster.USABLE_MM
 
 
-def test_generate_refuses_a_poster_over_the_plate(monkeypatch):
+def test_generate_refuses_a_poster_over_the_plate():
     """The whole refusal has to reach the UI: the front end prints `detail` verbatim.
 
     An offered size can no longer overflow on its own (that is what SIZES_MM buys),
     so the remaining way in is an explicit chin — the guard still has to catch it.
-    No monkeypatched DEM/water on purpose — it fires before those network calls. The
-    runway snap runs earlier still, so that one table is stubbed out."""
+    No monkeypatched DEM/water on purpose — it fires before those network calls."""
     from fastapi.testclient import TestClient
     import app as appmod
-    monkeypatch.setattr(poster, "_runways", lambda: poster._runway_table(""))
     r = TestClient(appmod.app).post(
         "/generate", files={"file": ("f.kml", KML.encode())},
         data={"params": '{"size_mm": 216, "text": "ZURICH", "text2": "HB-EZE",'
@@ -974,123 +970,6 @@ def test_generate_bad_params_json():
                        data={"params": "not-json"}).status_code == 400
     assert client.post("/generate", files=files,   # valid JSON, not an object
                        data={"params": "5"}).status_code == 400
-
-
-RUNWAYS_CSV = """\
-id,airport_ref,airport_ident,length_ft,width_ft,surface,lighted,closed,le_ident,le_latitude_deg,le_longitude_deg,le_elevation_ft,le_heading_degT,le_displaced_threshold_ft,he_ident,he_latitude_deg,he_longitude_deg,he_elevation_ft,he_heading_degT,he_displaced_threshold_ft
-239532,2441,"EGNH",2621,98,"ASP",0,1,"07",53.77239990234375,-3.041330099105835,33,67.8,126,"25",53.77510070800781,-3.030100107192993,29,247.8,325
-239533,2441,"EGNH",6129,148,"ASP",1,0,"10",53.772202,-3.04269,32,95,,"28",53.770901,-3.01444,28,275,
-1,1,"XXXX",1000,50,"GRS",0,0,"09",,,,,,"27",,,,,
-239534,2441,"EGNH",3274,78,"ASP",1,0,"13",53.774502,-3.04373,32,127,478,"31",53.7686,-3.03074,30,307,
-"""
-LE10, HE10 = np.array([53.772202, -3.04269]), np.array([53.770901, -3.01444])
-LE13, HE13 = np.array([53.774502, -3.04373]), np.array([53.7686, -3.03074])
-on = lambda f, alt, dlat=0.0: [*(LE10 + f * (HE10 - LE10) + [dlat, 0]), alt]   # 10/28 line
-on13 = lambda f, alt: [*(LE13 + f * (HE13 - LE13)), alt]                         # 13/31 line
-
-
-def test_snap_runways_cuts_the_field_ends_and_rolls_on_the_runway():
-    """FR24 drops a GA aircraft's first/last fixes into the fields beside the runway.
-    They are cut, and a straight roll on the real runway (field elevation) replaces them."""
-    rws = poster._runway_table(RUNWAYS_CSV)
-    assert [l[1] for l in rws[0]] == ["10", "13"]      # closed 07/25 and blank row skipped
-    le, he = LE10, HE10
-    bogus = [on(0.5, 0, 0.008)] + [on(f, 0, 0.006) for f in (-0.5, -0.4, -0.3, -0.2)]
-    track = np.array([bogus[0]]
-                     + [on(f, a) for f, a in zip((0.5, 0.7, 0.9, 1.3, 1.8, 2.5),
-                                                 (10, 30, 60, 150, 300, 500))]
-                     + [on(f, a) for f, a in zip((-1.6, -1.3, -1.0, -0.7), (400, 300, 200, 100))]
-                     + bogus[1:])
-    out, note = poster.snap_runways(track, rws)
-    assert note == "Runways: takeoff EGNH 10, landing EGNH 10"
-    assert len(out) == len(track) - 5 + 4
-    for row, f in ((0, 0.0), (1, 0.25), (-2, 0.0), (-1, 0.55)):
-        assert np.allclose(out[row, :2], le + f * (he - le))
-        assert out[row, 2] == pytest.approx(32 * 0.3048)
-    assert not any(np.allclose(r, b) for r in out for b in bogus)
-
-    far = track + [1.0, 0, 0]                          # no runway within SNAP_NEAR_M
-    out, note = poster.snap_runways(far, rws)
-    assert note == "Runways: takeoff —, landing —" and np.array_equal(out, far)
-
-    # A circuit off and back onto 28: the climb-out lies on 10's approach line, with
-    # more fixes than the real approach. Searching the whole track, landing "10" won
-    # and cut everything after the climb-out; each end only searches its own half.
-    circuit = np.array([on(f, 100) for f in (0.6, 0.4, 0.2, -0.2, -0.5, -0.8, -1.1, -1.4, -1.7)]
-                       + [on(f, 300, 0.01) for f in (-1.0, 0.0, 1.0, 2.0)]       # downwind
-                       + [on(f, 100) for f in (2.6, 2.3, 2.0, 1.7)] + bogus[3:])
-    out, note = poster.snap_runways(circuit, rws)
-    assert note == "Runways: takeoff EGNH 28, landing EGNH 28"
-    assert np.allclose(out[-1, :2], he + 0.55 * (le - he)) and len(out) == len(circuit) + 2
-
-
-def _g_cefm_landing(approach=(-1.6, -1.5, -1.4, -1.3, -1.2, -1.1)):
-    """G-CEFM's landing end in miniature, with a first half 1deg north (no takeoff)."""
-    land = ([on13(f, 300) for f in (-2.0, -1.9, -1.8, -1.7, -1.6)]   # downwind crosses 13's line
-            + [on(f, 400 - 50 * i) for i, f in enumerate(approach)]   # the real approach on 10
-            + [on(-0.8, 100, 0.006), on(-0.5, 100)]                   # off-line bogus, fluke on 10
-            + [on13(f, 0) for f in (-0.4, -0.3, -0.2)])               # alt-0 tail on 13's line
-    return np.array([[la + 1.0, lo, a] for la, lo, a in land] + land)
-
-
-def test_snap_runways_scores_the_run_not_the_count():
-    """The bogus tail in the field is itself a 3-run on 13's extended centreline and
-    the downwind leg crosses that line: 13 has more aligned fixes (8 vs 7), but 10 has
-    the longer run ending the clean part (6 vs 3). A near-tie is left alone."""
-    rws = poster._runway_table(RUNWAYS_CSV)
-    track = _g_cefm_landing()
-    out, note = poster.snap_runways(track, rws)
-    assert note == "Runways: takeoff —, landing EGNH 10"
-    assert len(out) == len(track) - 5 + 2
-    assert np.allclose(out[-3], on(-1.1, 150))                       # last real approach fix
-    assert np.allclose(out[-2, :2], LE10) and np.allclose(out[-1, :2], LE10 + 0.55 * (HE10 - LE10))
-
-    track = _g_cefm_landing((-1.4, -1.3, -1.2, -1.1))                # run 4 vs 3: under SNAP_MARGIN
-    out, note = poster.snap_runways(track, rws)
-    assert "landing ambiguous (EGNH 10 run 4 vs EGNH 13 run 3)" in note
-    assert np.array_equal(out, track)
-
-
-def test_snap_runways_forced_runway(monkeypatch):
-    rws = poster._runway_table(RUNWAYS_CSV)
-    base = _g_cefm_landing()
-    auto, _ = poster.snap_runways(base, rws)
-    out, note = poster.snap_runways(base, rws, landing_rwy="egnh 10")
-    assert np.array_equal(out, auto) and note.endswith("landing EGNH 10 (forced)")
-
-    # A climb-out that turns before three fixes line up: auto leaves it, a force rolls it
-    approach = [on(f, a) for f, a in zip((-1.6, -1.3, -1.0, -0.7), (400, 300, 200, 100))]
-    early = np.array([on(0.5, 0, 0.008), on(0.5, 10), on(0.7, 30), on(0.9, 60, 0.01),
-                      on(1.3, 150, 0.02), on(1.8, 300, 0.03), on(2.5, 500, 0.04)] + approach)
-    assert poster.snap_runways(early, rws)[1].startswith("Runways: takeoff —")
-    out, note = poster.snap_runways(early, rws, takeoff_rwy="EGNH 10")
-    assert np.allclose(out[0, :2], LE10) and np.allclose(out[1, :2], LE10 + 0.25 * (HE10 - LE10))
-    assert np.allclose(out[2], on(0.5, 10)) and "takeoff EGNH 10 (forced)" in note
-
-    for bad in ("EGNH 99", "EGNH", "EGNH 10 28"):                    # never a silent auto
-        with pytest.raises(ValueError, match="Unknown runway"):
-            poster.snap_runways(base, rws, landing_rwy=bad)
-    with pytest.raises(ValueError, match="no fixes within"):        # 28's approach is east
-        poster.snap_runways(np.array(approach), rws, landing_rwy="EGNH 28")
-
-    def down():
-        raise OSError("offline")
-    monkeypatch.setattr(poster, "_runways", down)
-    with pytest.raises(ValueError, match="cannot force"):
-        poster.snap_runways(base, landing_rwy="EGNH 10")
-    assert poster.snap_runways(base)[1] == "runway data unavailable (offline)"
-
-
-def test_generate_rejects_an_unknown_forced_runway(monkeypatch):
-    from fastapi.testclient import TestClient
-    import app as appmod
-    monkeypatch.setattr(poster, "_runways", lambda: poster._runway_table(RUNWAYS_CSV))
-    r = TestClient(appmod.app).post(
-        "/generate", files={"file": ("f.kml", KML.encode())},
-        data={"params": '{"size_mm": 120, "landing_rwy": "EGNH 99"}'})
-    assert r.status_code == 400 and "Unknown runway 'EGNH 99'" in r.json()["detail"]
-
-
 
 
 def test_masked_slab_mesh_geometry():
@@ -1814,7 +1693,7 @@ def test_get_sends_an_identifying_user_agent(monkeypatch):
     monkeypatch.setattr(poster.requests, "get",
                         lambda url, **kw: seen.update(kw) or R())
     assert poster._get("https://example.invalid/x") == b"x"
-    assert "FlightPathPoster" in seen["headers"]["User-Agent"]
+    assert "ActivityPathPoster" in seen["headers"]["User-Agent"]
 
 
 @pytest.mark.skipif(not os.environ.get("LIVE"), reason="hits the live Overpass API")

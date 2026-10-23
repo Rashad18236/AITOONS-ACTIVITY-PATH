@@ -1,9 +1,10 @@
-# Flight Path Poster
+# Activity Path Poster
 
-Local web tool that turns a FlightRadar24 track export (KML/CSV) into three ready-to-print OrcaSlicer projects:
+A sister product to the Flight Path Poster for runners, cyclists, hikers and triathletes. The customer sends the recorded file of one activity (a race, a big ride, a mountain hike, a triathlon) with the order; the shop owner runs it through this local tool, which turns it into the same physical poster as the flight product, as ready-to-print OrcaSlicer projects:
 `frame.3mf` (black backplate + ring, white text as its own body), `relief.3mf` (multi-body
-green terrain / blue water (lakes, rivers, sea) / grey high-alpine band, runways and main roads (same slot 3), one AMS slot per colour) and `path.3mf` (the flight-path strip:
-a red wall following the flight altitude, standing in a constant-floor slot). Every print setting is embedded: open, slice, print.
+green terrain / blue water (lakes, rivers, sea) / grey high-alpine band, runways and main roads (same slot 3), one AMS slot per colour) and the path (a raised wall crossing the relief along the route, standing in a constant-floor slot). On the flight poster the wall's height is the altitude; an athlete is always on the ground, so here the wall **stands on the terrain and its height above the ground is their heart rate**: the hard parts of the race stand tall, the easy kilometres stay low, and a climb reads twice. Every print setting is embedded: open, slice, print. Customers never see or touch the tool.
+
+Until the activity parser and the heart-rate wall land (plan Task 10), the input is still the flight tool's FR24 KML/CSV and `path.3mf` is still the altitude-following strip described below.
 
 ## Rules
 
@@ -12,7 +13,7 @@ a red wall following the flight altitude, standing in a constant-floor slot). Ev
 - Footprints are checked against `USABLE_MM` (226), never the bare 256 plate
 - Design decisions with Fable, implementation via Opus subagents
 - Ponytail full mode during coding: laziest working solution, heightmap ops over 3D booleans, no speculative features
-- Local only (localhost), single user, no auth, no persistence of user data; OSM/runway responses are cached in process only
+- Local only (localhost), single user, no auth, no persistence of user data; OSM responses are cached in process only
 
 ## Run
 
@@ -24,7 +25,7 @@ uv run uvicorn app:app --reload
 ## Architecture
 
 - `app.py` — FastAPI: upload/generate routes, serves `static/`
-- `poster.py` — core: parse track → snap takeoff/landing ends to the nearest OurAirports runway (`snap_runways`, live CSV, lru_cached in memory) → fetch DEM (AWS Terrain Tiles, terrarium, no key) + OSM water, coastline, runway and road geometry (one Overpass call, `_overpass` lru-cached per query, mirrors tried until one answers *without* a `remark`) → compose 2D heightmaps (frame + text mask, green/water/snow relief, slot) → mesh to `frame.3mf` + `relief.3mf` + `path.3mf` (OrcaSlicer projects, `write_3mf`)
+- `poster.py` — core: parse track → fetch DEM (AWS Terrain Tiles, terrarium, no key) + OSM water, coastline, runway and road geometry (one Overpass call, `_overpass` lru-cached per query, mirrors tried until one answers *without* a `remark`) → compose 2D heightmaps (frame + text mask, green/water/snow relief, slot) → mesh to `frame.3mf` + `relief.3mf` + `path.3mf` (OrcaSlicer projects, `write_3mf`)
 - `orca_profile.py` → `orca_a1_pla.json` — the A1 0.4 / 0.24 Draft / Bambu PLA Basic system profiles, inherits chains flattened, vendored (committed). Regenerate with `uv run python orca_profile.py` against the installed Orca after an Orca update
 - `static/index.html` — upload form, parameter sliders, three.js preview, downloads
 - `test_poster.py` — self-check: parse sample track, build small mesh, assert watertight + strip fits slot
@@ -57,6 +58,4 @@ The text body is meshed on its **own** grid, `TEXT_SUB` (4) times finer than the
 
 Visual params (`frame_mm`, `relief_mm`, `frame_height_mm`, `text_mm`, `groove_w_mm`, `proud_mm`) default to `None` = auto: `poster.resolve(p)` scales them from their 250mm base by `size_mm` and floors them for printability, so an 80mm poster keeps the 250mm look. `build_poster` and `check_output.py` both resolve first; `/generate` returns the resolved dict for the preview. The floors are printability floors and one of them is about a part that is not the one named: **`groove_w_mm`'s floor is 1.44**, because what has to survive the printer is the *strip*, `groove_w_mm - 2*clearance_mm` wide. At the old 1.2 floor that was 0.60mm — 1.4 extrusions at a 0.42mm line width, so a 16mm-tall fin printed as one wobbly bead with no perimeter pair to brace it. 1.44 − 0.60 = **0.84 = exactly 2 × 0.42**, the pure-perimeter case `docs/print-settings.md` §5 tunes the path plate for.
 
-**Runway snap.** FR24 tracks GA aircraft badly near the ground, so a track's first and last fixes jump into the fields beside the airport and the strip ends in a hook. `snap_runways` cuts those ends and replaces each with a straight roll on the real runway from OurAirports' `runways.csv` (fetched on demand, `lru_cache`d in memory, never on disk; a failed fetch is non-fatal like water and the note says "runway data unavailable"). A fix is *aligned* with a runway direction when it is within 120m of the centreline and inside the window — approach only (up to 4km before the threshold) for landing, so on-runway and taxi fixes are cut and the rollout never doubles back; from 25% down the runway to 4km past its end for takeoff. Walking in from each end, the first 3 aligned fixes in a row end the clean part; no such run → that direction is not a candidate. A direction's score is the length of the aligned run that ends the clean part (the run the inward walk stops at, extended inward), **not** its total aligned count — on G-CEFM the bogus alt-0 tail in the field is itself a 3-run on 13's extended centreline and two downwind fixes cross that line by chance, so counts were 7 vs 5 where runs are 6 vs 3. The best run must beat the runner-up by `SNAP_MARGIN` (2) or the end is reported *ambiguous* and left alone. `takeoff_rwy` / `landing_rwy` (`EGNH 10`, case-insensitive) force one direction: same gate, falling back to a run of 1 because the forced case exists for climb-outs that turn before three fixes align; an unknown ident, a forced runway with no aligned fix, or missing runway data with a force set is a 400, never a silent auto. The note marks forced ends `(forced)`. Each end only searches its **own half** of the track: a circuit's climb-out lies on the reciprocal runway's approach line and, with more fixes than the real approach, otherwise won and cut the whole flight. Altitude is never used (FR24 pressure altitude is 100ft steps, QNH-shifted). The two new points per end (threshold, then 25% down the runway for takeoff / 55% for the rollout) sit at field elevation, which can be under the DEM terrain — the strip's `proud_mm` clamp lifts them. It runs in `app.py` between `parse_track` and `build_poster`, not inside `build_poster`, so the "Runways: takeoff EGNH 10, landing EGNH 10" note reaches the status line and every `build_poster` caller is untouched; `Params.snap_runways` (default on) turns it off. The gates are fitted to one G-CEFM flight at Blackpool (EGNH).
-
-Spec: `docs/superpowers/specs/2026-08-05-flight-path-poster-design.md`
+Spec: `docs/superpowers/specs/2026-10-23-activity-path-poster-design.md`

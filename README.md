@@ -1,3 +1,1 @@
-# Flight Path Poster
-
-Scripts for generating 3D-printed flight path posters.
+Activity Path Poster: turns an activity file into a three-part 3D-printed poster. Run: `uv run uvicorn app:app --reload`
