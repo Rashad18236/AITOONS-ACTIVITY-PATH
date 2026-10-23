@@ -253,6 +253,17 @@ def _cat(*pieces):
     return np.concatenate([P for P, _ in pieces]), np.concatenate([h for _, h in pieces])
 
 
+def _vline(x, y0, y1, hr):
+    """_line turned upright: column x, stepping 1 px from y0 to y1 inclusive."""
+    P, h = _line(y0, y1, x, hr)
+    return P[:, ::-1], h
+
+
+def test_ramp_grades_each_piece_on_its_own():
+    w = poster._ramp(np.array([0, 1, 1, 1, 1, 0, 1, 1, 1, 1], bool), np.array([0] * 6 + [1] * 4), 4)
+    assert np.allclose(w, [0, .25, .5, .5, .25, 0, 1, 1, 1, 1])
+
+
 def test_an_out_and_back_collapses_onto_one_line_at_the_average_hr():
     (P, hr), = poster.collapse_passes([_cat(_line(10, 90, 50.0, 120), _line(90, 10, 50.6, 160))], r_px=4, ramp=4)
     back, xb = P[81:], P[81:, 0]
@@ -290,6 +301,29 @@ def test_three_laps_collapse_onto_the_first_at_the_mean_hr():
     n = len(laps[0][0])
     assert poster._nearest_on_segments(P[n:], P[:n - 1], P[1:n])[1].max() < 1e-6
     assert np.allclose(hr[12:n - 12], 150, atol=3)
+
+
+def test_a_shared_road_gets_its_own_lane_beside_the_earlier_wall():
+    a, b = _line(10, 90, 50.0, 120), _line(10, 90, 50.5, 160)
+    [[(Pa, _)], [(Pb, hb)]] = poster.assign_lanes([[a], [b]], lane_px=4, r_px=4, ramp=4)
+    assert np.array_equal(Pa, a[0]) and np.allclose(Pb[:, 1], 54.0) and np.allclose(hb, 160)
+
+
+def test_three_walls_on_one_road_take_three_lanes():
+    out = poster.assign_lanes([[_line(10, 90, y, 120)] for y in (50.0, 50.5, 50.2)], lane_px=4, r_px=4, ramp=4)
+    assert [w[0][0][:, 1].mean() for w in out] == pytest.approx([50.0, 54.0, 58.0])
+
+
+def test_the_lane_side_does_not_flip_with_the_direction_of_travel():
+    [_, [(Pb, _)]] = poster.assign_lanes([[_line(10, 90, 50.0, 120)], [_line(90, 10, 50.5, 160)]], lane_px=4, r_px=4, ramp=4)
+    assert np.allclose(Pb[:, 1], 54.0)
+
+
+def test_a_wall_leaving_the_shared_road_is_left_alone_off_it():
+    b = _cat(_line(10, 50, 50.5, 160), _vline(50, 51, 90, 160))
+    [_, [(Pb, _)]] = poster.assign_lanes([[_line(10, 90, 50.0, 120)], [b]], lane_px=4, r_px=4, ramp=4)
+    off = b[0][:, 1] >= 59
+    assert np.array_equal(Pb[off], b[0][off]) and np.allclose(Pb[:30, 1], 54.0)
 
 
 def test_relief_plate_clears_the_frame_ring():

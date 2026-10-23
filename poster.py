@@ -1176,6 +1176,45 @@ def collapse_passes(pieces: list[tuple[np.ndarray, np.ndarray]], r_px: float, ra
     return list(zip(np.split(new, cut), np.split(out, cut)))
 
 
+def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: float,
+                 r_px: float, ramp: int) -> list[list[tuple[np.ndarray, np.ndarray]]]:
+    """Collapsed walls, earliest first -> the same walls, shared roads in side-by-side lanes.
+
+    Wall 0 stays put. A station of a later wall takes lane = the number of earlier
+    walls whose INPUT polyline lies strictly within r_px, and moves to lane * lane_px
+    left of the earliest of them (left of that wall's travel, so the side never flips
+    with this wall's direction), eased in and out by _ramp (spec 6.6). hr is untouched.
+    Zero-length segments (collapse snaps several stations onto one vertex) are left out
+    of a reference; they have no direction and their point is a neighbour's end anyway."""
+    refs = []
+    for w in walls:
+        A = np.concatenate([q[:-1] for q, _ in w]).astype(float)
+        B = np.concatenate([q[1:] for q, _ in w]).astype(float)
+        # ponytail: a one-station piece is no reference (no direction to lane beside);
+        # give it a point segment and a fallback normal if such pieces ever reach here
+        keep = (A != B).any(1)
+        refs.append((A[keep], B[keep]))
+    out = [walls[0]]
+    for i, w in enumerate(walls[1:], 1):
+        n_k = [len(q) for q, _ in w]
+        P = np.concatenate([q for q, _ in w]).astype(float)
+        lane, foot, nrm = np.zeros(len(P), int), np.zeros_like(P), np.zeros_like(P)
+        for A, B in refs[i - 1::-1]:          # earliest last, so it ends up the ref
+            if not len(A):
+                continue                      # a wall of single stations has no road
+            f, d, k = _nearest_on_segments(P, A, B)
+            m = d < r_px
+            u = (B - A)[k[m]]
+            lane += m
+            foot[m], nrm[m] = f[m], np.stack([-u[:, 1], u[:, 0]], 1) / np.hypot(*u.T)[:, None]
+        m = lane > 0
+        new = P.copy()
+        new[m] += _ramp(m, np.repeat(np.arange(len(w)), n_k), ramp)[m, None] * (
+            foot[m] + lane[m, None] * lane_px * nrm[m] - P[m])
+        out.append(list(zip(np.split(new, np.cumsum(n_k)[:-1]), [h for _, h in w])))
+    return out
+
+
 def _grid_faces(idx):
     a = idx[:-1, :-1].ravel(); b = idx[:-1, 1:].ravel()
     c = idx[1:, 1:].ravel(); d = idx[1:, :-1].ravel()
