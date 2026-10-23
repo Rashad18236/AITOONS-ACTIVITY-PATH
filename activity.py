@@ -1,6 +1,7 @@
 """Customer activity files -> legs (sport + lat/lon/time/heart rate). No geometry."""
 import bisect
 import datetime as dt
+import os
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
@@ -10,7 +11,9 @@ from garmin_fit_sdk import Decoder, Stream
 
 HR_WINDOW_S = 30.0  # rolling heart-rate window: optical sensors spike and drop out
 HR_GAP_S = 15.0  # a Health route point further than this from every HR record stays NaN
+MAX_SPEED_MS = 60.0  # a fix reached faster than this (216 km/h) is a GPS spike
 _HK = "HKWorkoutActivityType"
+_TRI = ("swim", "bike", "run")
 
 
 @dataclass
@@ -218,3 +221,92 @@ def _pick_workout(found, date, at, pre):
         raise ValueError(f"{pre}Apple Watch triathlon: send the Strava or HealthFit files "
                          "for each leg instead")
     return found[0]
+
+
+_PARSERS = {".gpx": parse_gpx, ".tcx": parse_tcx, ".fit": parse_fit}
+
+
+def read_activity(files: list[tuple[str, BinaryIO]], workout_date: str = "",
+                  workout_time: str = "") -> list[Leg]:
+    """Every leg of an order's files, empty ones included, cleaned, sorted by start time and
+    with sports assigned. Anything wrong with the order is a ValueError for the operator."""
+    legs = []
+    for name, f in files:
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in (*_PARSERS, ".zip"):
+            raise ValueError(f"{name}: unsupported file type, send GPX, TCX, FIT or an Apple Health export.zip")
+        try:  # customer files: whatever a parser trips over is the file's fault, never a 500
+            legs += ([parse_health_zip(f, workout_date, workout_time, name)] if ext == ".zip"
+                     else _PARSERS[ext](f.read(), name))
+        except Exception as e:
+            if isinstance(e, ValueError) and str(e).startswith(name):
+                raise
+            raise ValueError(f"{name}: could not read this file ({type(e).__name__}: {e})") from None
+    legs = [_clean(l) for l in legs]
+    if not any(len(l.t) >= 2 for l in legs):
+        raise ValueError("no GPS track in these files — indoor or pool activity?")
+    key, keys = -np.inf, []
+    for l in legs:  # an empty leg has no time: it stays after the leg it followed in the files
+        key = l.t[0] if len(l.t) else key
+        keys.append(key)
+    legs = [legs[i] for i in sorted(range(len(legs)), key=keys.__getitem__)]
+    full = [l for l in legs if len(l.t) >= 2]
+    sports = {l.sport for l in full}
+    if sports == {""}:
+        if len(full) == 3:  # three exports without metadata: a triathlon in time order
+            for l, s in zip(full, _TRI):
+                l.sport = s
+    elif "" in sports:
+        names = ", ".join(dict.fromkeys(l.source for l in full if not l.sport))
+        raise ValueError(f"{names}: no sport recorded, while the other files have one — "
+                         "send every file with its sport")
+    elif len(sports) > 1 and (odd := sorted(sports - set(_TRI))):
+        raise ValueError(f"{', '.join(odd)}: a multisport order can only hold swim, bike and run legs")
+    return legs
+
+
+def _sub(l, i):
+    return Leg(l.sport, l.lat[i], l.lon[i], l.t[i], l.hr[i], l.source)
+
+
+def _speed(l):
+    """m/s between consecutive fixes: equirectangular distance, dt floored at 1 s."""
+    mid = np.radians(l.lat[:-1] + l.lat[1:]) / 2
+    d = np.hypot(np.radians(np.diff(l.lon)) * np.cos(mid), np.radians(np.diff(l.lat)))
+    return 6371e3 * d / np.maximum(np.diff(l.t), 1)
+
+
+def _clean(l):
+    """Finite fixes in time order, no repeated position, isolated GPS spikes gone."""
+    l = _sub(l, np.isfinite(l.lat) & np.isfinite(l.lon) & np.isfinite(l.t))
+    l = _sub(l, np.argsort(l.t, kind="stable"))
+    l = _sub(l, np.r_[True, (np.diff(l.lat) != 0) | (np.diff(l.lon) != 0)][:len(l.t)])
+    # ponytail: isolated spikes only; two bad fixes in a row survive
+    fast, keep = _speed(l) > MAX_SPEED_MS, np.ones(len(l.t), bool)
+    keep[1:-1] = ~(fast[:-1] & fast[1:])  # interior: too fast both in and out
+    l = _sub(l, keep)
+    fast, keep = _speed(l) > MAX_SPEED_MS, np.ones(len(l.t), bool)
+    if len(fast):
+        keep[[0, -1]] = ~fast[[0, -1]]  # an end too fast to its new neighbour
+    return _sub(l, keep)
+
+
+def group_walls(legs: list[Leg]) -> list[tuple[str, list[Leg]]]:
+    """[("strip", legs)] for one sport (or none), else one (sport, legs) per sport in order of
+    first appearance: a sport's legs merge into one wall. Legs under 2 fixes are left out."""
+    full = [l for l in legs if len(l.t) >= 2]
+    sports = list(dict.fromkeys(l.sport for l in full))
+    if len(sports) == 1:
+        return [("strip", full)]
+    return [(s, [l for l in full if l.sport == s]) for s in sports]
+
+
+def legs_note(legs: list[Leg]) -> str:
+    """Status line: the Health workout picked, then each leg's GPS and HR coverage."""
+    parts = [s for s in dict.fromkeys(l.source for l in legs) if s.startswith("Health:")]
+    for l in legs:
+        label, share = l.sport or "activity", np.isfinite(l.hr).mean() if len(l.hr) else 0.0
+        parts.append(f"{label}: no GPS track, not printed" if len(l.t) < 2
+                     else f"{label}: no HR, low line" if share == 0
+                     else f"{label}: HR {round(100 * share)}%")
+    return " · ".join(parts)

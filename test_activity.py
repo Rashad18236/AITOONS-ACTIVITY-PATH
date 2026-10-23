@@ -229,3 +229,63 @@ def test_health_export_takes_the_exact_start_when_two_workouts_are_close():
 def test_health_export_refuses_a_file_that_is_not_a_zip():
     with pytest.raises(ValueError, match="export.zip: not a readable"):
         activity.parse_health_zip(io.BytesIO(b"hello"), "2026-05-01", name="export.zip")
+
+_file = lambda name, data: (name, io.BytesIO(data))
+
+def test_read_activity_dispatches_by_extension_and_refuses_others():
+    legs = activity.read_activity([_file("a.gpx", _gpx([("running", _pts(5))])),
+                                   _file("b.tcx", _tcx([("Running", _pts(5, t0=T0 + H))]))])
+    assert [l.source for l in legs] == ["a.gpx", "b.tcx"]
+    with pytest.raises(ValueError, match="unsupported"):
+        activity.read_activity([_file("flight.kml", b"<kml/>")])
+
+def test_a_file_that_cannot_be_read_is_a_value_error_naming_it():
+    with pytest.raises(ValueError, match=r"^broken\.gpx: could not read this file \(ParseError"):
+        activity.read_activity([_file("broken.gpx", b"this is not xml")])
+    bad_lat = _gpx([("running", _pts(2))]).replace(b'lat="47.0"', b'lat="north"', 1)
+    with pytest.raises(ValueError, match=r"^bad\.gpx: could not read this file \(ValueError"):
+        activity.read_activity([_file("bad.gpx", bad_lat)])
+    with pytest.raises(ValueError, match=r"^junk\.fit: not a FIT file$"):  # already named: unchanged
+        activity.read_activity([_file("junk.fit", b"\x00" * 64)])
+
+def test_three_files_without_sport_are_swim_bike_run_in_time_order():
+    fs = [_file(f"{i}.gpx", _gpx([(None, _pts(5, t0=T0 + i * H))])) for i in (2, 0, 1)]
+    assert [l.sport for l in activity.read_activity(fs)] == ["swim", "bike", "run"]
+
+def test_a_file_without_sport_next_to_files_with_one_is_refused():
+    fs = [_file("a.gpx", _gpx([("running", _pts(5))])), _file("b.gpx", _gpx([(None, _pts(5, t0=T0 + H))]))]
+    with pytest.raises(ValueError, match="b.gpx"):
+        activity.read_activity(fs)
+
+def test_a_multisport_order_with_an_unknown_sport_is_refused():
+    fs = [_file("a.gpx", _gpx([("rowing", _pts(5))])), _file("b.gpx", _gpx([("running", _pts(5, t0=T0 + H))]))]
+    with pytest.raises(ValueError, match="rowing"):
+        activity.read_activity(fs)
+
+def test_one_sport_in_several_files_is_one_strip_wall():
+    fs = [_file(f"{i}.gpx", _gpx([("cycling", _pts(5, t0=T0 + i * H))])) for i in (0, 1)]
+    assert [(n, len(ls)) for n, ls in activity.group_walls(activity.read_activity(fs))] == [("strip", 2)]
+
+def test_a_duathlon_groups_by_sport_in_order_of_first_appearance():
+    fs = [_file(f"{i}.gpx", _gpx([(s, _pts(5, t0=T0 + i * H))]))
+          for i, s in enumerate(("running", "cycling", "running"))]
+    assert [(n, len(ls)) for n, ls in activity.group_walls(activity.read_activity(fs))] == [("run", 2), ("bike", 1)]
+
+def test_a_gps_spike_is_dropped():
+    pts = _pts(10)
+    pts[5] = (47.5, pts[5][1], pts[5][2], 150)          # one fix 55 km north
+    (leg,) = activity.read_activity([_file("a.gpx", _gpx([("running", pts)]))])
+    assert len(leg.lat) == 9 and leg.lat.max() < 47.01
+
+def test_a_leg_without_gps_is_reported_and_not_printed():
+    legs = activity.read_activity([_file("tri.fit", _fit([("swimming", 0, None), ("cycling", 5, 140), ("running", 5, 160)]))])
+    assert [n for n, _ in activity.group_walls(legs)] == ["bike", "run"]
+    assert "swim: no GPS track, not printed" in activity.legs_note(legs)
+
+def test_files_without_any_gps_are_refused():
+    with pytest.raises(ValueError, match="no GPS"):
+        activity.read_activity([_file("pool.fit", _fit([("swimming", 0, None)]))])
+
+def test_legs_note_reports_hr_coverage_per_leg():
+    legs = activity.read_activity([_file("tri.fit", _fit([("swimming", 5, None), ("cycling", 4, 140), ("running", 4, 160)]))])
+    assert activity.legs_note(legs) == "swim: no HR, low line · bike: HR 100% · run: HR 100%"
