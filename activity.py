@@ -1,8 +1,10 @@
 """Customer activity files -> legs (sport + lat/lon/time/heart rate). No geometry."""
+import bisect
 import datetime as dt
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 import numpy as np
+from garmin_fit_sdk import Decoder, Stream
 
 HR_WINDOW_S = 30.0  # rolling heart-rate window: optical sensors spike and drop out
 
@@ -104,3 +106,32 @@ def parse_tcx(data: bytes, name: str = "") -> list[Leg]:
                              _hr(_child(_child(tp, "HeartRateBpm"), "Value"))))
         legs.append(_leg(act.get("Sport", ""), rows, name))
     return legs
+
+
+def parse_fit(data: bytes, name: str = "") -> list[Leg]:
+    """One leg per session (a multisport file holds several). A record belongs to the last
+    session started at or before it; a transition's records join the next leg, so the path
+    runs on unbroken from swim exit to bike to run. Records without position are skipped."""
+    dec = Decoder(Stream.from_byte_array(bytearray(data)))
+    if not dec.is_fit():
+        raise ValueError(f"{name}: not a FIT file")
+    m, errors = dec.read()
+    if errors:
+        raise ValueError(f"{name}: {errors[0]}")
+    rows = [(r["position_lat"] * 180 / 2**31, r["position_long"] * 180 / 2**31,
+             r["timestamp"].timestamp(), r.get("heart_rate", np.nan))
+            for r in m.get("record_mesgs", [])
+            if {"timestamp", "position_lat", "position_long"} <= r.keys()]
+    sessions = sorted(m.get("session_mesgs", []), key=lambda s: s["start_time"])
+    if not sessions:
+        return [_leg("", rows, name)]
+    sports = [str(s.get("sport", "")) for s in sessions]  # an unknown enum decodes as an int
+    starts = [s["start_time"].timestamp() for s in sessions]
+    real = [i for i, s in enumerate(sports) if sport_family(s) != "transition"]
+    out = {i: [] for i in real}
+    for row in rows:
+        i = bisect.bisect_right(starts, row[2]) - 1
+        j = bisect.bisect_left(real, i)  # this session, or the leg after a transition
+        if i >= 0 and j < len(real):
+            out[real[j]].append(row)
+    return [_leg(sports[i], out[i], name) for i in real]

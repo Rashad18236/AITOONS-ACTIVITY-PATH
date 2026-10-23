@@ -2,6 +2,7 @@ import datetime as dt
 
 import numpy as np
 import pytest
+from garmin_fit_sdk import Encoder, Profile
 
 import activity
 
@@ -48,6 +49,27 @@ def _tcx(activities):
     return ('<?xml version="1.0" encoding="UTF-8"?><TrainingCenterDatabase '
             'xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2">'
             f"<Activities>{acts}</Activities></TrainingCenterDatabase>").encode()
+
+
+def _fit(sessions, t0=T0):
+    """FIT activity from [(sport, n, hr)] back to back: n records 1 s apart heading east,
+    heart_rate omitted when hr is None. n=0 is a session with no positioned records."""
+    M = Profile["mesg_num"]
+    e = Encoder()
+    e.on_mesg(M["FILE_ID"], {"type": "activity", "manufacturer": "development", "product": 0,
+                             "time_created": t0, "serial_number": 1})
+    t, lon0 = t0, 8.0
+    for i, (sport, n, hr) in enumerate(sessions):
+        for la, lo, ts, h in _pts(n, hr, lon0=lon0, t0=t):
+            e.on_mesg(M["RECORD"], {"timestamp": ts, "position_lat": int(la / 180 * 2**31),
+                                    "position_long": int(lo / 180 * 2**31)}
+                      | ({} if h is None else {"heart_rate": h}))
+        secs = max(n, 1)  # an empty session still spans time, so the windows stay ordered
+        end = t + dt.timedelta(seconds=secs)
+        e.on_mesg(M["SESSION"], {"timestamp": end, "start_time": t, "total_elapsed_time": secs,
+                                 "sport": sport, "message_index": i})
+        t, lon0 = end, lon0 + n * 1e-4
+    return e.close()
 
 
 @pytest.mark.parametrize("raw,fam", [
@@ -102,3 +124,24 @@ def test_parse_tcx_skips_trackpoints_without_position():
     pts[1] = (None, None, pts[1][2], 150)
     (leg,) = activity.parse_tcx(_tcx([("Running", pts)]))
     assert len(leg.lat) == 3
+
+def test_parse_fit_splits_a_multisport_file_and_attaches_transitions_to_the_next_leg():
+    legs = activity.parse_fit(_fit([("swimming", 5, None), ("transition", 2, 120),
+                                    ("cycling", 6, 140), ("transition", 2, 130),
+                                    ("running", 4, 160)]), "tri.fit")
+    assert [l.sport for l in legs] == ["swim", "bike", "run"]
+    assert [len(l.lat) for l in legs] == [5, 8, 6]
+    assert np.isnan(legs[0].hr).all() and legs[1].hr[0] == 120 and legs[2].hr[-1] == 160
+    assert abs(legs[0].lat[0] - 47.0) < 1e-6 and legs[0].source == "tri.fit"
+
+def test_parse_fit_keeps_a_session_without_gps_as_an_empty_leg():
+    legs = activity.parse_fit(_fit([("swimming", 0, None), ("cycling", 3, 140)]))
+    assert [l.sport for l in legs] == ["swim", "bike"] and len(legs[0].lat) == 0
+
+def test_parse_fit_refuses_a_non_fit_file():
+    with pytest.raises(ValueError, match="not a FIT file"):
+        activity.parse_fit(b"hello", "x.fit")
+
+def test_parse_fit_reports_a_damaged_file_as_a_value_error_naming_it():
+    with pytest.raises(ValueError, match="cut.fit"):
+        activity.parse_fit(_fit([("running", 3, 150)])[:-5], "cut.fit")

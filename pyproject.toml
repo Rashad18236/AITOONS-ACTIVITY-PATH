@@ -4,7 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi", "uvicorn", "numpy", "trimesh", "pillow>=10.1",  # load_default(size=)
-    "requests", "python-multipart",
+    "requests", "python-multipart", "garmin-fit-sdk>=21.218",
 ]
 
 [dependency-groups]
