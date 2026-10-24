@@ -367,6 +367,46 @@ def test_lanes_round_a_sharp_corner_stay_clear_of_the_earlier_wall(lane_inside, 
     assert np.hypot(*np.diff(P, axis=0).T).max() <= 1.5 * 4
 
 
+def _bend(deg, left=0.0, n=30):
+    """A road n px along +x to a corner at index n, then n px on a heading turned deg
+    (positive toward +y), 1 px stations around (50, 50); left shifts it to its +y side
+    (leg 1's left), the corner mitred."""
+    d2 = np.array([np.cos(np.radians(deg)), np.sin(np.radians(deg))])
+    n1, n2 = np.array([0, 1.0]), np.array([-d2[1], d2[0]])
+    ends = [left * n1, n * np.array([1, 0]) + left * (n1 + n2) / (1 + d2[0]), n * (np.array([1, 0]) + d2) + left * n2]
+    legs = [a + np.linspace(0, 1, int(np.ceil(np.hypot(*(b - a)) - 1e-9)) + 1)[:, None] * (b - a)
+            for a, b in zip(ends, ends[1:])]
+    P = np.concatenate([legs[0], legs[1][1:]]) + 50
+    return P, np.full(len(P), 120.0)
+
+
+@pytest.mark.parametrize("deg, cut, lane_px, ramp", [
+    (sgn * deg, cut, lane_px, ramp)
+    for deg in (90, 120, 135) for sgn in (1, -1) for cut in (-0.4, 0.4, 0.8, 2.0)
+    for lane_px, ramp in ((4, 4), (5.075, 11))
+] + [(-120, None, 4, 4)])   # the re-review's repro: later wall = road - 1.6
+def test_a_sharp_corner_never_switches_the_lane_side_for_the_rest_of_the_run(deg, cut, lane_px, ramp):
+    # cut: how far the later track runs inside the corner (-0.4 = outside). Clearance is
+    # not asserted past 90 deg or for a cut-in track, and stations whose foot is within
+    # 3 lanes of the corner are not checked: that is assign_lanes' ceiling. What must
+    # hold is the side after the corner being the side before it.
+    road = _bend(deg)
+    late = (road[0] - 1.6, road[1]) if cut is None else _bend(deg, cut * np.sign(deg))
+    [_, [(P, _)]] = poster.assign_lanes([[road], [late]], lane_px=lane_px, r_px=lane_px, ramp=ramp)
+    a1 = poster._ramp(_dist_to(late[0], [road]) < lane_px, np.zeros(len(P), int), ramp) == 1
+    A, B = road[0][:-1], road[0][1:]
+    F, _, k = poster._nearest_on_segments(P, A, B)
+    u = B[k] - A[k]
+    side = np.sign(u[:, 0] * (P - F)[:, 1] - u[:, 1] * (P - F)[:, 0])
+    keep = a1 & (np.hypot(*(F - road[0][30]).T) > 3 * lane_px)
+    assert np.ptp(side[keep]) == 0 and side[keep][0] != 0
+
+
+def test_a_push_out_that_gives_up_says_so_in_one_line_without_coordinates(capsys):
+    poster.assign_lanes([[_bend(150)], [_bend(150, 0.4)]], lane_px=4, r_px=4, ramp=4)   # a 30 deg wedge
+    assert re.fullmatch(r"path: lane push-out did not converge at \d+ stations\n", capsys.readouterr().out)
+
+
 def test_lanes_are_counted_against_the_earlier_walls_lines_before_they_moved():
     # wall 2 is 1 px from wall 1's input line but 4.5 px from where wall 1 moved to
     out = poster.assign_lanes([[_line(10, 90, y, 120)] for y in (50.0, 50.5, 49.5)], lane_px=4, r_px=4, ramp=4)

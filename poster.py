@@ -1046,6 +1046,9 @@ WALL_SUB = 4
 # each shave about a pixel off a drawn width, and the meshed strip must never come out
 # under its core groove_w_mm - 2*clearance_mm (spec 6.5 allows "a couple" of pixels).
 WALL_PAD_PX = 2
+# assign_lanes flips a station's lane normal only when it is over 150 deg off the previous
+# one: that is a collapsed out-and-back's two passes tying, never a corner of a road.
+LANE_FLIP_DOT = -0.866
 
 
 def wall_height(hr: np.ndarray, p: Params) -> np.ndarray:
@@ -1120,6 +1123,19 @@ def _nearest_on_segments(Q: np.ndarray, A: np.ndarray, B: np.ndarray
         r = np.arange(len(j))
         feet[sl], dist[sl] = F[r, j], d[r, j]
     return feet, dist, k
+
+
+def _ray_hit(O: np.ndarray, D: np.ndarray, A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """Per ray O + t*D, the smallest t > 1e-6 where it meets a segment A-B, inf if none."""
+    E, hit = B - A, np.full(len(O), np.inf)
+    for sl in _rows(len(O), len(A)):
+        w, d = A - O[sl, None], D[sl, None]
+        den = d[..., 0] * E[:, 1] - d[..., 1] * E[:, 0]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = (w[..., 0] * E[:, 1] - w[..., 1] * E[:, 0]) / den
+            u = (w[..., 0] * d[..., 1] - w[..., 1] * d[..., 0]) / den
+        hit[sl] = np.where((den != 0) & (u >= 0) & (u <= 1) & (t > 1e-6), t, np.inf).min(1)
+    return hit
 
 
 def _ramp(mask: np.ndarray, piece: np.ndarray, k: int) -> np.ndarray:
@@ -1212,17 +1228,24 @@ def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: floa
     Wall 0 stays put; hr is untouched. A station of a later wall takes lane = the
     number of earlier walls whose INPUT polyline lies strictly within r_px; ref is the
     earliest of them. Its target is the foot on ref plus lane * lane_px along ref's
-    vertex normals interpolated at the foot. A vertex normal averages the segment
-    normals within +-ramp segments, so a sharp corner turns the lane over ~2*ramp
-    stations instead of one chord across it. The normal is
-    oriented to agree with the previous station along each run of lane > 0 (so an
-    out-and-back ref, whose two passes face opposite ways, never flips the side). The
-    move is eased by _ramp, then any lane station still closer than lane * lane_px to
-    ref is pushed straight away from its nearest ref point to exactly that (inside
-    corners, and a wall easing off the road), spec 6.6."""
-    # ponytail: the normal window is ramp, 0.908 L worst case at a 90 deg corner; widen if a lane chords
+    vertex normals interpolated at the foot; a vertex normal averages the segment
+    normals within +-ramp segments, so a corner turns the lane over ~2*ramp stations.
+    Along a run of lane > 0 the normal is flipped only where it points over 150 deg
+    away from the previous station's (LANE_FLIP_DOT): a collapsed out-and-back's two
+    passes tying, never a corner. A target that would cross another stretch of ref (a
+    turnaround, an inside corner) stops half way to it. The move is eased by _ramp,
+    then every lane station closer than lane * lane_px to ref is pushed straight away
+    from its nearest ref point to exactly that, repeated until none is (64 rounds,
+    then one line on stdout), spec 6.6.
+
+    Ceiling: the lane is clear of a neighbour's crossing cut only where the shared road
+    turns up to 90 deg and the later track stays within ~0.4 px of it. At a sharper
+    corner, or where the later track cuts the corner, the lane can come inside the cut
+    and Task 9's crossing rule gives the EARLIER wall a short gap there."""
+    # ponytail: per-station offsets; build lanes from a true offset polyline of the earlier
+    # wall's road (round joins outside, trimmed loops inside) to clear any corner
     refs = [_lane_ref(w, ramp) for w in walls]
-    out = [walls[0]]
+    out, short = [walls[0]], 0
     for i, w in enumerate(walls[1:], 1):
         n_k = [len(q) for q, _ in w]
         P = np.concatenate([q for q, _ in w]).astype(float)
@@ -1243,22 +1266,29 @@ def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: floa
             nrm[m] = np.where((n ** 2).sum(1, keepdims=True) > 0, n, NS[k])[m]
         m = lane > 0
         for s in np.flatnonzero(m[1:] & m[:-1] & (g[1:] == g[:-1])) + 1:
-            if nrm[s] @ nrm[s - 1] < 0:       # in order: s - 1 is already oriented
+            if nrm[s] @ nrm[s - 1] < LANE_FLIP_DOT:   # in order: s - 1 is already oriented
                 nrm[s] = -nrm[s]
-        off = lane[:, None] * lane_px
+        off = lane[:, None] * float(lane_px)
+        aim = off.copy()
+        for j in np.unique(ref[m]):   # never aim across another stretch of ref (a turnaround,
+            s = np.flatnonzero(m & (ref == j))   # an inside corner): stop half way, push the rest
+            aim[s] *= np.minimum(1, _ray_hit(foot[s], off[s] * nrm[s], *refs[j][:2]) / 2)[:, None]
         new = P.copy()
-        new[m] += _ramp(m, g, ramp)[m, None] * (foot[m] + off[m] * nrm[m] - P[m])
+        new[m] += _ramp(m, g, ramp)[m, None] * (foot[m] + aim[m] * nrm[m] - P[m])
         for j in np.unique(ref[m]):
             s = np.flatnonzero(m & (ref == j))
-            for _ in range(8):   # ponytail: an inside corner settles in 2-3; raise if a lane dips
+            for it in range(65):   # 64 pushes at most; a narrow inside corner converges slowly
                 f, d = _nearest_on_segments(new[s], *refs[j][:2])[:2]
-                c = d < off[s, 0] - 1e-9
-                if not c.any():
-                    break
+                c = d < off[s, 0] * (1 - 1e-6)
                 s, f, d = s[c], f[c], d[c, None]
+                if not len(s) or it == 64:
+                    break
                 away = np.divide(new[s] - f, d, out=nrm[s].copy(), where=d > 0)
                 new[s] = f + off[s] * away
+            short += len(s)
         out.append(list(zip(np.split(new, np.cumsum(n_k)[:-1]), [h for _, h in w])))
+    if short:
+        print(f"path: lane push-out did not converge at {short} stations")
     return out
 
 
