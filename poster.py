@@ -291,8 +291,11 @@ ROAD_TIERS = (("streets", 35, "residential|unclassified|living_street|service|pe
               ("tertiary", 60, "tertiary"), ("secondary", 150, "secondary"),
               ("primary", 400, "primary"), ("trunk", 1200, "trunk"), ("motorway", 3000, "motorway"))
 DETAIL_GROUPS = {"streets", "trails"}
-RAIL_MAX_M_PER_MM = 150   # railway=rail, a theme permission like the tiers, never dropped
+RAIL_MAX_M_PER_MM = 150   # railway=rail|narrow_gauge (Swiss mountain lines), theme permission
 ROAD_MAX_FRAC = 0.15   # grey plate fraction above which the finest class is dropped
+# ...when the theme prints detail in its own colour: Zermatt's streets grey 16%, which
+# reads as streets in a 4th colour and as a block in the band's shared grey
+DETAIL_MAX_FRAC = 0.20
 RUNWAY_M = 45.0        # OSM aeroway=runway without a usable width tag
 
 # The relief ceiling spans the terrain range, or this (m) if that is smaller, so a flat
@@ -654,11 +657,12 @@ def _road_mask(items, bounds, px_out):
     return np.asarray(img) > 0
 
 
-def fetch_osm_masks(bounds, px_out, res_mm, groups=frozenset()):
+def fetch_osm_masks(bounds, px_out, res_mm, groups=frozenset(), max_frac=ROAD_MAX_FRAC):
     """OSM water, sea and grey roads/runways over bounds -> (water, sea, roads), each
     bool (px_out, px_out), row 0 = north. One Overpass call for all three. `groups` are
     the detail classes the theme permits (Theme.groups); the zoom decides which of
-    them are drawn, and hiking routes and rail go into `roads`."""
+    them are drawn, and hiking routes and rail go into `roads`. Above `max_frac` of the
+    plate the finest class is dropped."""
     w, s = _unmerc(bounds[0], bounds[1])
     e, n = _unmerc(bounds[2], bounds[3])
     if e - w > 4.0:   # a transoceanic track; Overpass would time out on the ocean
@@ -673,19 +677,25 @@ def fetch_osm_masks(bounds, px_out, res_mm, groups=frozenset()):
     tier_of = {h: c for c, rx in tiers if rx for h in rx.split("|")}
     rail = "rail" in groups and m_per_mm <= RAIL_MAX_M_PER_MM
     hw = "|".join(rx for _, rx in tiers if rx)
-    # appended inside {roads}, so classic's query string (and cache key) is unchanged
+    # appended inside {roads}, so classic's query string (and cache key) is unchanged.
+    # ponytail: `out geom` sends every hiking relation's member ways whole, unclipped
+    # (Zermatt: 2 MB / 32 s, 34% of the points inside the box). Upgrade: a way(r) member
+    # fetch scoped to the hiking set, which also brings the member tags; never
+    # `out geom(bbox)` on the shared `out`, which would clip the lake rings.
     roads = ((f'way["highway"~"^({hw})$"];' if hw else "")
              + ('relation["route"="hiking"];' if "trails" in classes else "")
-             + ('way["railway"="rail"];' if rail else ""))
+             + ('way["railway"~"^(rail|narrow_gauge)$"];' if rail else ""))
     els = _overpass(OVERPASS_QL.format(s=s, w=w, n=n, e=e, roads=roads))
     tag = lambda el, k: (el.get("tags") or {}).get(k)
     # a tunnel is skipped, not "water": a closed roundabout way would otherwise reach
-    # the polygon rasteriser as a lake; so would a circular hiking route or a rail loop
+    # the polygon rasteriser as a lake; so would a circular hiking route or a rail loop.
+    # A rail `service` way is a yard, siding or spur: skipped too.
     kind = lambda el: ("sea" if tag(el, "natural") == "coastline" else
                        "runway" if tag(el, "aeroway") == "runway" else
                        (tier_of.get(tag(el, "highway")) if not tag(el, "tunnel")
                         else None) if tag(el, "highway") else
-                       (None if tag(el, "tunnel") else "rail") if tag(el, "railway") == "rail" else
+                       (None if tag(el, "tunnel") or tag(el, "service") else "rail")
+                       if tag(el, "railway") in ("rail", "narrow_gauge") else
                        "trails" if tag(el, "route") == "hiking" else "water")
     # coastline must never reach the polygon rasteriser: a closed coastline way is an
     # island, and painted as a polygon it would print as a lake
@@ -703,9 +713,11 @@ def fetch_osm_masks(bounds, px_out, res_mm, groups=frozenset()):
     areas = [el for el in runways if tag(el, "area") == "yes"]   # drawn as an outline polygon
     fixed = [(pts(el), px(max(ROAD_MM, runway_m(el) / m_per_mm)))   # never dropped
              for el in runways if tag(el, "area") != "yes" and len(pts(el)) >= 2]
+    # ponytail: rail is never dropped by the cap, like runways (one line in practice,
+    # sidings skipped); key it as a tier if a rail hub ever greys the plate
     fixed += [(pts(el), px(ROAD_MM)) for el in pick("rail") if len(pts(el)) >= 2]
-    # `out geom` hands a relation's member ways their geometry but, as a rule, not their
-    # tags, so a member's tunnel=* is honoured only when the response carries it
+    # `out geom` hands a relation's member ways their geometry but not their tags (0 of
+    # 1337 at Zermatt), so a member's tunnel=* is honoured only if a response carries it
     trail = lambda el: [[(p["lat"], p["lon"]) for p in m.get("geometry") or []]
                         for m in el.get("members", ())
                         if m.get("type") == "way" and not (m.get("tags") or {}).get("tunnel")]
@@ -714,7 +726,7 @@ def fetch_osm_masks(bounds, px_out, res_mm, groups=frozenset()):
     while True:
         grey = _road_mask(fixed + [it for c, it in road_items if c in classes],
                           bounds, px_out)
-        if grey.mean() <= ROAD_MAX_FRAC or not classes:
+        if grey.mean() <= max_frac or not classes:
             break
         print(f"roads: {classes[0]} would grey {grey.mean():.0%} of the plate — dropped")
         classes.pop(0)
@@ -1825,7 +1837,8 @@ def build_poster(legs: list[activity.Leg], p=Params()) -> tuple[list, list, list
     elev = fetch_elevation(bounds, M)
     # No soft-fail: a poster without its coast keeps the seabed in the DEM and prints
     # different relief from the same order, so Overpass being down is a 502.
-    water, sea, roads = fetch_osm_masks(bounds, M, p.res_mm, groups=t.groups)
+    water, sea, roads = fetch_osm_masks(bounds, M, p.res_mm, groups=t.groups,
+                                        max_frac=DETAIL_MAX_FRAC if t.detail else ROAD_MAX_FRAC)
     # the sea is flat; terrarium carries bathymetry (Blackpool: -7.85 m seabed,
     # 45% of the grid). np.where, not in place: fetch_elevation's array is read-only
     elev = np.where(sea, 0.0, elev)
