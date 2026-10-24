@@ -1006,8 +1006,14 @@ MIN_PIECE_MM = 3.0
 # assign_lanes flips a station's lane normal only when it is over 150 deg off the previous
 # one: that is a collapsed out-and-back's two passes tying, never a corner of a road.
 LANE_FLIP_DOT = -0.866
-# Lanes clear an earlier wall from 0.9 pitch: jitter can't flip them, still past the cut's reach.
-LANE_CLEAR_FRAC = 0.9
+# assign_lanes prices lane k at a station by d, its target's distance to the earlier walls,
+# against lane_dists' cut_px (the crossing cut's reach) and clear_px: 0 from clear_px,
+# (clear_px - d) / lane_px between them, LANE_HARD under cut_px.
+LANE_CLEAR_FRAC = 0.95   # clear_px is at least this much of the pitch
+LANE_HARD = 100.0        # the price of a station whose lane the crossing cut would reach
+LANE_COST = 0.05         # per station per lane above 1, so a raised lane comes back down once
+                         # more than LANE_CHANGE_COST / LANE_COST = 20 stations of road follow
+LANE_CHANGE_COST = 1.0   # per lane changed
 
 
 def wall_height(hr: np.ndarray, p: Params) -> np.ndarray:
@@ -1178,6 +1184,41 @@ def _segs(wall, was):
     return np.concatenate(A), np.concatenate(B), np.concatenate(mv)
 
 
+def lane_dists(lane_px: float, dil_px: int) -> tuple[float, float]:
+    """(cut_px, clear_px) of assign_lanes, relief px, for pitch lane_px and the crossing
+    cut's dilation dil_px (both from _wall_dims). cut_px is the cut's measured raster reach
+    between centrelines, (W + sqrt(2)*dil*res_f)/res_mm + sqrt(2)/WALL_SUB (worst at 45 deg:
+    the ribbon's corners add a fine-pixel diagonal), written from lane_px = (W + (2*dil + 1)
+    * res_f)/res_mm so it holds for any groove_w_mm. clear_px is one fine pixel past it, or
+    LANE_CLEAR_FRAC of the pitch if that is more."""
+    cut = lane_px - ((2 - math.sqrt(2)) * dil_px + 1 - math.sqrt(2)) / WALL_SUB
+    return cut, max(LANE_CLEAR_FRAC * lane_px, cut + 1 / WALL_SUB)
+
+
+def _lane_path(cost: np.ndarray, hard: np.ndarray) -> np.ndarray:
+    """Lanes 1..K, one per station of a lane run, from per-station lane costs (n, K) and
+    hard (n, K), lane k within the crossing cut's reach at s: Viterbi for the least total
+    of the station costs plus LANE_CHANGE_COST per lane changed. A change a -> b at s is
+    banned when b, or a lane strictly between a and b, is hard there: a wall never steps
+    onto a neighbour or over it. Staying is always allowed and the first station is free,
+    so a path always exists."""
+    n, K = cost.shape
+    a, b = np.meshgrid(np.arange(K), np.arange(K), indexing="ij")
+    lo, hi = np.minimum(a, b), np.maximum(a, b)
+    hc = np.concatenate([np.zeros((n, 1), int), np.cumsum(hard, 1)], 1)
+    banned = (hc[:, hi] - hc[:, lo + 1] > 0) | (hard[:, None, :] & (a != b))   # across | into
+    step = np.where(banned, np.inf, LANE_CHANGE_COST * abs(b - a))
+    D, back = cost[0], np.zeros((n, K), int)
+    for s in range(1, n):
+        t = D[:, None] + step[s]
+        back[s], D = t.argmin(0), cost[s] + t.min(0)
+    k = np.empty(n, int)
+    k[-1] = D.argmin()
+    for s in range(n - 1, 0, -1):
+        k[s - 1] = back[s, k[s]]
+    return k + 1
+
+
 def _push(Q, A, B, off, nrm):
     """(Q, how many are still short): each Q pushed straight away from its nearest point
     on segments A-B to its off, repeated until every one is at off * (1 - 1e-6) or more,
@@ -1195,7 +1236,8 @@ def _push(Q, A, B, off, nrm):
 
 
 def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: float,
-                 r_px: float, ramp: int) -> list[list[tuple[np.ndarray, np.ndarray]]]:
+                 r_px: float, ramp: int, dil_px: int | None = None
+                 ) -> list[list[tuple[np.ndarray, np.ndarray]]]:
     """Collapsed walls, earliest first -> the same walls, shared roads in side-by-side lanes.
 
     Wall 0 stays put; hr is untouched. A station of a later wall is in a lane where
@@ -1205,18 +1247,33 @@ def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: floa
     normals within +-ramp segments, so a corner turns the lane over ~2*ramp stations.
     Along a run of lane stations the normal is flipped only where it points over 150
     deg away from the previous station's (LANE_FLIP_DOT): a collapsed out-and-back's
-    two passes tying, never a corner. k is the smallest k >= 1 whose target, pushed
-    off ref as below, clears every earlier wall's OUTPUT polyline by LANE_CLEAR_FRAC *
-    lane_px (ref's own unmoved road is lane 0, which the push keeps clear, so it never
-    blocks k = 1): counted against the inputs, two later walls either side of an earlier
-    one took one lane and the crossing cut deleted one. Along each run of lane stations
-    (consecutive, one piece) k is held at its max over +-ramp stations, so a jittering
-    neighbour cannot make it alternate, then eased to the offset o, its mean over
-    +-ramp // 2 (clipped at the run's ends): a lane change is a linear move over ~ramp
-    stations, and o == k exactly where k is constant. The target foot + o * lane_px
-    along the normal is eased in by _ramp, then every lane station closer than o *
-    lane_px to ref is pushed straight away from its nearest ref point to exactly that,
-    repeated until none is (64 rounds, then one line on stdout), spec 6.6.
+    two passes tying, never a corner.
+
+    The lane, per lane run (consecutive lane stations of one piece), of lanes 1..i+1:
+    - Priced closeness. d is lane k's target, pushed off ref as below, to every earlier
+      wall's OUTPUT polyline (ref's own unmoved road is lane 0, which the push keeps
+      clear, so it never counts; counted against the INPUTS, two later walls either side
+      of an earlier one took one lane and the crossing cut deleted one). lane_dists gives
+      cut_px, the crossing cut's raster reach, and clear_px; a station-lane costs 0 from
+      clear_px, (clear_px - d) / lane_px from cut_px and LANE_HARD under it, plus
+      LANE_COST per lane above 1.
+    - Fewest changes. _lane_path picks the least total, with LANE_CHANGE_COST per lane
+      changed, and bans a change into a lane that is hard at that station or across one:
+      stepping onto or over a neighbour is what cuts it into pieces, a dip that grazes
+      it is only priced. So a station keeps a hard lane where that is the cheapest legal
+      path: every lane hard (an earlier wall crossing the shared road, the crossing cut
+      decides), or a graze where the cleaner lane lies across the neighbour.
+    - Ease, with room. The chosen lanes are eased to the offset o, their mean over
+      +-ramp // 2 clipped to the run, so a change is a linear move over ~ramp stations
+      and o == k exactly where k holds; a change within ramp // 2 of a run's end is only
+      part-eased at that end. A station whose eased target would come within cut_px of
+      an earlier wall, where its chosen lane's would not, keeps its chosen lane: the ease
+      shortens where there is no room.
+    The target foot + o * lane_px along the normal is eased in by _ramp, then every lane
+    station closer than o * lane_px to ref is pushed straight away from its nearest ref
+    point to exactly that, repeated until none is (64 rounds, then one line on stdout),
+    spec 6.6. dil_px is the crossing cut's dilation (_wall_dims) behind cut_px; None
+    takes the default Params'.
 
     Ceiling: the lane is clear of a neighbour's crossing cut only where the shared road
     turns up to 90 deg and the later track stays within ~0.4 px of it. At a sharper
@@ -1227,6 +1284,7 @@ def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: floa
     # ponytail: per-station offsets; build lanes from a true offset polyline of the earlier
     # wall's road (round joins outside, trimmed loops inside) to clear any corner
     refs = [_lane_ref(w, ramp) for w in walls]
+    cut, clear = lane_dists(lane_px, _wall_dims(resolve(Params()))[2] if dil_px is None else dil_px)
     out, short = [walls[0]], 0
     for i, w in enumerate(walls[1:], 1):
         n_k = [len(q) for q, _ in w]
@@ -1251,35 +1309,47 @@ def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: floa
             if nrm[s] @ nrm[s - 1] < LANE_FLIP_DOT:   # in order: s - 1 is already oriented
                 nrm[s] = -nrm[s]
         segs = [_segs(o, w0) for o, w0 in zip(out, walls)]
-        lane[:] = 0
-        for k in range(1, i + 2):   # lanes 1..i+1, one more than there are earlier walls
-            s = np.flatnonzero(m & (lane == 0))
-            T = foot[s] + k * lane_px * nrm[s]
+
+        def dist(s, off):
+            """Stations s' targets at offset off, pushed off ref, to every earlier wall's
+            output; ref's own unmoved road is lane 0, which the push keeps off clear."""
+            T = foot[s] + off[:, None] * nrm[s]
             for j in np.unique(ref[s]):
                 t = ref[s] == j
-                T[t] = _push(T[t], *refs[j][:2], np.full(t.sum(), k * lane_px), nrm[s][t])[0]
-            ok = np.ones(len(s), bool)
+                T[t] = _push(T[t], *refs[j][:2], off[t], nrm[s][t])[0]
+            d = np.full(len(s), np.inf)
             for j, (A, B, mv) in enumerate(segs):
-                # ref's own unmoved road is lane 0, which the push keeps k lanes off
-                own, d = ref[s] == j, np.full(len(s), np.inf)
+                own = ref[s] == j
                 for q, sel in ((~own, slice(None)), (own, mv)):
                     if q.any() and len(A[sel]):
-                        d[q] = _nearest_on_segments(T[q], A[sel], B[sel])[1]
-                ok &= d >= LANE_CLEAR_FRAC * lane_px
-            lane[s[ok]] = k
-        # ponytail: where no lane clears (an earlier wall crossing the shared road) the
-        # station stays in lane 1 and the crossing cut decides; search on past i+1 if a
-        # real order ever shows two earlier walls sitting between lanes
-        lane[m & (lane == 0)] = 1
-        o, h = np.zeros(len(P)), ramp // 2    # per lane run: hold max over +-ramp, mean over +-h
+                        d[q] = np.minimum(d[q], _nearest_on_segments(T[q], A[sel], B[sel])[1])
+            return d
+
+        s = np.flatnonzero(m)
+        d = np.zeros((len(P), i + 1))   # lanes 1..i+1, one more than there are earlier walls
+        for k in range(1, i + 2):
+            d[s, k - 1] = dist(s, np.full(len(s), k * lane_px))
+        hard = d < cut
+        cost = (np.where(hard, LANE_HARD, np.clip(clear - d, 0, None) / lane_px)
+                + LANE_COST * np.arange(i + 1))
+        # ponytail: where every lane is hard (an earlier wall crossing the shared road) the
+        # path pays it and the crossing cut decides; search on past i+1 if a real order ever
+        # shows two earlier walls sitting between lanes
+        lane[:] = 0
+        o, half = np.zeros(len(P)), ramp // 2   # per lane run: lane path, then its mean over +-half
         runs = np.flatnonzero((m[1:] != m[:-1]) | (g[1:] != g[:-1])) + 1
         for s in np.split(np.arange(len(P)), runs):
             if len(s) and m[s[0]]:
-                c = np.r_[0, np.cumsum(np.lib.stride_tricks.sliding_window_view(
-                    np.pad(lane[s], ramp), 2 * ramp + 1).max(1))]
-                x = np.arange(len(s))
-                lo, hi = np.maximum(x - h, 0), np.minimum(x + h + 1, len(s))
+                lane[s] = _lane_path(cost[s], hard[s])
+                c, x = np.r_[0, np.cumsum(lane[s])], np.arange(len(s))
+                lo, hi = np.maximum(x - half, 0), np.minimum(x + half + 1, len(s))
                 o[s] = (c[hi] - c[lo]) / (hi - lo)    # integer sums: exactly k where k holds
+        # room check: an eased station that would come within cut_px of an earlier wall, where
+        # its own lane would not, keeps its lane; the ease shortens where there is no room
+        s = np.flatnonzero(m & (o != lane))
+        if len(s):
+            back = (dist(s, o[s] * lane_px) < cut) & ~hard[s, lane[s] - 1]
+            o[s[back]] = lane[s[back]]
         off = o * float(lane_px)
         new = P.copy()
         new[m] += _ramp(m, g, ramp)[m, None] * (foot[m] + off[m, None] * nrm[m] - P[m])
@@ -1545,10 +1615,11 @@ def build_poster(legs: list[activity.Leg], p=Params()) -> tuple[list, list, list
     # Walls (spec 6.5, 6.6): passes collapse inside a sport, then sports take lanes, then
     # crossings cut the earlier wall; the groove is carved from those very masks. "The
     # same road" is within one lane pitch, and every snap eases over two pitches.
-    r = _wall_dims(p)[3] / p.res_mm
+    _, _, dil, lane = _wall_dims(p)
+    r = lane / p.res_mm
     ramp = math.ceil(2 * r)
     laned = assign_lanes([collapse_passes([leg_stations(l, bounds, M) for l in ls], r, ramp)
-                          for _, ls in walls], r, r, ramp)
+                          for _, ls in walls], r, r, ramp, dil)
     masks = wall_masks(laned, M, p)
     parts = compose_parts(groove_from_masks(masks, M, p), elev, lc, p)
     tops = wall_tops(laned, parts["surface"], p)

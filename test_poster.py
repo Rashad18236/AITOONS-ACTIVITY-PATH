@@ -159,8 +159,8 @@ def test_wall_dims_keep_neighbouring_lanes_clear_of_the_crossing_cut():
         res_f, W, dil, lane = poster._wall_dims(p)
         assert W >= p.groove_w_mm - 2 * p.clearance_mm
         assert lane - W > 2 * dil * res_f
-    # assign_lanes calls a lane clear at LANE_CLEAR_FRAC of the pitch: that must still be
-    # outside the cut's reach, W plus the dilation's diagonal sqrt(2) * dil fine pixels
+    # assign_lanes' clear_px is at least LANE_CLEAR_FRAC of the pitch: that floor must still
+    # be outside the cut's analytic reach, W plus the dilation's diagonal sqrt(2) * dil fine pixels
     for p in [_params(res_mm=res) for res in (0.5, 0.4, 0.25)] + [
             poster.resolve(poster.Params(size_mm=s)) for s in poster.SIZES_MM]:
         res_f, W, dil, lane = poster._wall_dims(p)
@@ -461,7 +461,8 @@ def test_a_jittery_swim_beside_a_shared_road_is_not_cut(seed):
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_a_neighbour_jittering_across_the_clear_line_is_held_off_not_flapped(seed):
     # wall 1 at 1.9L +-0.5 px: lane 1 clears it at some stations and not at the next, so
-    # only the hold keeps wall 2 off it, eased up once (through lane 2) to lane 3
+    # only a steady lane choice keeps wall 2 off it (343dee3's hold; now a move up to
+    # lane 3 before the neighbour starts)
     p, L, ramp = _dims216()
     rng = np.random.default_rng(seed)
     w0, w2 = _line(10, 180, 100.0, 150), _line(10, 180, 100 + 0.3 * L, 150)
@@ -488,9 +489,90 @@ def test_a_lane_change_that_is_really_needed_happens_once_up_and_once_down_eased
     assert (k[abs(x - 100) > 20 + 3 * ramp] == 1).all() and (k[alongside] == 2).all()
     assert changes == 2
     assert np.hypot(*np.diff(P, axis=0).T).max() <= 1.5 * L
-    assert abs(np.diff(P[:, 1])).max() < 0.5 * L     # eased: never a one-lane jump
+    assert abs(np.diff(P[:, 1])).max() < 0.75 * L    # eased: never a one-lane jump
     assert _dist_to(P[alongside], out[1]).min() >= 0.9 * L
     assert len(list(poster._components(poster.wall_masks(out, _mpx(p), p)[1]))) == 1
+
+
+def _drift(x0, x1, y, amp, lam):
+    """_line at y plus a slow sinusoidal GPS drift of amp px, wavelength lam px."""
+    P, h = _line(x0, x1, y, 150)
+    P[:, 1] += amp * np.sin(2 * np.pi * P[:, 0] / lam)
+    return P, h
+
+
+def _assert_steady_beside_and_neighbour_whole(walls, nb, x0, x1):
+    """At 216 dims: wall 2's rounded lane changes at most once over x0..x1 (the neighbour's
+    stretch), and wall nb is one piece with >= 99% of its pixels without wall 2."""
+    p, L, ramp = _dims216()
+    out = poster.assign_lanes(walls, L, L, ramp)
+    x = walls[2][0][0][:, 0]
+    assert _lane_changes(out[2][0][0][(x >= x0) & (x <= x1)], 100, L)[1] <= 1
+    M = _mpx(p)
+    solo = poster.wall_masks(poster.assign_lanes(walls[:2], L, L, ramp), M, p)[nb]
+    m = poster.wall_masks(out, M, p)[nb]
+    assert len(list(poster._components(m))) == 1 and m.sum() >= 0.99 * solo.sum()
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("y, j", [(1.97, 0.5), (1.98, 0.5), (1.99, 0.5), (1.95, 0.3)])
+def test_a_neighbour_jittering_just_past_the_clear_line_keeps_the_lane_steady(y, j, seed):
+    # lane 1 clears the neighbour at one station and not the next, in gaps longer than
+    # any fixed hold: the fewest-changes path keeps one lane past the whole neighbour
+    _, L, _ = _dims216()
+    w0, w2 = _line(10, 180, 100.0, 150), _line(10, 180, 100 + 0.3 * L, 150)
+    w1 = _jitter(50, 170, 100 + y * L, j, np.random.default_rng(seed))
+    _assert_steady_beside_and_neighbour_whole([[w0], [w1], [w2]], 1, 50, 170)
+
+
+@pytest.mark.parametrize("layout", ["neighbour", "triathlon"])
+def test_a_neighbour_drifting_slowly_across_the_clear_line_keeps_the_lane_steady(layout):
+    # +-0.2 px of drift around 1.92 L, wavelength 80 px: 3840a94 held lane 3, a +-ramp
+    # hold flipped every half wave
+    _, L, _ = _dims216()
+    road, run = _line(10, 180, 100.0, 150), _line(10, 180, 100 + 0.3 * L, 150)
+    if layout == "neighbour":
+        _assert_steady_beside_and_neighbour_whole(
+            [[road], [_drift(50, 170, 100 + 1.92 * L, 0.2, 80)], [run]], 1, 50, 170)
+    else:   # the swim drifts beside the bike's road, which the run shares
+        _assert_steady_beside_and_neighbour_whole(
+            [[_drift(10, 180, 100 + 1.92 * L, 0.2, 80)], [road], [run]], 0, 10, 180)
+
+
+@pytest.mark.parametrize("gap", [8, 10, 12])
+def test_going_round_a_blocker_never_eases_through_the_piece_before_it(gap):
+    # wall 1: piece A two lanes off beside lane 1 (x 55..72), then piece B, a blocker in
+    # lane 1, from gap px after A ends: a hold that eased wall 2 up early ran through A
+    p, L, ramp = _dims216()
+    w0, w2 = _line(10, 180, 100.0, 150), _line(10, 180, 100 + 0.3 * L, 150)
+    w1 = [_line(55, 72, 100 + 2.05 * L, 150), _line(72 + gap, 120, 100 + 1.05 * L, 150)]
+    out = poster.assign_lanes([[w0], w1, [w2]], L, L, ramp)
+    M = _mpx(p)
+    solo = poster.wall_masks(poster.assign_lanes([[w0], w1], L, L, ramp), M, p)[1]
+    m1 = poster.wall_masks(out, M, p)[1]
+    for c in poster._components(solo):
+        assert (m1 & c).sum() >= 0.99 * c.sum()
+
+
+@pytest.mark.parametrize("size, groove", [(216, None), (120, None), (216, 2.5)])
+def test_a_later_wall_clear_px_away_cuts_no_meshed_cell_of_the_earlier(size, groove):
+    # clear_px is where assign_lanes stops pricing a lane's closeness; the raster crossing
+    # cut must not reach that far at any heading or sub-pixel phase, override or not
+    p = poster.resolve(poster.Params(size_mm=size, **({"groove_w_mm": groove} if groove else {})))
+    res_f, W, dil, lane = poster._wall_dims(p)
+    cut, gap = poster.lane_dists(lane / p.res_mm, dil)
+    assert cut == pytest.approx((W + math.sqrt(2) * dil * res_f) / p.res_mm + math.sqrt(2) / poster.WALL_SUB)
+    M = 64
+    c = (M - 1) / 2
+    for deg in np.linspace(0, 45, 8):
+        u = np.array([np.cos(np.radians(deg)), np.sin(np.radians(deg))])
+        n = np.array([-u[1], u[0]])
+        for ph in (0.0, 0.25, 0.5, 0.75):
+            a = c + (ph - gap / 2) * n + np.arange(-20, 21)[:, None] * u
+            h = np.full(len(a), 150.0)
+            solo = poster.wall_masks([[(a, h)]], M, p)[0]
+            both = poster.wall_masks([[(a, h)], [(a + gap * n, h)]], M, p)[0]
+            assert not (poster._slab_cells(solo) & ~poster._slab_cells(both)).any(), (deg, ph)
 
 
 def _flat(p):
