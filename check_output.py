@@ -19,7 +19,7 @@ rasterisation error of its own. Nor is the assembly fit of plate-in-ring: the tw
 are exported in their own local frames, and _grid()'s pixel rounding is unit-tested
 by test_relief_plate_clears_the_frame_ring.
 """
-import argparse, json, sys
+import argparse, json, os, re, sys
 from dataclasses import fields
 import numpy as np
 import trimesh
@@ -59,13 +59,21 @@ def main(argv=None):
     def chk(name, ok, got, want):
         rows.append((bool(ok), name, str(got), str(want)))
 
-    # 1. every file loads; each path file is one wall, labelled by its body's name
+    # 1. every file loads; each path file is one wall, labelled by its body's name: one
+    # body, so one filament per path plate (spec 4), named after the file's wall
     strips = []
     for path in a.path_3mf:
         try:
-            name, m = _load_3mf(path, WALLS)[0]
+            got = _load_3mf(path, WALLS)
+            name, m = got[0]
             strips.append((name, m))
             chk(f"{name} loads", True, f"{len(m.faces)} faces", f"3MF, {'/'.join(WALLS)} first")
+            base = os.path.basename(path)
+            chk(f"{base} holds one body", len(got) == 1, ", ".join(n for n, _ in got),
+                "one body, one filament")
+            if f := re.fullmatch(r"path(?:_(\w+))?\.3mf", base):
+                chk(f"{base} body is {f[1] or 'strip'}", name == (f[1] or "strip"), name,
+                    f[1] or "strip")
         except Exception as e:
             chk(f"{path} loads", False, f"{type(e).__name__}: {e}", "loadable")
     bodies = frame_bodies = []

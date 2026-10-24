@@ -1,5 +1,6 @@
 """Activity Path Poster core: activity -> heightmap -> printable meshes."""
 import functools, io, json, math, re, urllib.parse
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 import numpy as np
@@ -1164,21 +1165,52 @@ def _lane_ref(wall, win):
     return [np.concatenate(c) for c in zip(*parts)] if parts else None
 
 
+def _segs(wall, was):
+    """(A, B, moved) of a wall's polyline segments, stations joined within a piece only;
+    moved marks a segment with an end that is not where `was` (the wall before lanes) had it."""
+    A, B, mv = [], [], []
+    for (q, _), (q0, _) in zip(wall, was):
+        q = np.asarray(q, float)
+        c = (q != np.asarray(q0, float)).any(1)
+        A.append(q[:-1]); B.append(q[1:]); mv.append(c[:-1] | c[1:])
+    return np.concatenate(A), np.concatenate(B), np.concatenate(mv)
+
+
+def _push(Q, A, B, off, nrm):
+    """(Q, how many are still short): each Q pushed straight away from its nearest point
+    on segments A-B to its off, repeated until every one is at off * (1 - 1e-6) or more,
+    64 pushes at most (a narrow inside corner converges slowly). nrm is the way out for
+    a Q exactly on the line."""
+    Q, s = Q.copy(), np.arange(len(Q))
+    for it in range(65):
+        f, d = _nearest_on_segments(Q[s], A, B)[:2]
+        c = d < off[s] * (1 - 1e-6)
+        s, f, d = s[c], f[c], d[c, None]
+        if not len(s) or it == 64:
+            break
+        Q[s] = f + off[s, None] * np.divide(Q[s] - f, d, out=nrm[s].copy(), where=d > 0)
+    return Q, len(s)
+
+
 def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: float,
                  r_px: float, ramp: int) -> list[list[tuple[np.ndarray, np.ndarray]]]:
     """Collapsed walls, earliest first -> the same walls, shared roads in side-by-side lanes.
 
-    Wall 0 stays put; hr is untouched. A station of a later wall takes lane = the
-    number of earlier walls whose INPUT polyline lies strictly within r_px; ref is the
-    earliest of them. Its target is the foot on ref plus lane * lane_px along ref's
+    Wall 0 stays put; hr is untouched. A station of a later wall is in a lane where
+    some earlier wall's INPUT polyline lies strictly within r_px; ref is the earliest
+    of them. Its target for lane k is the foot on ref plus k * lane_px along ref's
     vertex normals interpolated at the foot; a vertex normal averages the segment
     normals within +-ramp segments, so a corner turns the lane over ~2*ramp stations.
-    Along a run of lane > 0 the normal is flipped only where it points over 150 deg
-    away from the previous station's (LANE_FLIP_DOT): a collapsed out-and-back's two
-    passes tying, never a corner. The move is eased by _ramp, then every lane station
-    closer than lane * lane_px to ref is pushed straight away from its nearest ref
-    point to exactly that, repeated until none is (64 rounds, then one line on stdout),
-    spec 6.6.
+    Along a run of lane stations the normal is flipped only where it points over 150
+    deg away from the previous station's (LANE_FLIP_DOT): a collapsed out-and-back's
+    two passes tying, never a corner. k is the smallest k >= 1 whose target, pushed
+    off ref as below, clears every earlier wall's OUTPUT polyline by lane_px (ref's
+    own unmoved road is lane 0, which the push keeps clear, so it never blocks k = 1):
+    counted against the inputs, two later walls either side of an earlier one took one
+    lane and the crossing cut deleted one. The move is eased by _ramp, then every lane
+    station closer than k * lane_px to ref is pushed straight away from its nearest
+    ref point to exactly that, repeated until none is (64 rounds, then one line on
+    stdout), spec 6.6.
 
     Ceiling: the lane is clear of a neighbour's crossing cut only where the shared road
     turns up to 90 deg and the later track stays within ~0.4 px of it. At a sharper
@@ -1212,20 +1244,34 @@ def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: floa
         for s in np.flatnonzero(m[1:] & m[:-1] & (g[1:] == g[:-1])) + 1:
             if nrm[s] @ nrm[s - 1] < LANE_FLIP_DOT:   # in order: s - 1 is already oriented
                 nrm[s] = -nrm[s]
-        off = lane[:, None] * float(lane_px)
+        segs = [_segs(o, w0) for o, w0 in zip(out, walls)]
+        lane[:] = 0
+        for k in range(1, i + 2):   # lanes 1..i+1, one more than there are earlier walls
+            s = np.flatnonzero(m & (lane == 0))
+            T = foot[s] + k * lane_px * nrm[s]
+            for j in np.unique(ref[s]):
+                t = ref[s] == j
+                T[t] = _push(T[t], *refs[j][:2], np.full(t.sum(), k * lane_px), nrm[s][t])[0]
+            ok = np.ones(len(s), bool)
+            for j, (A, B, mv) in enumerate(segs):
+                # ref's own unmoved road is lane 0, which the push keeps k lanes off
+                own, d = ref[s] == j, np.full(len(s), np.inf)
+                for q, sel in ((~own, slice(None)), (own, mv)):
+                    if q.any() and len(A[sel]):
+                        d[q] = _nearest_on_segments(T[q], A[sel], B[sel])[1]
+                ok &= d >= lane_px * (1 - 1e-6)
+            lane[s[ok]] = k
+        # ponytail: where no lane clears (an earlier wall crossing the shared road) the
+        # station stays in lane 1 and the crossing cut decides; search on past i+1 if a
+        # real order ever shows two earlier walls sitting between lanes
+        lane[m & (lane == 0)] = 1
+        off = lane * float(lane_px)
         new = P.copy()
-        new[m] += _ramp(m, g, ramp)[m, None] * (foot[m] + off[m] * nrm[m] - P[m])
+        new[m] += _ramp(m, g, ramp)[m, None] * (foot[m] + off[m, None] * nrm[m] - P[m])
         for j in np.unique(ref[m]):
             s = np.flatnonzero(m & (ref == j))
-            for it in range(65):   # 64 pushes at most; a narrow inside corner converges slowly
-                f, d = _nearest_on_segments(new[s], *refs[j][:2])[:2]
-                c = d < off[s, 0] * (1 - 1e-6)
-                s, f, d = s[c], f[c], d[c, None]
-                if not len(s) or it == 64:
-                    break
-                away = np.divide(new[s] - f, d, out=nrm[s].copy(), where=d > 0)
-                new[s] = f + off[s] * away
-            short += len(s)
+            new[s], n = _push(new[s], *refs[j][:2], off[s], nrm[s])
+            short += n
         out.append(list(zip(np.split(new, np.cumsum(n_k)[:-1]), [h for _, h in w])))
     if short:
         print(f"path: lane push-out did not converge at {short} stations")
@@ -1332,8 +1378,9 @@ def _slab_mesh(cells, top, bot, res_mm):
     return trimesh.Trimesh(np.vstack([vt, vb]), np.array(F), process=False)
 
 
-def _components(mask: np.ndarray) -> list[np.ndarray]:
-    """The 4-connected components of a bool mask, each as its own bool mask.
+def _components(mask: np.ndarray) -> Iterator[np.ndarray]:
+    """The 4-connected components of a bool mask, each as its own bool mask, one at a
+    time (a full-size mask each: 3.6 MB at 216mm).
 
     ponytail: pure-Python floodfill like _sea_mask, ~0.2 s per 1000mm wall at 216mm;
     swap for scipy.ndimage.label if it ever hurts."""
@@ -1344,7 +1391,7 @@ def _components(mask: np.ndarray) -> list[np.ndarray]:
             n += 1
             ImageDraw.floodfill(img, (int(x), int(y)), n)
     lab = np.asarray(img)
-    return [lab == k for k in range(1, n + 1)]
+    return (lab == k for k in range(1, n + 1))
 
 
 def wall_masks(walls, M: int, p) -> list[np.ndarray]:

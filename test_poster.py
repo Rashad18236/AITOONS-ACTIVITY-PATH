@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import math
 import os
 import re
 import warnings
@@ -356,10 +357,32 @@ def test_a_push_out_that_gives_up_says_so_in_one_line_without_coordinates(capsys
     assert re.fullmatch(r"path: lane push-out did not converge at \d+ stations\n", capsys.readouterr().out)
 
 
-def test_lanes_are_counted_against_the_earlier_walls_lines_before_they_moved():
-    # wall 2 is 1 px from wall 1's input line but 4.5 px from where wall 1 moved to
+def test_a_lane_clears_where_the_earlier_walls_moved_to():
+    # wall 2 is 1 px from wall 1's input line, and wall 1 moved to lane 1: wall 2 takes lane 2
     out = poster.assign_lanes([[_line(10, 90, y, 120)] for y in (50.0, 50.5, 49.5)], lane_px=4, r_px=4, ramp=4)
     assert np.allclose(out[2][0][0][:, 1], 58.0)
+
+
+@pytest.mark.parametrize("dims", ["4/4/4", "216"])
+def test_two_later_walls_either_side_of_an_earlier_one_take_two_lanes(dims):
+    # The earliest wall lies between two later ones, each within r of it but more than r
+    # from each other. Counted against the earlier walls' INPUT lines both took lane 1,
+    # on the same target, and the crossing cut then deleted the bike whole.
+    p = poster.resolve(poster.Params(size_mm=216))
+    L = poster._wall_dims(p)[3] / p.res_mm if dims == "216" else 4.0
+    ramp = math.ceil(2 * L) if dims == "216" else 4
+    walls = [[_line(20, 200, y, 150)] for y in (100.0, 100 - 0.9 * L, 100 + 0.9 * L)]
+    out = poster.assign_lanes(walls, lane_px=L, r_px=L, ramp=ramp)
+    for w, want in zip(out, (100, 100 + L, 100 + 2 * L)):
+        assert np.allclose(w[0][0][ramp:-ramp, 1], want)
+    assert all(len(list(poster._components(m))) >= 1 for m in poster.wall_masks(out, _mpx(p), p))
+
+
+def test_a_lane_clears_where_its_ref_wall_moved_to():
+    # wall 2 is within r of wall 1's input only, so wall 1 is its ref, and wall 1 moved to
+    # 54: lane 1 off wall 1's input (54.5) would sit on it, so wall 2 takes lane 2
+    out = poster.assign_lanes([[_line(10, 90, y, 120)] for y in (50.0, 50.5, 54.3)], lane_px=4, r_px=4, ramp=4)
+    assert np.allclose(out[1][0][0][:, 1], 54.0) and np.allclose(out[2][0][0][:, 1], 58.5)
 
 
 def test_the_lane_move_is_eased_per_piece():
@@ -455,7 +478,7 @@ def test_repeated_stations_draw_the_same_wall_without_a_warning():
 def test_a_later_wall_runs_through_and_the_earlier_one_is_cut_clear_of_it():
     p = _params(); M, S = _mpx(p), poster.WALL_SUB
     ma, mb = poster.wall_masks([[_line(5, 55, 30.0, 150)], [_vline(30, 5, 55, 150)]], M, p)
-    assert len(poster._components(mb)) == 1 and len(poster._components(ma)) == 2
+    assert len(list(poster._components(mb))) == 1 and len(list(poster._components(ma))) == 2
     win = lambda m: np.argwhere(m[25 * S:36 * S, 25 * S:36 * S])
     A, B = win(ma), win(mb)
     gap = np.sqrt(((A[:, None] - B[None]) ** 2).sum(-1)).min() * p.res_mm / S
@@ -465,19 +488,19 @@ def test_a_later_wall_runs_through_and_the_earlier_one_is_cut_clear_of_it():
 def test_walls_in_neighbouring_lanes_are_not_cut():
     p = _params(); M = _mpx(p); lane = poster._wall_dims(p)[3] / p.res_mm
     ma, mb = poster.wall_masks([[_line(5, 55, 30.0, 150)], [_line(5, 55, 30.0 + lane, 150)]], M, p)
-    assert len(poster._components(ma)) == len(poster._components(mb)) == 1 and not (ma & mb).any()
+    assert len(list(poster._components(ma))) == len(list(poster._components(mb))) == 1 and not (ma & mb).any()
 
 
 def test_a_fragment_too_short_to_handle_is_dropped(capsys):
     p = _params(); M = _mpx(p)
     ma, _ = poster.wall_masks([[_line(5, 55, 30.0, 150)], [_vline(10, 5, 55, 150)]], M, p)
-    assert len(poster._components(ma)) == 1 and "dropped" in capsys.readouterr().out
+    assert len(list(poster._components(ma))) == 1 and "dropped" in capsys.readouterr().out
 
 
 def test_a_wall_crossing_itself_stays_one_piece():
     p = _params(); M = _mpx(p)
     (m,) = poster.wall_masks([[_figure8(31, 31, 20, 150)]], M, p)
-    assert len(poster._components(m)) == 1
+    assert len(list(poster._components(m))) == 1
 
 
 def test_relief_plate_clears_the_frame_ring():
@@ -913,6 +936,20 @@ def test_generate_returns_one_path_per_leg_and_the_legs_note(monkeypatch):
     assert r.json()["legs"] == "swim: no HR, low line · bike: HR 100% · run: HR 100%"
 
 
+def test_generate_says_when_a_leg_is_too_short_to_print(monkeypatch):
+    # a 2-fix swim meshes under MIN_PIECE_MM: no path_swim file, and the status line says so
+    from fastapi.testclient import TestClient
+    import app as appmod
+    from test_activity import _fit
+    _fake_fetches(monkeypatch)
+    fit = _fit([("swimming", 2, None), ("cycling", 120, 140), ("running", 90, 160)])
+    r = TestClient(appmod.app).post("/generate", files=[("files", ("tri.fit", fit, "application/octet-stream"))],
+                                    data={"params": json.dumps({"size_mm": 120.0})})
+    assert r.status_code == 200, r.text
+    assert sorted(r.json()["paths"]) == ["path_bike", "path_run"]
+    assert r.json()["legs"].endswith(" · swim: too short to print at this size, no path file")
+
+
 def test_generate_refuses_an_unsupported_file():
     from fastapi.testclient import TestClient
     import app as appmod
@@ -1158,6 +1195,14 @@ def test_generate_bad_params_json():
                        data={"params": "not-json"}).status_code == 400
     assert client.post("/generate", files=files,   # valid JSON, not an object
                        data={"params": "5"}).status_code == 400
+
+
+def test_generate_refuses_a_param_of_the_wrong_type():
+    from fastapi.testclient import TestClient
+    import app as appmod
+    r = TestClient(appmod.app).post("/generate", files=[("files", _run_gpx())],
+                                    data={"params": json.dumps({"size_mm": 120, "wall_mm": "abc"})})
+    assert r.status_code == 400, r.text
 
 
 def test_masked_slab_mesh_geometry():
@@ -1521,6 +1566,23 @@ def test_check_output_flags_a_missing_text_body(monkeypatch, tmp_path, capsys):
     files = _write_order(tmp_path, poster.build_poster(LEGS3, _params()))   # no text
     rc = check_output.main(files + ["--params", json.dumps(asdict(_params(text="HB-EZE")))])
     assert rc == 1 and "text body" in capsys.readouterr().out
+
+
+def test_check_output_flags_a_path_file_with_two_bodies_or_the_wrong_wall(monkeypatch, tmp_path, capsys):
+    """One filament per path plate (spec 4): a second body would share its layers."""
+    import check_output
+    _fake_fetches(monkeypatch)
+    p = _params()
+    frame, relief, paths = poster.build_poster(TRI3, p)
+    files = _write_order(tmp_path, (frame, relief, paths))
+    bodies = dict(paths)
+    (tmp_path / "path_run.3mf").write_bytes(poster.write_3mf(bodies["path_run"] + bodies["path_bike"]))
+    (tmp_path / "path_bike.3mf").write_bytes(poster.write_3mf(bodies["path_swim"]))
+    rc = check_output.main(files + ["--params", json.dumps(asdict(p))])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "FAIL  path_run.3mf holds one body" in out and "PASS  path_swim.3mf holds one body" in out
+    assert "FAIL  path_bike.3mf body is bike" in out and "PASS  path_run.3mf body is run" in out
 
 
 def test_check_output_flags_a_chin_that_overflows_the_plate(monkeypatch, tmp_path, capsys):

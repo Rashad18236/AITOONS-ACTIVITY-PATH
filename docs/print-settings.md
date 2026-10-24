@@ -2,7 +2,9 @@
 
 Target: Bambu X1C / P1S / H2D class, 256×256 plate, 0.4 mm nozzle, AMS, PLA.
 Three plates: `relief.3mf` (3 colours), `frame.3mf` (2 colours), `path.3mf` (1 colour;
-`path.stl` in the sections below, written before it became a project).
+`path.stl` in the sections below, written before it became a project). An order with
+several sports gets one `path_<sport>.3mf` per sport instead of `path.3mf`; each shares
+`PLATES["path"]`'s settings and carries one filament.
 
 Written against Bambu Studio 1.10 / 2.x setting names. Where a name differs in
 Orca Slicer it is noted.

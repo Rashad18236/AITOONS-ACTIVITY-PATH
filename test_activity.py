@@ -74,10 +74,11 @@ def _fit(sessions, t0=T0):
     return e.close()
 
 
-def _health_zip(workouts, hr, pad_cda=4096):
+def _health_zip(workouts, hr, pad_cda=4096, dtd="<!ELEMENT HealthData ANY>"):
     """iPhone-style export.zip from workouts [(type, "YYYY-MM-DD HH:MM:SS +ZZZZ", n)] and HR
-    records [(date, bpm)]: export.xml with its DOCTYPE, one route GPX per workout with n > 0
-    fixes 1 s apart (UTC, no HR), and an export_cda.xml of pad_cda bytes stored uncompressed."""
+    records [(date, bpm)]: export.xml with its DOCTYPE (internal subset `dtd`), one route GPX
+    per workout with n > 0 fixes 1 s apart (UTC, no HR), and an export_cda.xml of pad_cda
+    bytes stored uncompressed."""
     fmt = "%Y-%m-%d %H:%M:%S %z"
     recs = "".join(f' <Record type="HKQuantityTypeIdentifierHeartRate" sourceName="Watch" '
                    f'unit="count/min" creationDate="{d}" startDate="{d}" endDate="{d}" value="{v}"/>\n'
@@ -96,7 +97,8 @@ def _health_zip(workouts, hr, pad_cda=4096):
             wos += (f' <Workout workoutActivityType="HKWorkoutActivityType{ty}" duration="{max(n, 60) / 60}" '
                     f'durationUnit="min" sourceName="Watch" startDate="{start}" endDate="{end}">{route}</Workout>\n')
         z.writestr("apple_health_export/export.xml",
-                   '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE HealthData [<!ELEMENT HealthData ANY>]>\n'
+                   '<?xml version="1.0" encoding="UTF-8"?>\n'
+                   f'<!DOCTYPE HealthData [\n{dtd}\n]>\n'
                    f'<HealthData locale="en_CH">\n{recs}{wos}</HealthData>\n')
         z.writestr("apple_health_export/export_cda.xml", b" " * pad_cda, compress_type=zipfile.ZIP_STORED)
     return buf.getvalue()
@@ -226,6 +228,13 @@ def test_health_export_takes_the_exact_start_when_two_workouts_are_close():
     with pytest.raises(ValueError, match="within 30 minutes"):
         activity.parse_health_zip(io.BytesIO(z), "2026-05-01", "12:00")
 
+def test_health_export_reads_past_a_malformed_internal_dtd():
+    # iOS 16 shipped exports whose internal DTD expat rejects; the reader never needs it
+    bad = "<!ELEMENT HealthData ANY>\n<!ATTLIST HealthData\n  locale CDATA\n>"
+    z = _health_zip([RUN_0800], EVERY_5S, dtd=bad)
+    leg = activity.parse_health_zip(io.BytesIO(z), "2026-05-01", name="export.zip")
+    assert leg.sport == "run" and len(leg.lat) == 60 and np.allclose(leg.hr, 150)
+
 def test_health_export_refuses_a_file_that_is_not_a_zip():
     with pytest.raises(ValueError, match="export.zip: not a readable"):
         activity.parse_health_zip(io.BytesIO(b"hello"), "2026-05-01", name="export.zip")
@@ -247,6 +256,15 @@ def test_a_file_that_cannot_be_read_is_a_value_error_naming_it():
         activity.read_activity([_file("bad.gpx", bad_lat)])
     with pytest.raises(ValueError, match=r"^junk\.fit: not a FIT file$"):  # already named: unchanged
         activity.read_activity([_file("junk.fit", b"\x00" * 64)])
+
+def test_a_nameless_file_still_gets_its_error_wrapped(monkeypatch):
+    # every message starts with "", so a bare error passed unwrapped; read_activity's own
+    # extension check never lets a nameless file reach a parser, so the test hands it one
+    def bare(data, name):
+        raise ValueError("bare")
+    monkeypatch.setitem(activity._PARSERS, "", bare)
+    with pytest.raises(ValueError, match=r"^: could not read this file \(ValueError: bare\)$"):
+        activity.read_activity([_file("", b"x")])
 
 def test_three_files_without_sport_are_swim_bike_run_in_time_order():
     fs = [_file(f"{i}.gpx", _gpx([(None, _pts(5, t0=T0 + i * H))])) for i in (2, 0, 1)]

@@ -31,9 +31,12 @@ async def generate(files: list[UploadFile], params: str = Form("{}"),
                                           workout_date, workout_time)
         except ValueError as e:   # names the file and what is wrong with it
             raise HTTPException(400, str(e))
-        p0 = core.Params(**kw)
-        try:
+        try:  # TypeError: a field of the wrong type, e.g. "wall_mm": "abc"
+            p0 = core.Params(**kw)
             p = core.resolve(p0)   # blank fields auto-scale; the preview needs the values
+        except (TypeError, ValueError) as e:
+            raise HTTPException(400, str(e))
+        try:
             # p0, not p: build_poster resolves anyway (idempotent), and an over-plate
             # refusal has to suggest a smaller size against the AUTO chin, which shrinks
             # with the poster. Handed the resolved p it would freeze the 250mm chin and
@@ -43,6 +46,11 @@ async def generate(files: list[UploadFile], params: str = Form("{}"),
             b64 = lambda bodies: base64.b64encode(core.write_3mf(bodies)).decode()
             out = {"frame": b64(frame), "relief": b64(relief),
                    "paths": {stem: b64(bodies) for stem, bodies in path_files}}
+            # a wall whose every piece fell under MIN_PIECE_MM has no file: say so
+            printed = {bodies[0][1] for _, bodies in path_files}
+            note = " · ".join([activity.legs_note(legs)] + [
+                f"{'activity' if n == 'strip' else n}: too short to print at this size, no path file"
+                for n, _ in activity.group_walls(legs) if n not in printed])
         except ValueError as e:   # an input check (size, chin, slot): the order, not the server
             # ponytail: any ValueError is a 400, a meshing bug raising one included; give
             # the input checks their own exception type if that ever misleads the operator
@@ -52,7 +60,7 @@ async def generate(files: list[UploadFile], params: str = Form("{}"),
     finally:
         for f in files:
             await f.close()
-    return {**out, "resolved": asdict(p), "legs": activity.legs_note(legs)}
+    return {**out, "resolved": asdict(p), "legs": note}
 
 
 @app.get("/dimensions")

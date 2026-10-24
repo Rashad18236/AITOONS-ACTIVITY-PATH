@@ -2,6 +2,7 @@
 import bisect
 import datetime as dt
 import os
+import re
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
@@ -144,6 +145,33 @@ def parse_fit(data: bytes, name: str = "") -> list[Leg]:
     return [_leg(sports[i], out[i], name) for i in real]
 
 
+_DTD_END = re.compile(rb"\]\s*>")
+
+
+class _NoDTD:
+    """A stream with the internal DTD subset at its head, <!DOCTYPE .. [ .. ]>, cut out.
+    iOS 16 wrote exports whose subset expat rejects, and nothing here needs it; the rest
+    is passed through as it is read, so a multi-GB export.xml is never loaded whole."""
+
+    def __init__(self, f):
+        self.f, head = f, f.read(1 << 16)
+        i = head.find(b"<!DOCTYPE")
+        if i >= 0 and 0 <= head.find(b"[", i) < head.find(b">", i):   # it has a subset
+            while not (end := _DTD_END.search(head, i)) and len(head) < 1 << 24:
+                if not (more := f.read(1 << 16)):
+                    break
+                head += more
+            if end:
+                head = head[:i] + head[end.end():]
+        self.head = head
+
+    def read(self, n=-1):
+        if not self.head:
+            return self.f.read(n)
+        out, self.head = (self.head, b"") if n < 0 else (self.head[:n], self.head[n:])
+        return out
+
+
 def parse_health_zip(f: BinaryIO, workout_date: str, workout_time: str = "", name: str = "") -> Leg:
     """One workout out of an Apple Health export.zip, read in place (never extracted) in one
     streaming pass over export.xml. The workout is the one with a route that started on
@@ -168,7 +196,7 @@ def parse_health_zip(f: BinaryIO, workout_date: str, workout_time: str = "", nam
                 raise ValueError(f"{pre}not an Apple Health export, the zip holds no export.xml")
             recs, found = [], []
             with z.open(xml) as x:
-                it = ET.iterparse(x, ("start", "end"))
+                it = ET.iterparse(_NoDTD(x), ("start", "end"))
                 _, root = next(it)
                 depth = 0
                 for ev, el in it:
@@ -239,7 +267,7 @@ def read_activity(files: list[tuple[str, BinaryIO]], workout_date: str = "",
             legs += ([parse_health_zip(f, workout_date, workout_time, name)] if ext == ".zip"
                      else _PARSERS[ext](f.read(), name))
         except Exception as e:
-            if isinstance(e, ValueError) and str(e).startswith(name):
+            if name and isinstance(e, ValueError) and str(e).startswith(name):
                 raise
             raise ValueError(f"{name}: could not read this file ({type(e).__name__}: {e})") from None
     legs = [_clean(l) for l in legs]
