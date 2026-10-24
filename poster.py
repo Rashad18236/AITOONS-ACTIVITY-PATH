@@ -1006,6 +1006,8 @@ MIN_PIECE_MM = 3.0
 # assign_lanes flips a station's lane normal only when it is over 150 deg off the previous
 # one: that is a collapsed out-and-back's two passes tying, never a corner of a road.
 LANE_FLIP_DOT = -0.866
+# Lanes clear an earlier wall from 0.9 pitch: jitter can't flip them, still past the cut's reach.
+LANE_CLEAR_FRAC = 0.9
 
 
 def wall_height(hr: np.ndarray, p: Params) -> np.ndarray:
@@ -1204,13 +1206,17 @@ def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: floa
     Along a run of lane stations the normal is flipped only where it points over 150
     deg away from the previous station's (LANE_FLIP_DOT): a collapsed out-and-back's
     two passes tying, never a corner. k is the smallest k >= 1 whose target, pushed
-    off ref as below, clears every earlier wall's OUTPUT polyline by lane_px (ref's
-    own unmoved road is lane 0, which the push keeps clear, so it never blocks k = 1):
-    counted against the inputs, two later walls either side of an earlier one took one
-    lane and the crossing cut deleted one. The move is eased by _ramp, then every lane
-    station closer than k * lane_px to ref is pushed straight away from its nearest
-    ref point to exactly that, repeated until none is (64 rounds, then one line on
-    stdout), spec 6.6.
+    off ref as below, clears every earlier wall's OUTPUT polyline by LANE_CLEAR_FRAC *
+    lane_px (ref's own unmoved road is lane 0, which the push keeps clear, so it never
+    blocks k = 1): counted against the inputs, two later walls either side of an earlier
+    one took one lane and the crossing cut deleted one. Along each run of lane stations
+    (consecutive, one piece) k is held at its max over +-ramp stations, so a jittering
+    neighbour cannot make it alternate, then eased to the offset o, its mean over
+    +-ramp // 2 (clipped at the run's ends): a lane change is a linear move over ~ramp
+    stations, and o == k exactly where k is constant. The target foot + o * lane_px
+    along the normal is eased in by _ramp, then every lane station closer than o *
+    lane_px to ref is pushed straight away from its nearest ref point to exactly that,
+    repeated until none is (64 rounds, then one line on stdout), spec 6.6.
 
     Ceiling: the lane is clear of a neighbour's crossing cut only where the shared road
     turns up to 90 deg and the later track stays within ~0.4 px of it. At a sharper
@@ -1259,13 +1265,22 @@ def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: floa
                 for q, sel in ((~own, slice(None)), (own, mv)):
                     if q.any() and len(A[sel]):
                         d[q] = _nearest_on_segments(T[q], A[sel], B[sel])[1]
-                ok &= d >= lane_px * (1 - 1e-6)
+                ok &= d >= LANE_CLEAR_FRAC * lane_px
             lane[s[ok]] = k
         # ponytail: where no lane clears (an earlier wall crossing the shared road) the
         # station stays in lane 1 and the crossing cut decides; search on past i+1 if a
         # real order ever shows two earlier walls sitting between lanes
         lane[m & (lane == 0)] = 1
-        off = lane * float(lane_px)
+        o, h = np.zeros(len(P)), ramp // 2    # per lane run: hold max over +-ramp, mean over +-h
+        runs = np.flatnonzero((m[1:] != m[:-1]) | (g[1:] != g[:-1])) + 1
+        for s in np.split(np.arange(len(P)), runs):
+            if len(s) and m[s[0]]:
+                c = np.r_[0, np.cumsum(np.lib.stride_tricks.sliding_window_view(
+                    np.pad(lane[s], ramp), 2 * ramp + 1).max(1))]
+                x = np.arange(len(s))
+                lo, hi = np.maximum(x - h, 0), np.minimum(x + h + 1, len(s))
+                o[s] = (c[hi] - c[lo]) / (hi - lo)    # integer sums: exactly k where k holds
+        off = o * float(lane_px)
         new = P.copy()
         new[m] += _ramp(m, g, ramp)[m, None] * (foot[m] + off[m, None] * nrm[m] - P[m])
         for j in np.unique(ref[m]):

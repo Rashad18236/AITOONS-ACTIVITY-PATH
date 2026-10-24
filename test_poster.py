@@ -159,6 +159,12 @@ def test_wall_dims_keep_neighbouring_lanes_clear_of_the_crossing_cut():
         res_f, W, dil, lane = poster._wall_dims(p)
         assert W >= p.groove_w_mm - 2 * p.clearance_mm
         assert lane - W > 2 * dil * res_f
+    # assign_lanes calls a lane clear at LANE_CLEAR_FRAC of the pitch: that must still be
+    # outside the cut's reach, W plus the dilation's diagonal sqrt(2) * dil fine pixels
+    for p in [_params(res_mm=res) for res in (0.5, 0.4, 0.25)] + [
+            poster.resolve(poster.Params(size_mm=s)) for s in poster.SIZES_MM]:
+        res_f, W, dil, lane = poster._wall_dims(p)
+        assert poster.LANE_CLEAR_FRAC * lane > W + math.sqrt(2) * dil * res_f
 
 
 def test_leg_stations_resample_one_per_pixel_and_carry_smoothed_hr():
@@ -391,6 +397,100 @@ def test_the_lane_move_is_eased_per_piece():
     [_, [(P0, _), (P1, _)]] = poster.assign_lanes([[_line(10, 90, 50.0, 120)], b], lane_px=4, r_px=8, ramp=4)
     assert P0[b[0][0][:, 1] == 57, 1] == pytest.approx([56.25])   # 1/4 of the way at the edge
     assert np.allclose(P1[:, 1], 54.0)          # a piece that starts on the road is not eased
+
+
+def _dims216():
+    """(p, L, ramp) as build_poster passes them at 216mm: L = lane_mm / res_mm."""
+    p = poster.resolve(poster.Params(size_mm=216))
+    L = poster._wall_dims(p)[3] / p.res_mm
+    return p, L, math.ceil(2 * L)
+
+
+def _jitter(x0, x1, y, j, rng):
+    """_line with uniform(-j, j) px of GPS jitter on every station's y."""
+    P, h = _line(x0, x1, y, 150)
+    P[:, 1] += rng.uniform(-j, j, len(P))
+    return P, h
+
+
+def _lane_changes(P, y0, L):
+    """(rounded lane per station, how often it changes) of stations laned off the road y0."""
+    k = np.round(abs(P[:, 1] - y0) / L)
+    return k, np.count_nonzero(np.diff(k))
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_a_jittering_neighbour_two_lanes_off_never_flaps_the_lane(seed):
+    # wall 1 runs about two lanes off wall 0's road with GPS jitter. Lane 1 used to clear
+    # it only where it sat at >= 2L, so wall 2 flipped 1 <-> 3 and every flip drew a
+    # segment straight across wall 1, which the crossing cut then deleted.
+    p, L, ramp = _dims216()
+    rng = np.random.default_rng(seed)
+    w0, w2 = _line(10, 180, 100.0, 150), _line(10, 180, 100 + 0.3 * L, 150)
+    w1 = _jitter(50, 170, 100 + 2.0 * L, 0.1, rng)
+    out = poster.assign_lanes([[w0], [w1], [w2]], L, L, ramp)
+    P = out[2][0][0]
+    k, changes = _lane_changes(P[_dist_to(w2[0], [w0]) < L], 100, L)
+    assert changes == 0 and k[0] == 1
+    assert np.hypot(*np.diff(P, axis=0).T).max() <= 1.5 * L
+    M = _mpx(p)
+    solo = poster.wall_masks(poster.assign_lanes([[w0], [w1]], L, L, ramp), M, p)[1]
+    m1 = poster.wall_masks(out, M, p)[1]
+    assert len(list(poster._components(m1))) == 1 and m1.sum() >= 0.99 * solo.sum()
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_a_jittery_swim_beside_a_shared_road_is_not_cut(seed):
+    # a triathlon: the run shares the bike's road and takes lane 1 off it, toward the
+    # swim, which lies about two lanes off the road with +-0.5 px of jitter
+    p, L, ramp = _dims216()
+    rng = np.random.default_rng(seed)
+    swim = _jitter(10, 180, 100 + 2.0 * L, 0.5, rng)
+    bike, run = _line(10, 180, 100.0, 150), _line(10, 180, 100 + 0.3 * L, 150)
+    out = poster.assign_lanes([[swim], [bike], [run]], L, L, ramp)
+    P = out[2][0][0]
+    _, changes = _lane_changes(P[_dist_to(run[0], [bike]) < L], 100, L)
+    assert changes == 0
+    assert np.hypot(*np.diff(P, axis=0).T).max() <= 1.5 * L
+    M = _mpx(p)
+    solo = poster.wall_masks(poster.assign_lanes([[swim], [bike]], L, L, ramp), M, p)[0]
+    m0 = poster.wall_masks(out, M, p)[0]
+    assert len(list(poster._components(m0))) == 1 and m0.sum() >= 0.99 * solo.sum()
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_a_neighbour_jittering_across_the_clear_line_is_held_off_not_flapped(seed):
+    # wall 1 at 1.9L +-0.5 px: lane 1 clears it at some stations and not at the next, so
+    # only the hold keeps wall 2 off it, eased up once (through lane 2) to lane 3
+    p, L, ramp = _dims216()
+    rng = np.random.default_rng(seed)
+    w0, w2 = _line(10, 180, 100.0, 150), _line(10, 180, 100 + 0.3 * L, 150)
+    w1 = _jitter(50, 170, 100 + 1.9 * L, 0.5, rng)
+    out = poster.assign_lanes([[w0], [w1], [w2]], L, L, ramp)
+    assert _lane_changes(out[2][0][0], 100, L)[1] <= 4    # at most up and down once each
+    M = _mpx(p)
+    solo = poster.wall_masks(poster.assign_lanes([[w0], [w1]], L, L, ramp), M, p)[1]
+    m1 = poster.wall_masks(out, M, p)[1]
+    assert len(list(poster._components(m1))) == 1 and m1.sum() >= 0.99 * solo.sum()
+
+
+def test_a_lane_change_that_is_really_needed_happens_once_up_and_once_down_eased():
+    # wall 1 blocks lane 1 for x 80..120, just outside r of wall 0 so it is not laned
+    # itself: wall 2 must go round it in lane 2, once up and once down, eased
+    p, L, ramp = _dims216()
+    w0, w2 = _line(10, 180, 100.0, 150), _line(10, 180, 100 + 0.3 * L, 150)
+    w1 = _line(80, 120, 100 + 1.05 * L, 150)
+    out = poster.assign_lanes([[w0], [w1], [w2]], L, L, ramp)
+    assert np.array_equal(out[1][0][0], w1[0])
+    P, x = out[2][0][0], w2[0][:, 0]
+    k, changes = _lane_changes(P, 100, L)
+    alongside = (x >= 80) & (x <= 120)
+    assert (k[abs(x - 100) > 20 + 3 * ramp] == 1).all() and (k[alongside] == 2).all()
+    assert changes == 2
+    assert np.hypot(*np.diff(P, axis=0).T).max() <= 1.5 * L
+    assert abs(np.diff(P[:, 1])).max() < 0.5 * L     # eased: never a one-lane jump
+    assert _dist_to(P[alongside], out[1]).min() >= 0.9 * L
+    assert len(list(poster._components(poster.wall_masks(out, _mpx(p), p)[1]))) == 1
 
 
 def _flat(p):
