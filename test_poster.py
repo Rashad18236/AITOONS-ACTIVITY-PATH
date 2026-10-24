@@ -462,14 +462,20 @@ def _figure8(cx, cy, R, hr):
     return P, np.full(len(P), float(hr))
 
 
-def test_a_wall_mesh_is_watertight_seated_and_on_the_layer_grid():
+@pytest.mark.parametrize("ramp", [False, True], ids=["150bpm", "100-200bpm"])
+def test_a_wall_mesh_is_watertight_seated_and_on_the_layer_grid(ramp):
+    # the ramp: a segment whose two ends sit an odd number of layers apart must not
+    # take their mean, which is half a layer off the grid, on the mid-layer slice plane
     p = _params(); s = _flat(p); P = _ray(s.shape[0], 30)
-    walls = [[(P, np.full(len(P), 150.0))]]
+    hr = np.linspace(100, 200, len(P)) if ramp else np.full(len(P), 150.0)
+    walls = [[(P, hr)]]
     (mask,), (top,) = poster.wall_masks(walls, s.shape[0], p), poster.wall_tops(walls, s, p)
     m = poster.wall_mesh(mask, top, p)
+    on_grid = lambda z: np.allclose(z, poster._snap(z, p), rtol=0, atol=1e-9)
     assert m.is_watertight and m.is_winding_consistent and m.volume > 0
     assert abs(m.bounds[0][2] - poster.SLOT_FLOOR_MM) < 1e-9
-    assert abs(m.bounds[1][2] - poster._snap(s[0, 0] + 6.96, p)) < 1e-9
+    assert abs(m.bounds[1][2] - poster._snap(s[0, 0] + poster.wall_height(hr, p).max(), p)) < 1e-9
+    assert on_grid(top[mask]) and on_grid(m.vertices[:, 2])
 
 
 @pytest.mark.parametrize("res", [0.5, 0.4, 0.25])
@@ -483,7 +489,10 @@ def test_a_wall_is_never_narrower_than_the_strip_floor_and_its_groove_holds_its_
         C, nrm = poster._offsets(P * S)[:2]
         assert _min_width_mm(poster._cell_verts(poster._slab_cells(mask)), C, nrm, res_f) >= 0.84
         g = poster.groove_from_masks([mask], M, p)
-        R, Cc = np.nonzero(poster._slab_cells(poster._dilate(mask, dil)))
+        D = poster._dilate(mask, dil)
+        # every fine cell touching D, not only those inside it: a cell in block r can touch
+        # D through a vertex on row (r+1)*S, which only the closed-block rule counts
+        R, Cc = np.nonzero(D[:-1, :-1] | D[1:, :-1] | D[:-1, 1:] | D[1:, 1:])
         r, c = R // S, Cc // S
         assert (g[r, c] & g[r + 1, c] & g[r, c + 1] & g[r + 1, c + 1]).all()
 

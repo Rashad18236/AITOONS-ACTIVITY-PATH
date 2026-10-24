@@ -1063,10 +1063,12 @@ WALL_SUB = 4
 # Fine pixels added to the drawn strip width: rasterising and the four-corner cell rule
 # shave up to ~2.7 px off a drawn width between the axes, and the meshed strip must never
 # come out under its core groove_w_mm - 2*clearance_mm (spec 6.5). 2 meshed 0.75mm at
-# 30 deg and res 0.5 (0.815 at 0.4) for a 0.84mm core; 3 holds >= 0.88 at 0-90 deg.
+# 30 deg and res 0.5 (0.815 at 0.4) for a 0.84mm core; 3 holds >= 0.85 mid-wall at any
+# heading and sub-pixel phase (worst 0.850 at res 0.5 and 0.25, 0.860 at 0.4).
 WALL_PAD_PX = 3
-# A wall piece shorter than this, left between two crossings or at a plate edge, is
-# too small to pick up and glue; wall_masks drops it and says so (spec 6.6).
+# Any wall piece shorter than this is too small to pick up and glue, whether a crossing
+# cut it off, the plate edge clipped it or it is a short wall or GPS stub on its own;
+# wall_masks drops it and says so (spec 6.6).
 MIN_PIECE_MM = 3.0
 # assign_lanes flips a station's lane normal only when it is over 150 deg off the previous
 # one: that is a collapsed out-and-back's two passes tying, never a corner of a road.
@@ -1433,9 +1435,13 @@ def wall_masks(walls, M: int, p) -> list[np.ndarray]:
         m = (np.asarray(img) > 0) & ~cut
         for c in _components(m):
             if (length := c.sum() * res_f ** 2 / W) < MIN_PIECE_MM:
-                print(f"path: dropped a {length:.1f}mm wall fragment at a crossing")
+                print(f"path: dropped a {length:.1f}mm wall fragment, under the {MIN_PIECE_MM:g}mm minimum")
                 m &= ~c
         out.append(m)
+        # ponytail: the cut follows the through wall's grown outline, so an oblique
+        # crossing leaves the cut piece a pointed tip that meshes under 0.84mm over its
+        # last ~0.5-1.1mm (20 deg at res 0.4: ~1.1mm at 0.60mm), and a square wall end
+        # tapers the same way; square the cut across the earlier wall if tips break off
         cut |= _dilate(m, dil)
     return out[::-1]
 
@@ -1457,11 +1463,13 @@ def groove_from_masks(masks: list[np.ndarray], M: int, p) -> np.ndarray:
 
 def wall_tops(walls, surface: np.ndarray, p) -> list[np.ndarray]:
     """One fine float top per wall, mm: under each segment's _ribbon (the same pixels
-    wall_masks draws), the mean of its two stations' snapped surface + wall_height.
+    wall_masks draws), the higher of its two stations' snapped surface + wall_height.
 
-    A station reads the surface at its nearest relief vertex. Segment ids go into an
-    "I" image and are looked up in float64: an "F" image is float32, which would put
-    every top ~1e-7mm off the layer grid. Where segments overlap the last one drawn wins."""
+    The higher end, not the mean: two ends an odd number of layers apart average to
+    half a layer off the grid, exactly on the slicer's mid-layer plane (93% of a 100-200
+    bpm ray). A station reads the surface at its nearest relief vertex. Segment ids go
+    into an "I" image and are looked up in float64, since an "F" image is float32
+    (10.04 reads 10.0400000572). Where segments overlap the last one drawn wins."""
     M, S = surface.shape[0], WALL_SUB
     res_f, W = _wall_dims(p)[:2]
     n = (M - 1) * S + 1
@@ -1475,7 +1483,7 @@ def wall_tops(walls, surface: np.ndarray, p) -> list[np.ndarray]:
             c, r = np.clip(np.rint(P).astype(int), 0, M - 1).T
             zs = _snap(surface[r, c] + wall_height(hr, p), p)
             _ribbon(d, P * S, W / res_f / 2, sum(map(len, z)) + np.arange(len(P) - 1))
-            z.append((zs[:-1] + zs[1:]) / 2)
+            z.append(np.maximum(zs[:-1], zs[1:]))
         tops.append(np.concatenate(z)[np.asarray(img)])
     return tops
 
