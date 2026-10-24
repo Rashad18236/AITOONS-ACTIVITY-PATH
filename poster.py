@@ -1047,12 +1047,25 @@ def legs_bounds(legs: list[activity.Leg], margin_pct: float) -> tuple:
 def leg_stations(leg: activity.Leg, bounds, M: int) -> tuple[np.ndarray, np.ndarray]:
     """(P (k,2) relief-plate px about 1 px apart, hr (k,) smoothed bpm, NaN where none).
 
+    A raw fix closer than 1 px to the last kept one is dropped first (the first and last
+    are always kept): GPS scatter over a sub-pixel step zigzags the raw polyline, and a
+    1 m/s swim at 1 Hz with 3 m of scatter measured ~4x its real length, so _offsets put
+    its stations ~0.27 px apart. HR is smoothed over the FULL raw series first, so the
+    30 s window has already averaged every sample the decimation drops.
+
     HR is carried as a weighted interpolation: the NaN-zeroed signal and its finite
     weight v are interpolated separately and divided, so a station keeps the finite
     neighbours' bpm where they carry at least half the weight, and is NaN (the low
     line) where the gap does. A plain interp of s would smear NaN one fix wide."""
-    C, _, d, t = _offsets(_to_px(zip(leg.lat, leg.lon), bounds, M))
-    s = activity.smooth_hr(leg.t, leg.hr)
+    X = _to_px(zip(leg.lat, leg.lon), bounds, M)
+    keep, xy = [0], X.tolist()
+    # ponytail: a Python loop over the raw fixes (~50k for an Ironman, tens of ms);
+    # vectorise it if a bigger order ever makes it show
+    for k in range(1, len(xy)):
+        if k == len(xy) - 1 or math.dist(xy[k], xy[keep[-1]]) >= 1:
+            keep.append(k)
+    C, _, d, t = _offsets(X[keep])
+    s = activity.smooth_hr(leg.t, leg.hr)[keep]
     v = np.interp(t, d, np.isfinite(s))
     return C, np.divide(np.interp(t, d, np.nan_to_num(s)), v,
                         out=np.full(len(t), np.nan), where=v >= 0.5)
@@ -1111,22 +1124,25 @@ def collapse_passes(pieces: list[tuple[np.ndarray, np.ndarray]], r_px: float, ra
                     ) -> list[tuple[np.ndarray, np.ndarray]]:
     """One wall's (P, hr) pieces, in time order -> the same shapes, repeats collapsed.
 
-    A station within r_px of an earlier one (another piece, or more than 3*r_px
-    stations back in its own) is a repeat pass: it snaps, eased by _ramp, onto the
-    polyline of the non-repeats, so a lap or an out-and-back prints one wall, never two
-    offset by GPS drift (spec 6.5). Every station's hr is then the mean of the finite
-    hr within r_px of its new position: no-HR passes do not dilute it, and a stretch
-    no pass has HR on stays NaN, the low line."""
+    A station within r_px of an earlier one (another piece, or more than 3*r_px of
+    station arc length back along its own) is a repeat pass: it snaps, eased by _ramp
+    (over `ramp` stations), onto the polyline of the non-repeats, so a lap or an
+    out-and-back prints one wall, never two offset by GPS drift (spec 6.5). Every
+    station's hr is then the mean of the finite hr within r_px of its new position:
+    no-HR passes do not dilute it, and a stretch no pass has HR on stays NaN, the low line."""
     n_k = [len(q) for q, _ in pieces]
     P = np.concatenate([q for q, _ in pieces]).astype(float)
     hr = np.concatenate([h for _, h in pieces]).astype(float)
     g = np.repeat(np.arange(len(pieces)), n_k)
-    a = np.concatenate([np.arange(m) for m in n_k])
+    # arc length within each piece, not the station index: stations packed under 1 px
+    # apart made "3*r_px back" a few px of path, and a noisy swim collapsed onto its start
+    arc = np.concatenate([np.r_[0, np.cumsum(np.hypot(*np.diff(q, axis=0).T))][:len(q)]
+                          for q in np.split(P, np.cumsum(n_k)[:-1])])
     i = np.arange(len(P))
     rep = np.zeros(len(P), bool)
     for sl, near in _near(P, P, r_px):
         rep[sl] = (near & (i < i[sl, None])
-                   & ((g != g[sl, None]) | (a[sl, None] - a > 3 * r_px))).any(1)
+                   & ((g != g[sl, None]) | (arc[sl, None] - arc > 3 * r_px))).any(1)
     canon = ~rep
     seg = np.flatnonzero(canon[:-1] & canon[1:] & (g[:-1] == g[1:]))
     lone = canon.copy(); lone[seg] = lone[seg + 1] = False   # no canonical neighbour

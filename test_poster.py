@@ -1105,6 +1105,82 @@ def test_build_poster_prints_a_triathlon_as_one_file_per_leg(monkeypatch):
         ("path_swim", "swim", "#FFFFFF"), ("path_bike", "bike", "#CC2222"), ("path_run", "run", "#F4EE2A")]
 
 
+def _noisy_loop_leg(sport="swim", speed_ms=1.0, scatter_m=3.0, seed=0):
+    """A 633 x 317 m (1.9 km) closed rectangle off 47.355N 8.54E, one fix per second at
+    speed_ms with Gaussian scatter_m on every fix, no HR: a slow, jittery swim or walk."""
+    c = np.array([[0, 0], [633, 0], [633, 317], [0, 317], [0, 0]], float)   # east, north m
+    s = np.r_[0, np.cumsum(np.hypot(*np.diff(c, axis=0).T))]
+    q = np.r_[np.arange(0, s[-1], speed_ms), s[-1]]
+    en = np.stack([np.interp(q, s, c[:, 0]), np.interp(q, s, c[:, 1])], 1)
+    en += np.random.default_rng(seed).normal(0, scatter_m, en.shape)
+    m_lon = 111_320 * math.cos(math.radians(47.355))
+    return activity.Leg(sport, 47.355 + en[:, 1] / 111_320, 8.54 + en[:, 0] / m_lon,
+                        np.arange(len(q), dtype=float), np.full(len(q), np.nan))
+
+
+def _noisy_tri(swim):
+    """swim, then a clean 9 km bike and 4.5 km run 1.7-2.8 km south of it: a triathlon's
+    map, ~24 m per relief px at 216, so 3 m of scatter is 0.12 px and a 1 m step 0.04."""
+    return [swim, _leg("bike", 1200, 140, t0=3600, lat0=47.33, lon0=8.50),
+            _leg("run", 600, 160, t0=7200, lat0=47.34, lon0=8.52)]
+
+
+def _swim_216(speed_ms=1.0, scatter_m=3.0):
+    """(p, M, (P, hr)): the noisy loop's leg_stations at 216 on the _noisy_tri map."""
+    p = poster.resolve(poster.Params(size_mm=216)); M = _mpx(p)
+    legs = _noisy_tri(_noisy_loop_leg(speed_ms=speed_ms, scatter_m=scatter_m))
+    return p, M, poster.leg_stations(legs[0], poster.legs_bounds(legs, p.margin_pct), M)
+
+
+def _length(P):
+    return np.hypot(*np.diff(P, axis=0).T).sum()
+
+
+def test_a_noisy_slow_track_keeps_one_pixel_station_spacing():
+    # scatter over a 1 m step zigzags the raw polyline ~4x its real length, and _offsets
+    # resampled over that put the demo swim's 525 stations ~0.27 px apart
+    _, _, (P, _) = _swim_216()
+    _, _, (P0, _) = _swim_216(scatter_m=0.0)
+    spacing, stretch = np.hypot(*np.diff(P, axis=0).T).mean(), _length(P) / _length(P0)
+    assert 0.8 <= spacing <= 1.25
+    assert abs(stretch - 1) < 0.15
+
+
+@pytest.mark.parametrize("speed_ms", [1.0, 1.4])     # a swim and a walk
+def test_a_noisy_slow_loop_does_not_collapse_onto_itself(speed_ms):
+    # at 0.27 px stations, 3*r stations back was ~4 px of path, inside r: every station
+    # repeated the loop's start, and the demo swim snapped onto a 4.2 x 1.1 px blob
+    p, L, ramp = _dims216()
+    _, M, (P, hr) = _swim_216(speed_ms)
+    _, _, (P0, _) = _swim_216(speed_ms, scatter_m=0.0)
+    (Q, hq), = poster.collapse_passes([(P, hr)], L, ramp)
+    box_off = max(np.abs(Q.min(0) - P.min(0)).max(), np.abs(Q.max(0) - P.max(0)).max())
+    assert box_off <= 2
+    (m,) = poster.wall_masks([[(Q, hq)]], M, p)
+    res_f, W = poster._wall_dims(p)[:2]
+    pieces, wall_mm, loop_mm = len(list(poster._components(m))), m.sum() * res_f ** 2 / W, _length(P0) * p.res_mm
+    assert pieces == 1
+    assert wall_mm > 0.8 * loop_mm
+
+
+def test_the_repeat_gap_is_measured_in_px_not_stations():
+    # stations 0.25 px apart on a straight road: 3*r stations back is 3 px, inside r, so a
+    # gap counted in stations made the whole road a repeat of its first 3 px
+    piece = (np.stack([np.arange(10, 90.25, 0.25), np.full(321, 50.0)], 1), np.full(321, 150.0))
+    (P, _), = poster.collapse_passes([piece], r_px=4, ramp=4)
+    moved = np.abs(P - piece[0]).max()
+    assert moved == 0
+
+
+def test_build_poster_prints_a_noisy_swim(monkeypatch):
+    # the demo triathlon at 216: "swim: too short to print at this size, no path file"
+    _fake_fetches(monkeypatch)
+    _, _, paths = poster.build_poster(_noisy_tri(_noisy_loop_leg()), poster.Params(size_mm=216))
+    stems = [n for n, _ in paths]
+    assert stems == ["path_swim", "path_bike", "path_run"]
+    assert paths[0][1][0][0].is_watertight
+
+
 def test_generate_returns_one_path_per_leg_and_the_legs_note(monkeypatch):
     from fastapi.testclient import TestClient
     import app as appmod
