@@ -43,9 +43,13 @@ async def generate(files: list[UploadFile], params: str = Form("{}"),
             # suggest 246.3mm — a size that is still over the plate once it rescales.
             frame, relief, path_files = core.build_poster(legs, p0)
             # finished OrcaSlicer projects (A1 0.4), every print setting embedded
-            b64 = lambda bodies: base64.b64encode(core.write_3mf(bodies)).decode()
+            theme = core.THEMES[p.theme]   # build_poster has refused an unknown one
+            b64 = lambda bodies: base64.b64encode(core.write_3mf(bodies, theme=theme)).decode()
+            hexes = lambda bodies: [b[2] for b in bodies]   # the preview's, in body order
             out = {"frame": b64(frame), "relief": b64(relief),
-                   "paths": {stem: b64(bodies) for stem, bodies in path_files}}
+                   "paths": {stem: b64(bodies) for stem, bodies in path_files},
+                   "colours": {"frame": hexes(frame), "relief": hexes(relief),
+                               "paths": {stem: hexes(bodies) for stem, bodies in path_files}}}
             # a wall whose every piece fell under MIN_PIECE_MM has no file: say so
             printed = {bodies[0][1] for _, bodies in path_files}
             note = " · ".join([activity.legs_note(legs)] + [

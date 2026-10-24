@@ -1079,6 +1079,19 @@ def _fake_fetches(monkeypatch, water=False, elev_top=500.0, roads=False):
                                             np.full((px, px), roads, bool)))
 
 
+def _fake_strips(monkeypatch):
+    """Every relief body in one order: a W-E ramp to 4000 m (the band east of 2000 m),
+    water on the west quarter and a road across the middle (a bridge over the water)."""
+    def masks(b, px, res):
+        water, road = np.zeros((px, px), bool), np.zeros((px, px), bool)
+        water[:, :px // 4] = True
+        road[3 * px // 8:5 * px // 8] = True
+        return water, np.zeros((px, px), bool), road
+    monkeypatch.setattr(poster, "fetch_elevation",
+                        lambda b, px: np.tile(np.linspace(0, 4000.0, px), (px, 1)))
+    monkeypatch.setattr(poster, "fetch_osm_masks", masks)
+
+
 def test_a_flat_city_is_scaled_to_the_300m_span_floor():
     p = _params(); M = _mpx(p); full = p.relief_mm * p.exaggeration
     none, dry = np.zeros((M, M), bool), np.zeros((M, M), np.uint8)
@@ -1326,7 +1339,7 @@ def test_generate_endpoint(monkeypatch):
     assert r.status_code == 200, r.text
     import base64
     j = r.json()
-    assert set(j) == {"frame", "relief", "paths", "resolved", "legs"}
+    assert set(j) == {"frame", "relief", "paths", "colours", "resolved", "legs"}
     assert j["resolved"]["frame_mm"] == 4 and j["resolved"]["text"] == "ZRH-GVA"
     assert list(j["paths"]) == ["path"] and j["legs"] == "run: HR 100%"   # one sport, one file
     frame, relief, path = (base64.b64decode(v) for v in (j["frame"], j["relief"], j["paths"]["path"]))
@@ -1601,7 +1614,8 @@ def test_3mf_is_a_finished_orca_project():
             ("path", [(lifted, "strip", "#CC2222", 1)], "2")):
         z = zipfile.ZipFile(_io.BytesIO(poster.write_3mf(bodies)))
         cfg = json.loads(z.read("Metadata/project_settings.config"))
-        n = len(poster.SLOTS[plate])                     # relief: 3 even with 1 body used
+        n = len(poster.relief_colours(poster.THEMES["classic"]) if plate == "relief"
+                else poster.SLOTS[plate])                # relief: 3 even with 1 body used
         assert cfg["printer_settings_id"] == poster.PRINTER and cfg["layer_height"] == "0.24"
         assert "machine: A1 =" in cfg["machine_start_gcode"]           # the flatten got there
         assert len(cfg["filament_colour"]) == n == len(cfg["flush_volumes_matrix"]) ** 0.5
@@ -1657,12 +1671,131 @@ def test_orca_slices_every_plate(monkeypatch, tmp_path):
         g = zipfile.ZipFile(out / "sliced.3mf").read("Metadata/plate_1.gcode").decode()
         cfg = dict(re.findall(r"^; (\w+) = (.*)$", g, re.M))
         assert cfg["layer_height"] == "0.24" and cfg["prime_tower_width"] == "130"
+        cols = (poster.relief_colours(poster.THEMES["classic"]) if plate == "relief"
+                else [poster.COLORS[k] for k in poster.SLOTS[plate]])
         # Orca switches the tower off itself for a one-filament plate (path)
-        assert cfg["enable_prime_tower"] == ("1" if len(poster.SLOTS[plate]) > 1 else "0")
+        assert cfg["enable_prime_tower"] == ("1" if len(cols) > 1 else "0")
         assert cfg["wall_loops"] == poster.PLATES[plate]["wall_loops"]
-        assert cfg["filament_colour"] == ";".join(poster.COLORS[k] for k in poster.SLOTS[plate])
+        assert cfg["filament_colour"] == ";".join(cols)
         if plate == "frame":   # bead-only caption tops read as hollow outline letters in Orca
             assert "; FEATURE: Top surface" in g.split("; CHANGE_LAYER")[-1]
+
+
+# --- themes --------------------------------------------------------------------
+
+def _cfg(data):
+    """project_settings.config of a 3MF, as a dict."""
+    import zipfile
+    return json.loads(zipfile.ZipFile(io.BytesIO(data)).read("Metadata/project_settings.config"))
+
+
+def test_every_theme_in_the_table_is_complete():
+    from collections import Counter
+    hexes = ("frame", "text", "land", "water", "band", "detail", "path")
+    is_hex = lambda v: isinstance(v, str) and re.fullmatch(r"#[0-9A-F]{6}", v)
+    for k, t in poster.THEMES.items():
+        assert t.label, k
+        for f in hexes:
+            v = getattr(t, f)
+            assert is_hex(v) or (v is None and f in ("band", "detail")), (k, f, v)
+        assert sorted(t.legs) == ["bike", "run", "swim"] and all(map(is_hex, t.legs.values())), k
+        assert t.groups <= {"streets", "trails", "rail", "buildings"}, k
+        # no theme inherits classic's hand-tuned 3x3
+        n = len(poster.relief_colours(t))
+        assert len(poster._project_settings("relief", t)["flush_volumes_matrix"]) == n * n, k
+    keys = [k for ks in poster.THEME_GROUPS.values() for k in ks]
+    assert list(poster.THEME_GROUPS) == ["events", "rooms", "industrial", "nature", "running"]
+    assert sorted(keys) == sorted(poster.THEMES) and len(keys) == len(set(keys))
+    # plan finding 5: 22 themes on four relief slots, 9 on three, gallery on two
+    assert Counter(len(poster.relief_colours(t)) for t in poster.THEMES.values()) == {4: 22, 3: 9, 2: 1}
+
+
+def test_classic_theme_is_todays_output(monkeypatch):
+    """The default theme is the pre-theme output: COLORS on every body, the same slots,
+    classic's hand flush table at the same place in the config. The byte-for-byte
+    comparison against cba3d62 (bodies, vertices, every 3MF member) is in task-1-report."""
+    t, C = poster.THEMES["classic"], poster.COLORS
+    assert poster.Params().theme == "classic"
+    assert (t.frame, t.text, t.land, t.water, t.band, t.detail, t.path) == (
+        C["frame"], C["text"], C["green"], C["water"], C["snow"], None, C["strip"])
+    assert t.legs == {s: C[s] for s in ("swim", "bike", "run")} and t.groups == frozenset()
+    _fake_strips(monkeypatch)
+    frame, relief, paths = poster.build_poster(TRI3, _params(text="HB", text_mm=3.0))
+    assert [b[1:] for b in frame] == [("frame", "#222222", 1), ("text", "#FFFFFF", 2)]
+    assert [b[1:] for b in relief] == [("terrain", "#4CAF50", 1), ("water", "#2196F3", 2),
+                                       ("snow", "#9E9E9E", 3), ("roads", "#9E9E9E", 3)]
+    assert [(s, b[0][1:]) for s, b in paths] == [
+        ("path_swim", ("swim", "#FFFFFF", 1)), ("path_bike", ("bike", "#CC2222", 1)),
+        ("path_run", ("run", "#F4EE2A", 1))]
+    cfg = poster._project_settings("relief")
+    assert cfg["filament_colour"] == ["#4CAF50", "#2196F3", "#9E9E9E"]
+    assert cfg["flush_volumes_matrix"] == ["0", "400", "550", "350", "0", "600", "250", "300", "0"]
+    keys = list(cfg)   # json.dumps keeps this order: the config's bytes
+    assert keys[keys.index("mmu_segmented_region_interlocking_depth") + 1] == "flush_volumes_matrix"
+
+
+def test_a_four_slot_theme_declares_four_filaments(monkeypatch):
+    t = poster.THEMES["alpine_hiking"]
+    _fake_strips(monkeypatch)
+    _, relief, paths = poster.build_poster(TRI3, _params(theme="alpine_hiking"))
+    assert [b[1:] for b in relief] == [("terrain", "#CFE3B4", 1), ("water", "#6FA8DC", 2),
+                                       ("snow", "#B9A58B", 3), ("roads", "#FFCC00", 4)]
+    assert [b[0][2] for _, b in paths] == ["#FFFFFF", "#D62828", "#FF8C42"]
+    cfg = _cfg(poster.write_3mf(relief, theme=t))
+    assert cfg["filament_colour"] == ["#CFE3B4", "#6FA8DC", "#B9A58B", "#FFCC00"]
+    assert len(cfg["filament_type"]) == 4
+    # row = from, column = to; luma land 219 > detail 200 > band 167 > water 160
+    assert np.array(cfg["flush_volumes_matrix"]).reshape(4, 4).tolist() == [
+        ["0", "300", "300", "300"], ["550", "0", "550", "550"],
+        ["550", "300", "0", "550"], ["550", "300", "300", "0"]]
+    assert len(cfg["different_settings_to_system"]) == 6
+
+
+def test_a_two_slot_theme_declares_two_filaments(monkeypatch):
+    # no band and no detail colour: nothing grey above 2000 m, and no roads at all
+    _fake_strips(monkeypatch)
+    _, relief, _ = poster.build_poster(LEGS3, _params(theme="gallery"))
+    assert [b[1:] for b in relief] == [("terrain", "#FFFFFF", 1), ("water", "#E6E6E3", 2)]
+    cfg = _cfg(poster.write_3mf(relief, theme=poster.THEMES["gallery"]))
+    assert cfg["filament_colour"] == ["#FFFFFF", "#E6E6E3"]
+    assert cfg["flush_volumes_matrix"] == ["0", "300", "550", "0"]
+    assert len(cfg["different_settings_to_system"]) == 4
+
+
+def test_unknown_theme_is_refused(monkeypatch):
+    from fastapi.testclient import TestClient
+    import app as appmod
+    from test_activity import _fit
+    monkeypatch.setattr(poster, "fetch_elevation",
+                        lambda b, px: pytest.fail("fetched before checking the theme"))
+    with pytest.raises(ValueError, match=r"unknown theme 'nope'; one of: classic, city_marathon"):
+        poster.build_poster(LEGS3, _params(theme="nope"))
+    r = TestClient(appmod.app).post(
+        "/generate", files=[("files", ("run.fit", _fit([("running", 90, 160)]), "application/octet-stream"))],
+        data={"params": json.dumps({"size_mm": 120.0, "theme": "nope"})})
+    assert r.status_code == 400 and "unknown theme" in r.json()["detail"]
+
+
+def test_generate_returns_the_theme_colours(monkeypatch):
+    import base64
+    from fastapi.testclient import TestClient
+    import app as appmod
+    from test_activity import _fit
+    _fake_strips(monkeypatch)
+    fit = _fit([("swimming", 60, None), ("cycling", 120, 140), ("running", 90, 160)])
+    r = TestClient(appmod.app).post(
+        "/generate", files=[("files", ("tri.fit", fit, "application/octet-stream"))],
+        data={"params": json.dumps({"size_mm": 120.0, "theme": "alpine_hiking", "text": "ZERMATT"})})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["colours"] == {"frame": ["#3E2A1E", "#FFFFFF"],
+                            "relief": ["#CFE3B4", "#6FA8DC", "#B9A58B", "#FFCC00"],
+                            "paths": {"path_swim": ["#FFFFFF"], "path_bike": ["#D62828"],
+                                      "path_run": ["#FF8C42"]}}
+    # ...and the 3MFs carry the theme too, not classic
+    got = lambda data: _cfg(base64.b64decode(data))["filament_colour"]
+    assert got(j["relief"]) == j["colours"]["relief"] and got(j["frame"]) == j["colours"]["frame"]
+    assert got(j["paths"]["path_bike"]) == ["#D62828"]
 
 
 def _text_body(**kw):

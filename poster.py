@@ -91,8 +91,191 @@ COLORS = {"frame": "#222222", "text": "#FFFFFF", "green": "#4CAF50",
           "water": "#2196F3", "snow": "#9E9E9E", "strip": "#CC2222",
           # triathlon legs, one file each; the water is blue, so the swim never is
           "swim": "#FFFFFF", "bike": "#CC2222", "run": "#F4EE2A"}
-# Runways and main roads share the grey band's colour and AMS slot 3 — no new spool.
-COLORS["roads"] = COLORS["snow"]
+
+
+@dataclass(frozen=True)
+class Theme:
+    """A relief palette and the detail it may draw, one hex per body colour. band None:
+    no grey band; detail None: roads share the band (or, with no band, are not drawn)."""
+    label: str
+    frame: str
+    text: str
+    land: str
+    water: str
+    band: str | None
+    detail: str | None
+    path: str           # the single-sport strip
+    legs: dict          # swim/bike/run -> hex, one path file each
+    groups: frozenset   # detail classes it MAY draw (streets, trails, rail, buildings); zoom decides
+    flush: tuple | None = None   # relief flush matrix; None -> _flush_matrix
+
+
+CLASSIC = Theme(label="Classic green terrain", frame=COLORS["frame"], text=COLORS["text"],
+                land=COLORS["green"], water=COLORS["water"], band=COLORS["snow"], detail=None,
+                path=COLORS["strip"], legs={s: COLORS[s] for s in ("swim", "bike", "run")},
+                groups=frozenset(),
+                # hand-tuned, docs/print-settings.md "Flushing volume table" (row = from)
+                flush=("0", "400", "550", "350", "0", "600", "250", "300", "0"))
+_like_classic = functools.partial(replace, CLASSIC, flush=None)   # only classic's flush is hand-tuned
+# ponytail: every palette is a starting value picked from rendered previews; tune each hex
+# against the spools actually bought. Generic names only: no brand, event or logo.
+THEMES = {
+    "classic": CLASSIC,
+    "city_marathon": _like_classic(
+        label="City marathon — asphalt", frame="#222222", text="#FFFFFF", land="#CFCBC2",
+        water="#3F8FD2", band=None, detail="#4A4A4A", path="#E53935",
+        groups=frozenset({"buildings", "rail", "streets"})),
+    "dark_orange": _like_classic(
+        label="Dark terrain — orange route", frame="#111111", text="#FC4C02", land="#2B2B2B",
+        water="#355C7D", band=None, detail="#6E6E6E", path="#FC4C02",
+        groups=frozenset({"streets", "trails"})),
+    "alpine_hiking": _like_classic(
+        label="Alpine hiking — signpost-yellow trails", frame="#3E2A1E", text="#FFFFFF",
+        land="#CFE3B4", water="#6FA8DC", band="#B9A58B", detail="#FFCC00", path="#D62828",
+        legs={"swim": "#FFFFFF", "bike": "#D62828", "run": "#FF8C42"},
+        groups=frozenset({"rail", "streets", "trails"})),
+    "alpine_winter": _like_classic(
+        label="Alpine winter — snow and slate", frame="#1A1A2E", text="#FFFFFF", land="#B8C7D6",
+        water="#4A90C2", band="#FFFFFF", detail="#4B5563", path="#E63946",
+        groups=frozenset({"streets", "trails"})),
+    "triathlon": _like_classic(
+        label="Triathlon — red/black", frame="#111111", text="#FFFFFF", land="#2B2B2B",
+        water="#2A6FB5", band="#666666", detail=None, path="#ED1C24",
+        legs={"swim": "#FFFFFF", "bike": "#ED1C24", "run": "#FFC300"},
+        groups=frozenset({"streets"})),
+    "grand_tour": _like_classic(
+        label="Grand-tour cycling — yellow/pink/red", frame="#222222", text="#FFFFFF",
+        land="#6B8E23", water="#2196F3", band="#9E9E9E", detail="#4A4A4A", path="#FFD400",
+        legs={"swim": "#FFFFFF", "bike": "#F08CAE", "run": "#D52B1E"},
+        groups=frozenset({"streets"})),
+    "trail_slate": _like_classic(
+        label="Trail / ultra — slate and amber", frame="#1C1F26", text="#FFFFFF", land="#4F5B66",
+        water="#2F6690", band="#8A949E", detail="#E0E0E0", path="#F2C14E",
+        groups=frozenset({"streets", "trails"})),
+    "mono_dark": _like_classic(
+        label="Dark mode — one accent", frame="#111111", text="#FFFFFF", land="#1E1E1E",
+        water="#2C3E50", band=None, detail="#3A3A3A", path="#00E5A0",
+        groups=frozenset({"streets"})),
+    "forest": _like_classic(
+        label="Forest — deep greens", frame="#1B2A1B", text="#F4EAD5", land="#2F5D3A",
+        water="#5B9BD5", band="#C9D1C8", detail="#D9B36B", path="#FF8C42",
+        groups=frozenset({"streets", "trails"})),
+    "scandi_oak": _like_classic(
+        label="Scandinavian — oak and linen", frame="#C9A97A", text="#2B2B2B", land="#EFE9DD",
+        water="#9DB8C8", band="#D8D1C3", detail="#8C8577", path="#2F3A45",
+        groups=frozenset({"streets", "trails"})),
+    "japandi": _like_classic(
+        label="Japandi — clay and charcoal", frame="#3A3A38", text="#EAE3D6", land="#D9C9B3",
+        water="#7A9AA6", band="#B9B0A2", detail="#5B5651", path="#B5543A",
+        groups=frozenset({"streets", "trails"})),
+    "bauhaus": _like_classic(
+        label="Bauhaus — primaries on white", frame="#111111", text="#FFFFFF", land="#F2F0EB",
+        water="#1F4FBF", band=None, detail="#111111", path="#E63312",
+        legs={"swim": "#FFFFFF", "bike": "#E63312", "run": "#F2C300"},
+        groups=frozenset({"buildings", "streets"})),
+    "concrete": _like_classic(
+        label="Brutalist — raw concrete", frame="#6E6E6A", text="#F4F4F2", land="#B8B6B0",
+        water="#52606D", band="#D5D3CD", detail="#3C3C3A", path="#FF4F1F",
+        groups=frozenset({"buildings", "streets"})),
+    "gallery": _like_classic(
+        label="Gallery white — sculpture relief", frame="#F7F7F5", text="#1A1A1A", land="#FFFFFF",
+        water="#E6E6E3", band=None, detail=None, path="#1A1A1A", groups=frozenset()),
+    "chalk": _like_classic(
+        label="Chalk and charcoal", frame="#2B2B2B", text="#F2F2F0", land="#F2F2F0",
+        water="#BFC7CC", band="#DADAD6", detail="#2B2B2B", path="#2B2B2B",
+        legs={"swim": "#2B2B2B", "bike": "#6B6B6B", "run": "#A6A6A6"},
+        groups=frozenset({"streets", "trails"})),
+    "rams": _like_classic(
+        label="Greige and signal orange", frame="#D7D2C8", text="#222222", land="#E8E4DC",
+        water="#8FA3AD", band="#C8C3B9", detail="#4A4845", path="#F26419",
+        groups=frozenset({"rail", "streets"})),
+    "steel_brass": _like_classic(
+        label="Blackened steel and brass", frame="#1C1C1C", text="#C9A961", land="#3B3D40",
+        water="#23303A", band="#6B6E72", detail="#8A8D91", path="#C9A961",
+        groups=frozenset({"streets"})),
+    "verdigris": _like_classic(
+        label="Copper and verdigris", frame="#2E2A26", text="#E6D2B8", land="#4F8A7B",
+        water="#2C5F6E", band="#9FB9AE", detail="#B87333", path="#E07A3F",
+        groups=frozenset({"streets", "trails"})),
+    "workshop": _like_classic(
+        label="Workshop — plywood and safety yellow", frame="#D9B77E", text="#1E1E1E",
+        land="#E7DCC3", water="#6E8FA6", band="#C9BFA7", detail="#2B2B2B", path="#FFC400",
+        groups=frozenset({"buildings", "rail", "streets"})),
+    "sandstone": _like_classic(
+        label="Desert sandstone", frame="#5A3E2B", text="#F5E9D6", land="#E2B98A",
+        water="#4F8FB0", band="#A96F4B", detail="#7A5236", path="#1F3A5F",
+        groups=frozenset({"streets", "trails"})),
+    "ocean": _like_classic(
+        label="Ocean and coral", frame="#0B2A3A", text="#F3F6F7", land="#1E5F74",
+        water="#58C1D3", band="#E4E9EC", detail="#0B2A3A", path="#FF6F61",
+        groups=frozenset({"streets"})),
+    "larch": _like_classic(
+        label="Autumn larch", frame="#2E2419", text="#F3E5C8", land="#6B6F3F",
+        water="#4A7C9B", band="#D9A441", detail="#3C2F23", path="#C73E1D",
+        groups=frozenset({"trails"})),
+    "glacier": _like_classic(
+        label="Glacier ice", frame="#DDE7EE", text="#0E2A3F", land="#CFE0EA",
+        water="#4A8FB8", band="#F6FBFD", detail="#7E96A6", path="#FF3B30",
+        groups=frozenset({"streets", "trails"})),
+    "moss_slate": _like_classic(
+        label="Moss and slate", frame="#2F3A34", text="#DDE6D9", land="#5C7A5A",
+        water="#3F6B86", band="#7E8686", detail="#B9C0B4", path="#F2E394",
+        groups=frozenset({"streets", "trails"})),
+    "blue_hour": _like_classic(
+        label="Blue hour — sodium lights", frame="#141A2E", text="#F7D5A8", land="#2B3A5C",
+        water="#0F1E3A", band="#8B9BC4", detail="#52648C", path="#F7A541",
+        groups=frozenset({"streets"})),
+    "volcanic": _like_classic(
+        label="Volcanic — basalt and ember", frame="#0D0D0D", text="#FFB37A", land="#262323",
+        water="#3A4A55", band="#5E5957", detail="#8A7F79", path="#FF4D00",
+        groups=frozenset({"streets", "trails"})),
+    "track": _like_classic(
+        label="Running track — oxide red", frame="#1A1A1A", text="#FFFFFF", land="#B33A2E",
+        water="#2C6FAA", band=None, detail="#F2E7D5", path="#FFFFFF",
+        legs={"swim": "#FFFFFF", "bike": "#F2E7D5", "run": "#FFD60A"},
+        groups=frozenset({"buildings", "streets"})),
+    "neon_kit": _like_classic(
+        label="Race kit — volt on black", frame="#0A0A0A", text="#CCFF00", land="#171717",
+        water="#1C2B3A", band=None, detail="#3A3A3A", path="#CCFF00",
+        legs={"swim": "#FF2D95", "bike": "#CCFF00", "run": "#00E0FF"},
+        groups=frozenset({"streets"})),
+    "retro_70s": _like_classic(
+        label="Retro seventies stripes", frame="#F4E3C1", text="#2B2118", land="#E9D8B4",
+        water="#4C86A8", band="#C9A86A", detail="#A6553D", path="#C8102E",
+        legs={"swim": "#C8102E", "bike": "#F28C28", "run": "#2E6B5E"},
+        groups=frozenset({"streets", "trails"})),
+    "night_run": _like_classic(
+        label="Night run — reflective silver", frame="#0F1115", text="#E8E8E8", land="#1B1F26",
+        water="#0B2540", band=None, detail="#C0C0C0", path="#FFD60A",
+        groups=frozenset({"streets"})),
+    "medal": _like_classic(
+        label="Finisher medal — bronze on navy", frame="#0F2238", text="#CD7F32", land="#16304D",
+        water="#0A1A2E", band="#345E85", detail="#5C7FA3", path="#CD7F32",
+        groups=frozenset({"streets"})),
+}
+# The UI's <optgroup>s, in the plan's order
+THEME_GROUPS = {
+    "events": ["classic", "city_marathon", "dark_orange", "alpine_hiking", "alpine_winter",
+               "triathlon", "grand_tour", "trail_slate", "mono_dark", "forest"],
+    "rooms": ["scandi_oak", "japandi", "bauhaus", "concrete", "gallery", "chalk"],
+    "industrial": ["rams", "steel_brass", "verdigris", "workshop"],
+    "nature": ["sandstone", "ocean", "larch", "glacier", "moss_slate", "blue_hour", "volcanic"],
+    "running": ["track", "neon_kit", "retro_70s", "night_run", "medal"]}
+
+
+def relief_colours(t):
+    """relief.3mf's AMS slots, fixed within a theme: land, water, then band and detail when
+    set (2-4). Roads take the last slot: classic's grey band, slot 3 (no new spool)."""
+    return [t.land, t.water] + [c for c in (t.band, t.detail) if c]
+
+
+def _flush_matrix(colours):
+    """n x n mm3, row = from, column = to: 0 to the same hex, 550 into a colour at least as
+    light (Rec.709 luma on the sRGB values), 300 into a darker one."""
+    # ponytail: starting values on print-settings.md's dark->light / light->dark rule of
+    # thumb, not measured per pair; hand-tune a theme's table once its spools are bought
+    luma = lambda h: sum(w * int(h[i:i + 2], 16) for w, i in ((0.2126, 1), (0.7152, 3), (0.0722, 5)))
+    return ["0" if a == b else "300" if luma(b) < luma(a) else "550" for a in colours for b in colours]
 
 # Grey roads, picked by zoom. A class is drawn while the poster's ground scale
 # (m per printed mm) is at most its limit, finest first: Blackpool at 36.7 m/mm gets
@@ -539,6 +722,7 @@ class Params:
     layer_mm: float = 0.24   # slicer layer height; terrain snaps to it (0 = don't snap)
     # ponytail: measured 0.06 m residual at Blackpool; a metres-based radius only if a print ever shows speckle
     smooth_px: float = 1.0   # DEM blur radius in pixels, kills sub-layer noise (0 = off)
+    theme: str = "classic"   # a THEMES key: the palette and the detail it may draw
 
 
 # Visual params: None means "auto" — base value at 250mm, scaled by size, floored so
@@ -1580,8 +1764,13 @@ def build_poster(legs: list[activity.Leg], p=Params()) -> tuple[list, list, list
     frame and relief are [(mesh, name, hex_colour, extruder_slot), ...] for write_3mf;
     path_files is [(file_stem, bodies)] with one such list each: ("path", a "strip" wall)
     for a single sport, else one ("path_<sport>", its wall) per sport (spec 6.6). A wall
-    that meshes to nothing (every piece dropped) has no file."""
+    that meshes to nothing (every piece dropped) has no file. Colours and slots come from
+    THEMES[p.theme]."""
     p0, p = p, resolve(p)   # auto (None) visual params -> concrete mm; all mm below
+    if p.theme not in THEMES:
+        raise ValueError(f"unknown theme {p.theme!r}; one of: {', '.join(THEMES)}")
+    t = THEMES[p.theme]
+    road = t.detail or t.band   # roads take the last relief slot; neither set: not drawn
     # ponytail: reject rather than clamp — a typo'd 2500mm is a mistake to surface,
     # not to silently honour, and N^2 grids OOM the box. Raise the cap if a bigger
     # plate ever shows up.
@@ -1625,9 +1814,11 @@ def build_poster(legs: list[activity.Leg], p=Params()) -> tuple[list, list, list
     # opening (the old conformal-cap defence against 1px slivers) dropped small peaks
     # from grey while leaving them in green — green then towered above the z_snow
     # plane and the two colours shared layers. Sub-2-cell blobs still go: _slab_cells.
-    lc[elev >= p.snow_line_m] = 2
+    if t.band:
+        lc[elev >= p.snow_line_m] = 2
     lc[water] = 1   # high Alpine lakes sit above the snow line and stay blue
-    lc[roads & (lc != 2)] = 3   # after water, so a bridge is grey across the river; never over snow
+    if road:
+        lc[roads & (lc != 2)] = 3   # after water, so a bridge is grey across the river; never over snow
     # Walls (spec 6.5, 6.6): passes collapse inside a sport, then sports take lanes, then
     # crossings cut the earlier wall; the groove is carved from those very masks. "The
     # same road" is within one lane pitch, and every snap eases over two pitches.
@@ -1639,17 +1830,17 @@ def build_poster(legs: list[activity.Leg], p=Params()) -> tuple[list, list, list
     masks = wall_masks(laned, M, p)
     parts = compose_parts(groove_from_masks(masks, M, p), elev, lc, p)
     tops = wall_tops(laned, parts["surface"], p)
-    bodies = [(heightmap_mesh(parts["green"], p.res_mm), "terrain", COLORS["green"], 1)]
+    bodies = [(heightmap_mesh(parts["green"], p.res_mm), "terrain", t.land, 1)]
     # water and roads stay conformal caps (lakes are flat, so their slices are lake-wide
     # anyway) draped into the slot; grey is a band standing on the z_snow plane
     cap = lambda k: _slab_mesh(parts[k], parts["cap_top"], parts["cap_bot"], p.res_mm)
-    for name, slot, m in (("water", 2, cap("water_cells")),
-                          ("snow", 3, band_mesh(parts, p)),
-                          ("roads", 3, cap("road_cells"))):
+    for name, colour, slot, m in (("water", t.water, 2, cap("water_cells")),
+                                  ("snow", t.band, 3, band_mesh(parts, p)),
+                                  ("roads", road, len(relief_colours(t)), cap("road_cells"))):
         if m is not None:
-            bodies.append((m, name, COLORS[name], slot))
+            bodies.append((m, name, colour, slot))
     ring_top = p.base_mm + p.frame_height_mm
-    frame_bodies = [(heightmap_mesh(parts["frame"], p.res_mm), "frame", COLORS["frame"], 1)]
+    frame_bodies = [(heightmap_mesh(parts["frame"], p.res_mm), "frame", t.frame, 1)]
     # Text is its own white body standing TEXT_EMBOSS_MM proud of the ring, in slot 2.
     # Its top is a CONSTANT, not parts["frame"] + emboss: the text sits on the flat
     # ring, so it needs no heightmap of its own — which is what frees it to be meshed
@@ -1658,12 +1849,12 @@ def build_poster(legs: list[activity.Leg], p=Params()) -> tuple[list, list, list
     text = masked_slab_mesh(tm, np.full(tm.shape, ring_top + TEXT_EMBOSS_MM),
                             TEXT_EMBOSS_MM, parts["text_res"])
     if text is not None:
-        frame_bodies.append((text, "text", COLORS["text"], 2))
+        frame_bodies.append((text, "text", t.text, 2))
     paths = []
     for (name, _), mask, top in zip(walls, masks, tops):
         if (m := wall_mesh(mask, top, p)) is not None:
             paths.append(("path" if name == "strip" else f"path_{name}",
-                          [(m, name, COLORS[name], 1)]))
+                          [(m, name, t.path if name == "strip" else t.legs[name], 1)]))
     return frame_bodies, bodies, paths
 
 
@@ -1713,9 +1904,10 @@ PLATES = {
     # 0.24 layers, walls 2, top 3: the user's print-time cut (docs/print-settings.md head)
     "relief": {"wall_loops": "2", "top_shell_layers": "3", "bottom_shell_layers": "3",
                "sparse_infill_density": "10%", "ironing_type": "no ironing", "brim_width": "5",
-               "mmu_segmented_region_interlocking_depth": "0.72",
-               "flush_volumes_matrix": ["0", "400", "550", "350", "0", "600", "250", "300", "0"]},
+               "mmu_segmented_region_interlocking_depth": "0.72"},   # flush: the theme's (_project_settings)
     # no ironing (it was over half the frame's print time), top 3 x 0.24 = the old 6 x 0.12
+    # ponytail: the black->white flush and per-filament temps serve every theme, so a light
+    # frame (scandi_oak, gallery, ...) purges more than it needs; tune per theme if waste shows
     "frame": {"wall_loops": "2", "top_shell_layers": "3", "bottom_shell_layers": "3",
               "sparse_infill_density": "7%", "ironing_type": "no ironing",
               "seam_position": "nearest", "brim_width": "5",
@@ -1742,15 +1934,17 @@ PART_OVERRIDES = {"text": {
     "ironing_type": "no ironing", "top_shell_layers": "5", "bottom_shell_layers": "1",
     "only_one_wall_top": "1", "sparse_infill_density": "100%", "outer_wall_speed": "50",
     "inner_wall_speed": "80", "top_surface_speed": "40"}}
-# AMS slot order per plate, fixed: relief.3mf always declares three filaments, even
-# when a dry lowland poster only uses slot 1 (or 1 and 3), so the slots never shift.
-SLOTS = {"relief": ("green", "water", "snow"), "frame": ("frame", "text"), "path": ("strip",),
+# AMS slot order per plate, as Theme fields, fixed within a theme: relief.3mf declares
+# every slot of its theme even when a dry lowland poster only uses slot 1, so the slots
+# never shift. "relief" is classic's, for the record: relief_colours(theme) decides (2-4).
+SLOTS = {"relief": ("land", "water", "band"), "frame": ("frame", "text"), "path": ("path",),
          "path_swim": ("swim",), "path_bike": ("bike",), "path_run": ("run",)}
 
 
-def _project_settings(plate):
+def _project_settings(plate, theme=CLASSIC):
     """Metadata/project_settings.config for one plate, as a dict."""
-    colours = [COLORS[k] for k in SLOTS[plate]]
+    colours = (relief_colours(theme) if plate == "relief" else
+               [theme.legs[k] if k in theme.legs else getattr(theme, k) for k in SLOTS[plate]])
     n = len(colours)
     cfg = {**_ORCA["machine"], **_ORCA["process"],
            **{k: v * n if isinstance(v, list) and len(v) == 1 else v
@@ -1767,6 +1961,8 @@ def _project_settings(plate):
                wipe_tower_y=[f"{BRIM_MM:g}"])
     cfg.update(COMMON)
     cfg.update(PLATES[plate])
+    if plate == "relief":   # right after the plate's keys, where the hand table used to sit
+        cfg["flush_volumes_matrix"] = list(theme.flush or _flush_matrix(colours))
     # Orca's GUI only treats the keys listed here as "(modified)" over the named system
     # presets: [print, filament 1..n, printer]. Left out, the first edit + save in the GUI
     # wrote the bare 0.24mm Draft preset back (classic walls, 35mm tower, 15% crosshatch)
@@ -1786,7 +1982,7 @@ def _project_settings(plate):
     return cfg
 
 
-def write_3mf(bodies, plate=None):
+def write_3mf(bodies, plate=None, theme=CLASSIC):
     """[(mesh, name, "#RRGGBB", extruder_slot), ...] -> OrcaSlicer project 3MF bytes.
 
     ONE build item: the bodies are components of a single container object, the
@@ -1799,13 +1995,14 @@ def write_3mf(bodies, plate=None):
     trimesh's 3MF support is export-only via lib3mf and carries neither.
 
     `plate` picks the print settings (PLATES); by default it follows the first body.
+    `theme` gives the filament slots' colours, so pass the one the bodies were built with.
     The bodies keep their local frame — check_output.py measures raw vertices — and
     the item alone carries the bed placement: centred in x, centred in y in the space
     behind the prime tower, dropped onto the bed (the strip's own floor is at 1.16)."""
     import zipfile
     plate = plate or {"frame": "frame", "strip": "path", "swim": "path_swim", "bike": "path_bike",
                       "run": "path_run"}.get(bodies[0][1], "relief")
-    cfg = _project_settings(plate)
+    cfg = _project_settings(plate, theme)
     assert max(b[3] for b in bodies) <= len(cfg["filament_colour"]), "slot without a filament"
     assert len(bodies) < 100, "basematerials ids are oid+100 — they'd collide"
     lo = np.min([m.bounds[0] for m, *_ in bodies], 0)
