@@ -1,5 +1,5 @@
 """Activity Path Poster core: activity -> heightmap -> printable meshes."""
-import csv, functools, io, json, math, re, urllib.parse
+import functools, io, json, math, re, urllib.parse
 from dataclasses import dataclass, replace
 from pathlib import Path
 import numpy as np
@@ -7,57 +7,6 @@ import requests
 import trimesh
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 import activity
-
-
-def parse_track(name: str, data: bytes) -> np.ndarray:
-    """Return (N,3) array of lat, lon, alt_m from FR24 KML or CSV export."""
-    text = data.decode("utf-8", "replace")
-    pts = _parse_kml(text) if name.lower().endswith(".kml") else _parse_csv(text)
-    t = np.array(pts, dtype=float).reshape(-1, 3)
-    if len(t) > 1:  # drop repeated fixes at the same position (parked aircraft)
-        t = t[np.r_[True, np.any(np.diff(t[:, :2], axis=0), axis=1)]]
-    if len(t) < 2:
-        raise ValueError("No track points found — is this a FlightRadar24 KML/CSV export?")
-    return t
-
-
-def _parse_kml(text):
-    # ponytail: regex over XML — FR24 exports are machine-generated, fine here
-    pts = [(float(la), float(lo), float(al)) for lo, la, al in
-           re.findall(r"<gx:coord>([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)</gx:coord>", text)]
-    if pts:
-        return pts
-    # plain <coordinates> fallback: "lon,lat,alt lon,lat,alt ...". FR24 GA exports hold
-    # the same flight up to three times over, so pick ONE representation, never concatenate.
-    blocks = [[(float(p[1]), float(p[0]), float(p[2]) if len(p) > 2 else 0.0)
-               for p in (t.split(",") for t in block.split()) if len(p) >= 2]
-              for block in re.findall(r"<coordinates>(.*?)</coordinates>", text, re.S)]
-    biggest = max(blocks, key=len, default=[])
-    if len(biggest) >= 10:
-        return biggest  # 1. classic single-LineString track (ignores 2-point Route lines)
-    twos = [b for b in blocks if len(b) == 2]
-    if len(twos) >= 10:
-        # 2. Trail folder: many 2-point segments, each starting where the last ended and
-        # carrying real altitudes. Keep the longest chain; unchained bits are Route lines.
-        chains, cur = [], []
-        for a, b in twos:
-            if cur and abs(cur[-1][0] - a[0]) < 1e-9 and abs(cur[-1][1] - a[1]) < 1e-9:
-                cur.append(b)
-            else:
-                cur = [a, b]
-                chains.append(cur)
-        return max(chains, key=len)
-    return [p for b in blocks for p in b]  # 3. tiny hand-made file: take everything
-
-
-def _parse_csv(text):
-    pts = []
-    for row in csv.DictReader(io.StringIO(text)):
-        pos = row.get("Position") or ""
-        if "," in pos:
-            lat, lon = map(float, pos.split(","))
-            pts.append((lat, lon, float(row.get("Altitude") or 0) * 0.3048))
-    return pts
 
 
 TILE_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
@@ -138,7 +87,9 @@ def fetch_elevation(bounds, px_out):
 
 
 COLORS = {"frame": "#222222", "text": "#FFFFFF", "green": "#4CAF50",
-          "water": "#2196F3", "snow": "#9E9E9E", "strip": "#CC2222"}
+          "water": "#2196F3", "snow": "#9E9E9E", "strip": "#CC2222",
+          # triathlon legs, one file each; the water is blue, so the swim never is
+          "swim": "#FFFFFF", "bike": "#CC2222", "run": "#F4EE2A"}
 # Runways and main roads share the grey band's colour and AMS slot 3 — no new spool.
 COLORS["roads"] = COLORS["snow"]
 
@@ -152,9 +103,9 @@ ROAD_TIERS = (("tertiary", 60), ("secondary", 150), ("primary", 400),
 ROAD_MAX_FRAC = 0.15   # grey plate fraction above which the finest class is dropped
 RUNWAY_M = 45.0        # OSM aeroway=runway without a usable width tag
 
-# The relief ceiling spans the terrain range, or the flight's height over the lowest
-# ground clipped to this (m), whichever is larger. See compose_parts.
-FLIGHT_SPAN_M = (300.0, 1000.0)
+# The relief ceiling spans the terrain range, or this (m) if that is smaller, so a flat
+# city course stays flat (spec 6.4). See compose_parts.
+SPAN_FLOOR_M = 300.0
 
 # Constant z the slot is carved down to, so the level strip seats on a flat floor
 # whatever terrain it crosses. Keeps the relief plate connected under the slot;
@@ -726,14 +677,6 @@ def _ribbon(draw, P, half, fill):
                           tuple(a[j] - n[j])], fill=int(fill[i]))
 
 
-def _groove_mask(track_px, shape, p):
-    """Boolean groove footprint on a (H,W) grid, from the strip's own offset geometry."""
-    H, W = shape
-    img = Image.new("L", (W, H))
-    _ribbon(ImageDraw.Draw(img), _offsets(track_px)[0], p.groove_w_mm / 2 / p.res_mm, 255)
-    return np.asarray(img) > 0
-
-
 def _fit_line(s, ink_px, avail_px):
     """(font, ink bbox) for `s`, ~ink_px tall and never wider than avail_px.
 
@@ -948,24 +891,23 @@ def _text_mask(H, N, fpx, chin_px, p):
     return mask, res
 
 
-def compose_parts(track, elev, lc, bounds, p):
+def compose_parts(gmask, elev, lc, p):
     """Split the poster into its printable pieces, all heights in mm.
 
-    `elev` arrives already smoothed (build_poster blurs once and shares the array
-    with the snow threshold, so nothing gets blurred twice).
+    `gmask` is the (M,M) groove vertex mask (groove_from_masks). `elev` arrives already
+    smoothed (build_poster blurs once and shares the array with the snow threshold, so
+    nothing gets blurred twice).
 
     frame (N+chin_px, N): backplate + raised ring, flat — printed alone. The chin
     rows hang below the square (heightmap_mesh maps y = (H-1-row)*res, so appending
     rows extends the poster southward); the opening keeps its indices.
     text_mask / text_res: the glyph pixels on their own TEXT_SUB-times finer grid,
     printed as their own white body on top of the ring (empty when no text).
-    green/surface/water/roads/snow/snow_cells/z_snow/track_px: the (M,M) relief plate
-    that drops into the ring, its pre-slot pre-cap top, the water, road and grey vertex masks,
-    the grey band's meshed cells and the horizontal plane it starts from, and the
-    track in relief-plate pixels. water_cells/road_cells/cap_top/cap_bot: the caps'
-    meshed cells and the vertex surfaces they span (draped to the slot floor in the groove).
-    alt_mm: flight altitude per original track point, on the same vertical scale
-    as `surface`, for the path wall."""
+    green/surface/water/roads/snow/snow_cells/z_snow: the (M,M) relief plate that drops
+    into the ring, its pre-slot pre-cap top, the water, road and grey vertex masks, and
+    the grey band's meshed cells and the horizontal plane it starts from.
+    water_cells/road_cells/cap_top/cap_bot: the caps' meshed cells and the vertex
+    surfaces they span (draped to the slot floor in the groove)."""
     N, M, fpx, chin_px = _grid(p)
     H = N + chin_px
     frame = np.full((H, N), p.base_mm)
@@ -975,23 +917,14 @@ def compose_parts(track, elev, lc, bounds, p):
     text_mask, text_res = _text_mask(H, N, fpx, chin_px, p)
     e0, e1 = float(elev.min()), float(elev.max())
     # Terrain range alone stretched 30m of Blackpool coast over the whole relief
-    # (0.86mm/m): flat land read as hills and the 335m circuit hit the strip ceiling
-    # as a flat fence. Spanning the flight too (clipped, so an airliner cannot flatten
-    # the Alps and a low hop over a polder still shows ground) gives 0.077mm/m there;
-    # in the mountains the terrain range wins and nothing changes.
-    span = max(e1 - e0, float(np.clip(np.asarray(track, float)[:, 2].max() - e0, *FLIGHT_SPAN_M)))
+    # (0.86mm/m) and flat land read as hills; the floor keeps a city course flat. In the
+    # mountains the terrain range wins. The wall's heart-rate scale is its own, in mm.
+    span = max(e1 - e0, SPAN_FLOOR_M)
     to_mm = lambda m: p.plate_mm + (m - e0) / span * p.relief_mm * p.exaggeration
     # Snap the terrain to whole slicer layers, before the caps and the slot are cut,
     # so those keep their exact offsets. Sub-layer DEM wobble otherwise slices into
     # scattered single-layer islands all over the flat ground.
     surface = _snap(to_mm(elev), p)
-    alt_mm = to_mm(np.asarray(track, float)[:, 2])   # same scale: the flight rides the relief
-    # project track into relief-plate pixels (row 0 = north)
-    x0, y0, x1, y1 = bounds
-    xy = np.array([_merc(la, lo) for la, lo, _ in track])
-    track_px = np.stack([(xy[:, 0] - x0) / (x1 - x0) * M,
-                         (y1 - xy[:, 1]) / (y1 - y0) * M], 1)
-    gmask = _groove_mask(track_px, (M, M), p)
     # The outer vertex ring is a
     # cap-only exclusion: a conformal cap is a thin slab floating at `surface - cap_mm`,
     # and on the boundary ring it has nothing under it, so its wall hangs off the plate
@@ -1036,15 +969,14 @@ def compose_parts(track, elev, lc, bounds, p):
                 green=green, surface=surface, water=water, roads=roads,
                 water_cells=water_cells, road_cells=road_cells,
                 cap_top=cap_top, cap_bot=cap_bot,
-                snow=snow, snow_cells=snow_cells, z_snow=z_snow,
-                track_px=track_px, alt_mm=alt_mm)
+                snow=snow, snow_cells=snow_cells, z_snow=z_snow)
 
 
 def _offsets(track_px):
     """Resample the centerline to ~1 sample/pixel -> (C, unit normals, d, t), pixel space.
 
     d is the input points' cumulative distance and t the resampled stations, handed
-    back so a caller can carry a per-point quantity (altitude) onto the same
+    back so a caller can carry a per-point quantity (heart rate) onto the same
     stations with the same np.interp — no second, drift-prone copy of this maths."""
     d = np.r_[0, np.cumsum(np.hypot(*np.diff(track_px, axis=0).T))]
     t = np.linspace(0, d[-1], max(int(d[-1]), 8))
@@ -1494,61 +1426,13 @@ def wall_mesh(mask: np.ndarray, top: np.ndarray, p) -> trimesh.Trimesh | None:
                       p.res_mm / WALL_SUB)
 
 
-def strip_mesh(track_px, alt_mm, surface, p):
-    """Altitude-following wall: constant width, swept along the track from the flat
-    slot floor up to the flight altitude, clamped to proud of the terrain below it.
+def build_poster(legs: list[activity.Leg], p=Params()) -> tuple[list, list, list[tuple[str, list]]]:
+    """An order's legs -> (frame_bodies, relief_bodies, path_files).
 
-    `alt_mm` is per original track point (compose_parts' own scale) and is resampled
-    onto the same arc-length stations as the centerline. Where the aircraft flew
-    below the terrain the poster shows (or the altitude is a missing 0), the clamp
-    takes over and the wall rides terrain + proud_mm — it never sinks into the relief.
-
-    The wall is capped at the relief's own ceiling (a full-scale peak plus proud_mm):
-    an airliner at 12000m over 500m terrain maps to a 362mm wall, which is not a
-    poster. Above the ceiling the flight simply rides a level line over the highest
-    ground the relief can show."""
-    C, nrm, d, t = _offsets(track_px)  # same centerline _groove_mask() carved the slot from
-    n = len(C)
-    cx, cy = C[:, 0], C[:, 1]
-    half = (p.groove_w_mm / 2 - p.clearance_mm) / p.res_mm  # px
-    H, W = surface.shape
-    # ponytail: nearest-neighbour surface sampling; bilinear if the top looks off
-    zc = surface[np.clip(cy.round().astype(int), 0, H - 1),
-                 np.clip(cx.round().astype(int), 0, W - 1)]
-    alt = np.interp(t, d, np.asarray(alt_mm, float))   # altitude onto the same stations
-    ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm
-    # a layer-aligned cap keeps the snap below it (round is monotone); floor, never
-    # round, or the cap itself would land above the relief's own ceiling
-    ceiling = float(_snap(ceiling, p, lambda x: np.floor(x + 1e-6)))
-    if (over := alt > ceiling).any():
-        print(f"path: flight above the relief ceiling on {over.mean() * 100:.0f}% of the "
-              f"track — wall capped at {ceiling:.2f}mm")
-    z_top = _snap(np.minimum(np.maximum(alt, zc + p.proud_mm), ceiling), p)
-    z_bot = SLOT_FLOOR_MM
-    L, R = C + nrm * half, C - nrm * half
-
-    def mm(q, z):
-        return np.stack([q[:, 0] * p.res_mm, (H - 1 - q[:, 1]) * p.res_mm,
-                         np.broadcast_to(z, (len(q),)).astype(float)], 1)
-
-    V = np.vstack([mm(L, z_bot), mm(R, z_bot), mm(R, z_top), mm(L, z_top)])
-    f = []
-    for k in range(4):  # 4 sides of the swept rectangle
-        a = np.arange(n - 1) + k * n
-        c = np.arange(n - 1) + ((k + 1) % 4) * n
-        f.append(np.stack([a, a + 1, c + 1], 1))
-        f.append(np.stack([a, c + 1, c], 1))
-    e = n - 1
-    f.append(np.array([[0, n, 2 * n], [0, 2 * n, 3 * n],
-                       [e, e + 2 * n, e + n], [e, e + 3 * n, e + 2 * n]]))
-    # mm() flips y, so the whole ring winds inward — reverse every face once
-    return trimesh.Trimesh(V, np.vstack(f)[:, ::-1], process=False)
-
-
-def build_poster(track, p=Params()):
-    """Track -> (frame_bodies, relief_bodies, strip_bodies).
-
-    All three are [(mesh, name, hex_colour, extruder_slot), ...] for write_3mf."""
+    frame and relief are [(mesh, name, hex_colour, extruder_slot), ...] for write_3mf;
+    path_files is [(file_stem, bodies)] with one such list each: ("path", a "strip" wall)
+    for a single sport, else one ("path_<sport>", its wall) per sport (spec 6.6). A wall
+    that meshes to nothing (every piece dropped) has no file."""
     p0, p = p, resolve(p)   # auto (None) visual params -> concrete mm; all mm below
     # ponytail: reject rather than clamp — a typo'd 2500mm is a mistake to surface,
     # not to silently honour, and N^2 grids OOM the box. Raise the cap if a bigger
@@ -1570,7 +1454,10 @@ def build_poster(track, p=Params()):
         if p.plate_mm <= v:   # slot floor above the plate top / caps push terrain negative
             raise ValueError(f"{label} ({v}mm) must be less than the relief plate "
                              f"thickness ({p.plate_mm}mm)")
-    bounds = track_bounds(track, p.margin_pct)
+    walls = activity.group_walls(legs)
+    if not walls:
+        raise ValueError("no leg with a GPS track to print")
+    bounds = legs_bounds([l for _, ls in walls for l in ls], p.margin_pct)
     M = _grid(p)[1]
     elev = fetch_elevation(bounds, M)
     # No soft-fail: a poster without its coast keeps the seabed in the DEM and prints
@@ -1593,7 +1480,16 @@ def build_poster(track, p=Params()):
     lc[elev >= p.snow_line_m] = 2
     lc[water] = 1   # high Alpine lakes sit above the snow line and stay blue
     lc[roads & (lc != 2)] = 3   # after water, so a bridge is grey across the river; never over snow
-    parts = compose_parts(track, elev, lc, bounds, p)
+    # Walls (spec 6.5, 6.6): passes collapse inside a sport, then sports take lanes, then
+    # crossings cut the earlier wall; the groove is carved from those very masks. "The
+    # same road" is within one lane pitch, and every snap eases over two pitches.
+    r = _wall_dims(p)[3] / p.res_mm
+    ramp = math.ceil(2 * r)
+    laned = assign_lanes([collapse_passes([leg_stations(l, bounds, M) for l in ls], r, ramp)
+                          for _, ls in walls], r, r, ramp)
+    masks = wall_masks(laned, M, p)
+    parts = compose_parts(groove_from_masks(masks, M, p), elev, lc, p)
+    tops = wall_tops(laned, parts["surface"], p)
     bodies = [(heightmap_mesh(parts["green"], p.res_mm), "terrain", COLORS["green"], 1)]
     # water and roads stay conformal caps (lakes are flat, so their slices are lake-wide
     # anyway) draped into the slot; grey is a band standing on the z_snow plane
@@ -1614,8 +1510,12 @@ def build_poster(track, p=Params()):
                             TEXT_EMBOSS_MM, parts["text_res"])
     if text is not None:
         frame_bodies.append((text, "text", COLORS["text"], 2))
-    strip = strip_mesh(parts["track_px"], parts["alt_mm"], parts["surface"], p)
-    return frame_bodies, bodies, [(strip, "strip", COLORS["strip"], 1)]
+    paths = []
+    for (name, _), mask, top in zip(walls, masks, tops):
+        if (m := wall_mesh(mask, top, p)) is not None:
+            paths.append(("path" if name == "strip" else f"path_{name}",
+                          [(m, name, COLORS[name], 1)]))
+    return frame_bodies, bodies, paths
 
 
 # Every output is a finished OrcaSlicer 2.3.2 project for the Bambu Lab A1, 0.4 nozzle:
@@ -1681,6 +1581,7 @@ PLATES = {
              "bottom_shell_layers": "2", "ironing_type": "no ironing", "brim_width": "8",
              "outer_wall_speed": "50", "inner_wall_speed": "80",
              "outer_wall_acceleration": "1000", "flush_volumes_matrix": ["0"]}}
+PLATES |= {f"path_{s}": PLATES["path"] for s in ("swim", "bike", "run")}   # a leg per file
 # Per part, on top of the plate: the caption's 1.07-1.33mm strokes as 3 walls at 0.40.
 # Caption top = one outline + a monotonic top surface, the user's proven "AIToons Sopra"
 # look. 3 walls with only_one_wall_top off filled the 1.1-1.3mm strokes with beads alone:
@@ -1694,7 +1595,8 @@ PART_OVERRIDES = {"text": {
     "inner_wall_speed": "80", "top_surface_speed": "40"}}
 # AMS slot order per plate, fixed: relief.3mf always declares three filaments, even
 # when a dry lowland poster only uses slot 1 (or 1 and 3), so the slots never shift.
-SLOTS = {"relief": ("green", "water", "snow"), "frame": ("frame", "text"), "path": ("strip",)}
+SLOTS = {"relief": ("green", "water", "snow"), "frame": ("frame", "text"), "path": ("strip",),
+         "path_swim": ("swim",), "path_bike": ("bike",), "path_run": ("run",)}
 
 
 def _project_settings(plate):
@@ -1752,7 +1654,8 @@ def write_3mf(bodies, plate=None):
     the item alone carries the bed placement: centred in x, centred in y in the space
     behind the prime tower, dropped onto the bed (the strip's own floor is at 1.16)."""
     import zipfile
-    plate = plate or {"frame": "frame", "strip": "path"}.get(bodies[0][1], "relief")
+    plate = plate or {"frame": "frame", "strip": "path", "swim": "path_swim", "bike": "path_bike",
+                      "run": "path_run"}.get(bodies[0][1], "relief")
     cfg = _project_settings(plate)
     assert max(b[3] for b in bodies) <= len(cfg["filament_colour"]), "slot without a filament"
     assert len(bodies) < 100, "basematerials ids are oid+100 — they'd collide"

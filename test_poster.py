@@ -21,76 +21,6 @@ def _fresh_overpass_cache():
     poster._overpass.cache_clear()
 
 
-KML = """<?xml version="1.0"?><kml xmlns:gx="http://www.google.com/kml/ext/2.2">
-<gx:coord>8.55 47.46 430</gx:coord>
-<gx:coord>8.60 47.50 900</gx:coord>
-<gx:coord>8.70 47.60 1500</gx:coord></kml>"""
-
-CSV = """Timestamp,UTC,Callsign,Position,Altitude,Speed,Direction
-1717000000,2026-05-29T00:00:00Z,HB123,"47.46,8.55",1000,120,90
-1717000060,2026-05-29T00:01:00Z,HB123,"47.50,8.60",2000,120,90
-"""
-
-
-def test_parse_kml():
-    t = poster.parse_track("flight.kml", KML.encode())
-    assert t.shape == (3, 3)
-    assert t[0, 0] == 47.46 and t[0, 1] == 8.55 and t[0, 2] == 430
-
-
-def test_parse_kml_linestring_fallback():
-    xml = "<kml><coordinates>8.55,47.46,430 8.60,47.50,900</coordinates></kml>"
-    t = poster.parse_track("x.kml", xml.encode())
-    assert t.shape == (2, 3) and t[1, 0] == 47.50
-
-
-def _fr24_ga_kml():
-    """FR24 GA export shape: a straight Route line, single-point fixes, and a
-    Trail folder of chaining 2-point segments that re-draw the same flight."""
-    path = [(8.00 + i / 100, 47.00 + i / 100, 500.0 + 100 * i) for i in range(13)]
-    singles = "".join(
-        f"<Placemark><Point><coordinates>{lo},{la},0</coordinates></Point></Placemark>"
-        for lo, la, _ in path)
-    trail = "".join(
-        f"<Placemark><LineString><coordinates>{a[0]},{a[1]},{a[2]} "
-        f"{b[0]},{b[1]},{b[2]}</coordinates></LineString></Placemark>"
-        for a, b in zip(path, path[1:]))
-    return (f'<kml><Folder><name>Route</name><Placemark><LineString>'
-            f'<coordinates>9.90,47.90,0 7.00,46.00,0</coordinates>'
-            f'</LineString></Placemark>{singles}</Folder>'
-            f'<Folder><name>Trail</name>{trail}</Folder></kml>'), path
-
-
-def test_parse_kml_fr24_ga_picks_trail_only():
-    xml, path = _fr24_ga_kml()
-    t = poster.parse_track("ga.kml", xml.encode())
-    assert t.shape == (13, 3)                                  # stitched trail, not doubled
-    assert len(t) < 13 + 12 * 2                                # nowhere near concatenation
-    assert (t[0, 0], t[0, 1]) == (path[0][1], path[0][0])
-    assert (t[-1, 0], t[-1, 1]) == (path[-1][1], path[-1][0])
-    assert (t[:, 2] > 0).all()                                 # real altitudes, not the 0-alt fixes
-    for lat, lon in ((47.90, 9.90), (46.00, 7.00)):            # no Route endpoints
-        assert not ((t[:, 0] == lat) & (t[:, 1] == lon)).any()
-
-
-def test_parse_dedupes_consecutive_duplicates():
-    xml = ("<kml><coordinates>8.55,47.46,430 8.55,47.46,430 "
-           "8.60,47.50,900</coordinates></kml>")
-    assert poster.parse_track("x.kml", xml.encode()).shape == (2, 3)
-
-
-def test_parse_csv_fr24():
-    t = poster.parse_track("flight.csv", CSV.encode())
-    assert t.shape == (2, 3)
-    assert t[0, 0] == 47.46
-    assert abs(t[0, 2] - 1000 * 0.3048) < 1e-6  # feet -> meters
-
-
-def test_parse_rejects_empty():
-    with pytest.raises(ValueError):
-        poster.parse_track("x.csv", b"Timestamp,Position\n")
-
-
 def test_track_bounds_square_with_margin():
     t = np.array([[47.0, 8.0, 0], [47.5, 9.0, 0]])
     x0, y0, x1, y1 = poster.track_bounds(t, 15.0)
@@ -571,15 +501,20 @@ def _synthetic():
     fpx = int(p.frame_mm / p.res_mm)           # 8
     M = _mpx(p)                                # 62
     elev = np.tile(np.linspace(0, 1000, M), (M, 1))  # E-W gradient
-    track = np.array([[47.0, 8.0, 0], [47.5, 9.0, 3000]])
-    bounds = poster.track_bounds(track, p.margin_pct)
-    return p, N, fpx, elev, track, bounds
+    return p, N, fpx, elev
+
+
+def _band(M):
+    """A horizontal groove band across the relief plate, rows M//2-2 .. M//2+2."""
+    g = np.zeros((M, M), bool)
+    g[M // 2 - 2:M // 2 + 3] = True
+    return g
 
 
 def test_compose_parts_frame_and_relief_levels():
-    p, N, fpx, elev, track, bounds = _synthetic()
+    p, N, fpx, elev = _synthetic()
     M = _mpx(p)
-    parts = poster.compose_parts(track, elev, np.zeros((M, M), np.uint8), bounds, p)
+    parts = poster.compose_parts(_band(M), elev, np.zeros((M, M), np.uint8), p)
     assert parts["frame"].shape == (N, N)
     assert parts["green"].shape == (M, M) and parts["surface"].shape == (M, M)
     assert parts["frame"][0, 0] == p.base_mm + p.frame_height_mm   # frame ring is flat
@@ -589,33 +524,28 @@ def test_compose_parts_frame_and_relief_levels():
 
 
 def test_compose_parts_slot_floor_is_constant():
-    """The slot is carved to a constant floor, so the level strip seats on a flat
-    seat regardless of the terrain it crosses (depth varies, floor does not)."""
-    p, N, fpx, elev, track, bounds = _synthetic()
+    """The slot is carved to a constant floor, so every wall seats on a flat seat
+    regardless of the terrain it crosses (depth varies, floor does not)."""
+    p, N, fpx, elev = _synthetic()
     M = _mpx(p)
-    parts = poster.compose_parts(track, elev, np.zeros((M, M), np.uint8), bounds, p)
-    tpx = parts["track_px"]
-    mid = (tpx[0] + tpx[-1]) / 2      # len(tpx)//2 was the endpoint, not the middle
-    x, y = int(round(mid[0])), int(round(mid[1]))
-    assert 0 <= x < M and 0 <= y < M                       # track inside the relief plate
-    gmask = poster._groove_mask(tpx, (M, M), p)
-    assert gmask[y, x]
+    gmask = _band(M)
+    parts = poster.compose_parts(gmask, elev, np.zeros((M, M), np.uint8), p)
     assert (parts["green"][gmask] == poster.SLOT_FLOOR_MM).all()
     assert 0 < poster.SLOT_FLOOR_MM < p.plate_mm           # plate stays connected under it
-    # the elevation ramp means the slot really does vary in depth along the track
+    # the elevation ramp means the slot really does vary in depth along the groove
     depth = parts["surface"][gmask] - parts["green"][gmask]
     assert depth.max() - depth.min() > 1.0
 
 
 def test_compose_parts_shapes_and_caps():
-    p, N, fpx, elev, track, bounds = _synthetic()
+    p, N, fpx, elev = _synthetic()
     M = _mpx(p)
     p = _params(snow_line_m=400.0)                         # under the ramp's high end
     lc = np.zeros((M, M), np.uint8)
-    lc[5:15, 5:15] = 1                                     # water square, away from track
+    lc[5:15, 5:15] = 1                                     # water square, away from groove
     lc[30:40, 30:40] = 2                                   # snow square
     lc[0, 20:30] = 1                                       # water touching the plate edge
-    parts = poster.compose_parts(track, elev, lc, bounds, p)
+    parts = poster.compose_parts(_band(M), elev, lc, p)
     assert parts["frame"].shape == (N, N) and parts["green"].shape == (M, M)
     assert parts["frame"][0, 0] == p.base_mm + p.frame_height_mm
     assert parts["green"].min() >= min(poster.SLOT_FLOOR_MM, p.plate_mm - p.cap_mm) - 1e-6
@@ -629,7 +559,7 @@ def test_compose_parts_shapes_and_caps():
     assert abs(parts["green"][35, 35] - parts["z_snow"]) < 1e-9
     assert parts["surface"][35, 35] - parts["z_snow"] > p.cap_mm      # a body, not a skin
     # groove cells are never band cells; water caps drape into the slot instead
-    gmask = poster._groove_mask(parts["track_px"], (M, M), p)
+    gmask = _band(M)
     assert gmask[30:40, 30:40].any()      # the groove really does cross the snow square
     assert not c[gmask].any()
     assert (parts["cap_top"][gmask] == poster.SLOT_FLOOR_MM).all()
@@ -645,14 +575,14 @@ def test_compose_parts_shapes_and_caps():
 def test_surface_snaps_to_layer_multiples():
     """Every terrain height lands on a layer boundary, so the slicer emits whole
     uniform layers instead of ragged single-layer islands."""
-    p, N, fpx, elev, track, bounds = _synthetic()
+    p, N, fpx, elev = _synthetic()
     M = _mpx(p)
     rng = np.random.default_rng(3)
     noisy = poster._smooth(elev + rng.normal(0, 3.0, (M, M)), p.smooth_px)
-    s = poster.compose_parts(track, noisy, np.zeros((M, M), np.uint8), bounds, p)["surface"]
+    s = poster.compose_parts(_band(M), noisy, np.zeros((M, M), np.uint8), p)["surface"]
     assert np.abs(s - poster._snap(s, p)).max() < 1e-9
     assert len(np.unique(s.round(9))) > 5              # a real hill keeps its levels
-    off = poster.compose_parts(track, noisy, np.zeros((M, M), np.uint8), bounds,
+    off = poster.compose_parts(_band(M), noisy, np.zeros((M, M), np.uint8),
                                _params(layer_mm=0.0))["surface"]
     assert np.abs(off - poster._snap(off, p)).max() > 1e-3      # 0 = opt out
 
@@ -660,16 +590,15 @@ def test_surface_snaps_to_layer_multiples():
 def test_sub_layer_noise_collapses_to_a_flat_plane():
     """DEM noise smaller than a layer must not survive as scattered islands, while
     the surrounding relief keeps every level it had."""
-    p, N, fpx, elev, track, bounds = _synthetic()
+    p, N, fpx, elev = _synthetic()
     M = _mpx(p)
     e = elev.copy()
     e[5:20, 5:20] = 500.0                              # a flat plateau in the ramp...
     rng = np.random.default_rng(0)
     noisy = e + rng.normal(0, 3.0, (M, M))             # ...under ~0.09mm of wobble
     lc = np.zeros((M, M), np.uint8)
-    raw = poster.compose_parts(track, noisy, lc, bounds, _params(layer_mm=0.0))["surface"]
-    got = poster.compose_parts(track, poster._smooth(noisy, p.smooth_px), lc, bounds,
-                               p)["surface"]
+    raw = poster.compose_parts(_band(M), noisy, lc, _params(layer_mm=0.0))["surface"]
+    got = poster.compose_parts(_band(M), poster._smooth(noisy, p.smooth_px), lc, p)["surface"]
     box = (slice(8, 17), slice(8, 17))                 # well inside the plateau
     assert len(np.unique(raw[box].round(9))) > 50      # every pixel its own level
     assert len(np.unique(got[box].round(9))) <= 2      # one plane (two at a boundary)
@@ -689,8 +618,8 @@ def _min_width_mm(mask, C, nrm, res):
     unit normals nrm) of a grid of pitch res; two stations skipped per end.
 
     The contiguous run of each station's perpendicular inside those cells, in 0.05 px
-    steps out to 64 px a side. Not _groove_widths' rounding of each sample to its
-    nearest vertex: that reads up to a pixel past the meshed edge, and it passed a
+    steps out to 64 px a side. Not a rounding of each sample to its nearest vertex:
+    that reads up to a pixel past the meshed edge, and it passed a
     0.84mm-core wall that meshed 0.75mm wide at 30 deg."""
     cells = mask[:-1, :-1] & mask[1:, :-1] & mask[:-1, 1:] & mask[1:, 1:]
     step = np.arange(0, 64, 0.05)
@@ -705,91 +634,40 @@ def _min_width_mm(mask, C, nrm, res):
     return ((reach(1.0) + reach(-1.0))[2:-2] * res).min()   # skip the square ends
 
 
-def _groove_widths(p):
-    """Contiguous perpendicular carved width, in mm, at every station along a 90° arc."""
-    M = _mpx(p)
-    a = np.linspace(0, np.pi / 2, 40)                    # arc sweeps 90° of heading
-    trk = np.stack([47.0 + 0.3 * np.sin(a), 8.0 + 0.3 * (1 - np.cos(a)),
-                    np.zeros_like(a)], 1)
-    bounds = poster.track_bounds(trk, p.margin_pct)
-    elev = np.tile(np.linspace(0, 1000, M), (M, 1))
-    parts = poster.compose_parts(trk, elev, np.zeros((M, M), np.uint8), bounds, p)
-    groove = (parts["surface"] - parts["green"]) > 0
-    C, nrm = poster._offsets(parts["track_px"])[:2]
-    half = (p.groove_w_mm / 2 - p.clearance_mm) / p.res_mm   # strip half-width, px
-    step = np.arange(0, 3 * half, 0.25)                      # march out from centreline
-
-    def reach(sign):                                         # contiguous carved px
-        q = C[:, None] + sign * nrm[:, None] * step[None, :, None]
-        ok = groove[q[..., 1].round().astype(int).clip(0, M - 1),
-                    q[..., 0].round().astype(int).clip(0, M - 1)]
-        return (np.where(ok.all(1), len(step), ok.argmin(1)) - 1) * 0.25
-
-    return (reach(1.0) + reach(-1.0))[2:-2] * p.res_mm, parts   # skip the square ends
-
-
-def test_strip_seats_in_groove_at_every_angle():
-    """Fit invariant: the carved groove is never narrower than the strip.
-
-    Rasterisation puts each edge within half a pixel of nominal, so absolute
-    per-pixel containment is a sub-pixel stricter than the physical fit — the
-    strip is slid in, not pinned to the centreline. Contiguous perpendicular
-    width per station is the criterion. line(width=) fails this at ~45°.
-
-    Swept over resolutions: at res_mm=0.5 the groove is only 4px wide and the
-    seat margin (1.4mm strip in a 2.0mm groove) is thinner than one pixel, so a
-    single resolution decides this on rasterisation luck rather than mechanism."""
-    for res in (0.5, 0.4, 0.25):
-        p = _params(res_mm=res)
-        w, parts = _groove_widths(p)
-        # ...and it seats on the slot floor exactly, not on the terrain under it
-        strip = poster.strip_mesh(parts["track_px"], parts["alt_mm"], parts["surface"], p)
-        assert abs(strip.bounds[0][2] - poster.SLOT_FLOOR_MM) < 1e-6
-        assert (parts["green"][parts["surface"] > parts["green"]] ==
-                poster.SLOT_FLOOR_MM).all()
-        assert w.min() >= p.groove_w_mm - 2 * p.clearance_mm, \
-            f"res={res}: groove pinches to {w.min():.2f}mm, " \
-            f"strip is {p.groove_w_mm - 2 * p.clearance_mm}mm"
-        # and it holds its *nominal* width to within one pixel of rasterisation
-        # slack — the seat margin above is too thin to catch a mechanism that
-        # narrows the groove by 1/sqrt(2) on the diagonal.
-        assert w.min() >= p.groove_w_mm - res, \
-            f"res={res}: groove pinches to {w.min():.2f}mm, nominal {p.groove_w_mm}mm"
-
-
 def test_compose_parts_text_is_a_mask_not_an_emboss():
     """Text is printed white as its own body, so the frame heightmap stays flat —
     the glyph pixels come back as a mask instead, on its own finer grid."""
-    p, N, fpx, elev, track, bounds = _synthetic()
+    p, N, fpx, elev = _synthetic()
     M = _mpx(p)
     S = poster.TEXT_SUB
     lc = np.zeros((M, M), np.uint8)
     q = _params(text="TEST", text_mm=3.0)
-    parts = poster.compose_parts(track, elev, lc, bounds, q)
+    parts = poster.compose_parts(_band(M), elev, lc, q)
     frame, tm = parts["frame"], parts["text_mask"]
     H = N + poster._grid(q)[3]
     assert frame.max() == p.base_mm + p.frame_height_mm    # ring is flat, nothing embossed
     assert tm.shape == ((H - 1) * S + 1, (N - 1) * S + 1) and tm.dtype == bool
     assert parts["text_res"] == q.res_mm / S
     assert tm.any() and tm[:(N - fpx) * S, :].sum() == 0   # glyphs live on the bottom bar
-    assert not poster.compose_parts(track, elev, lc, bounds, _params())["text_mask"].any()
+    assert not poster.compose_parts(_band(M), elev, lc, _params())["text_mask"].any()
 
 
 # --- the chin: extra frame height at the bottom, for the caption ----------------
 
 def _chinned(**kw):
     """(bare parts, chinned parts, chin_px) over the same synthetic terrain."""
-    p, N, fpx, elev, track, bounds = _synthetic()
-    lc = np.zeros((_mpx(p), _mpx(p)), np.uint8)
+    p, N, fpx, elev = _synthetic()
+    M = _mpx(p)
+    lc, g = np.zeros((M, M), np.uint8), _band(M)
     q = _params(**kw)
-    return (poster.compose_parts(track, elev, lc, bounds, p),
-            poster.compose_parts(track, elev, lc, bounds, q), poster._grid(q)[3])
+    return (poster.compose_parts(g, elev, lc, p),
+            poster.compose_parts(g, elev, lc, q), poster._grid(q)[3])
 
 
 def test_the_chin_extends_the_frame_downward_and_leaves_the_opening_alone():
     """The chin is extra ring at the bottom only: the inner opening keeps its exact
     indices and values, so the relief plate that drops into it is untouched."""
-    p, N, fpx, elev, track, bounds = _synthetic()
+    p, N, fpx, elev = _synthetic()
     bare, chinned, chin_px = _chinned(text="ZURICH", text2="HB-EZE")
     M = _mpx(p)
     assert chin_px > 0
@@ -819,9 +697,8 @@ def test_chin_auto_sizes_to_hold_the_caption():
     # one line needs less chin than two, no caption needs none
     assert 0 == _params().chin_mm < _params(text="ZURICH", text_mm=6.0).chin_mm < q.chin_mm
     # the glyphs really do sit inside those margins
-    p, N, fpx, elev, track, bounds = _synthetic()
-    parts = poster.compose_parts(track, elev, np.zeros((_mpx(q), _mpx(q)), np.uint8),
-                                 bounds, q)
+    p, N, fpx, elev = _synthetic()
+    parts = poster.compose_parts(_band(_mpx(q)), elev, np.zeros((_mpx(q), _mpx(q)), np.uint8), q)
     tm, tres = parts["text_mask"], parts["text_res"]
     rows = np.where(tm.any(1))[0]
     top = (N - fpx) * poster.TEXT_SUB                      # first fine row of the bar
@@ -839,10 +716,10 @@ def test_explicit_chin_mm_overrides_the_auto_size():
 
 
 def test_second_line_renders_smaller_than_the_first():
-    p, N, fpx, elev, track, bounds = _synthetic()
+    p, N, fpx, elev = _synthetic()
     q = _params(text="MMMM", text2="MMMM", text_mm=6.0)
-    tm = poster.compose_parts(track, elev, np.zeros((_mpx(q), _mpx(q)), np.uint8),
-                              bounds, q)["text_mask"]
+    tm = poster.compose_parts(_band(_mpx(q)), elev, np.zeros((_mpx(q), _mpx(q)), np.uint8),
+                              q)["text_mask"]
     rows = np.where(tm.any(1))[0]
     blank = np.where(~tm.any(1)[rows.min():rows.max() + 1])[0]   # the gap between the lines
     assert len(blank), "the two lines ran together"
@@ -872,10 +749,9 @@ def test_caption_strokes_clear_the_printable_stroke_floor(capsys):
     the other (docs/print-settings.md). The rendered strokes were 0.6-0.9mm, so the
     mask is dilated toward MIN_STROKE_MM — per line, because line 2 is the smaller
     face and needs the most — unless that would shut a counter, which it says."""
-    p, N, fpx, elev, track, bounds = _synthetic()
+    p, N, fpx, elev = _synthetic()
     q = _params(text="ZURICH", text2="HB-EZE", text_mm=6.0)
-    parts = poster.compose_parts(track, elev, np.zeros((_mpx(q), _mpx(q)), np.uint8),
-                                 bounds, q)
+    parts = poster.compose_parts(_band(_mpx(q)), elev, np.zeros((_mpx(q), _mpx(q)), np.uint8), q)
     tm, res = parts["text_mask"], parts["text_res"]
     floor = 0.6 if "keeps" in capsys.readouterr().out else poster.MIN_STROKE_MM
     for label, band in zip(("line 1", "line 2"), _split_lines(tm)):
@@ -984,133 +860,9 @@ def test_heightmap_mesh_watertight():
     assert m.bounds[0][2] == 0                     # flat back at z=0
 
 
-def test_strip_mesh_geometry():
-    p = _params()
-    M = _mpx(p)
-    surface = np.full((M, M), p.plate_mm + 8.0)            # relief top, plate_mm z-base
-    track_px = np.array([[10.0, 40.0], [40.0, 40.0], [55.0, 45.0]])
-    m = poster.strip_mesh(track_px, np.zeros(3), surface, p)   # ground-level flight
-    assert m.is_watertight
-    assert m.is_winding_consistent   # watertight alone passes inside-out meshes
-    assert m.volume > 0              # outward normals, not inverted
-    zmin, zmax = m.bounds[0][2], m.bounds[1][2]
-    assert abs(zmax - poster._snap(surface[0, 0] + p.proud_mm, p)) < 1e-6
-    assert abs(zmin - poster.SLOT_FLOOR_MM) < 1e-6
-    # width across a straight section = groove - 2*clearance
-    xs = m.vertices[np.abs(m.vertices[:, 0] - 25 * p.res_mm) < p.res_mm]
-    width = xs[:, 1].max() - xs[:, 1].min()
-    assert abs(width - (p.groove_w_mm - 2 * p.clearance_mm)) < 0.2
-
-
-def _strip_tops(m, track_px):
-    """Per-station top z of a strip mesh (vertex block 3 of 4: L_bot R_bot R_top L_top)."""
-    n = len(poster._offsets(track_px)[0])
-    return m.vertices[2 * n:3 * n, 2]
-
-
-def _sampled_surface(surface, track_px):
-    C = poster._offsets(track_px)[0]
-    H, W = surface.shape
-    return surface[np.clip(C[:, 1].round().astype(int), 0, H - 1),
-                   np.clip(C[:, 0].round().astype(int), 0, W - 1)]
-
-
-def test_strip_follows_the_flight_altitude_over_flat_terrain():
-    """The wall is the flight profile: a steady climb over level ground rises with
-    it, layer-snapped (so a staircase, never a dip), and clears the terrain."""
-    p = _params()
-    M = _mpx(p)
-    surface = np.full((M, M), p.plate_mm + 2.0)
-    track_px = np.stack([np.linspace(5, M - 6, 40), np.full(40, M // 2.0)], 1)
-    alt = np.linspace(p.plate_mm + 1.0, p.plate_mm + 20.0, 40)          # the climb
-    m = poster.strip_mesh(track_px, alt, surface, p)
-    assert m.is_watertight and m.is_winding_consistent and m.volume > 0
-    top = _strip_tops(m, track_px)
-    assert (np.diff(top) >= -1e-9).all()                   # never sinks along the climb
-    assert top[-1] - top[0] > 15.0                         # and really does climb
-    assert (top > surface[0, 0]).all()                     # above terrain everywhere
-    assert abs(m.bounds[0][2] - poster.SLOT_FLOOR_MM) < 1e-6
-    assert np.abs(top - poster._snap(top, p)).max() < 1e-9
-
-
-def test_strip_clamps_onto_a_peak_the_flight_crosses_below():
-    """A low level flight over a ramp: where the terrain outclimbs the aircraft the
-    wall rides terrain + proud instead of sinking into the relief."""
-    p = _params()
-    M = _mpx(p)
-    surface = p.plate_mm + np.tile(np.linspace(0, 12.0, M), (M, 1))     # W-E ramp
-    track_px = np.stack([np.linspace(5, M - 6, 40), np.full(40, M // 2.0)], 1)
-    alt = np.full(40, p.plate_mm + 1.0)                                 # level, low
-    m = poster.strip_mesh(track_px, alt, surface, p)
-    assert m.is_watertight and m.is_winding_consistent and m.volume > 0
-    top, zc = _strip_tops(m, track_px), _sampled_surface(surface, track_px)
-    assert (alt[0] < zc + p.proud_mm).all()                # the clamp really engages
-    want = poster._snap(zc + p.proud_mm, p)
-    assert np.abs(top - want).max() < 1e-9                 # == surface + proud, snapped
-    assert (top > zc).all()                                # never sinks into the terrain
-    assert len(np.unique(top.round(6))) > 2                # and it is no longer level
-
-
-def test_compose_parts_maps_altitude_through_the_terrain_scale():
-    """Flight altitude rides the same vertical scale as the relief, so a flight
-    above the highest terrain visibly stands above it."""
-    p, N, fpx, elev, track, bounds = _synthetic()          # terrain 0-1000m, flight 0-3000m
-    M = _mpx(p)
-    parts = poster.compose_parts(track, elev, np.zeros((M, M), np.uint8), bounds, p)
-    alt = parts["alt_mm"]
-    assert alt.shape == (len(track),)
-    e0, e1 = float(elev.min()), float(elev.max())
-    want = p.plate_mm + (track[:, 2] - e0) / (e1 - e0) * p.relief_mm * p.exaggeration
-    assert np.allclose(alt, want)
-    assert alt[0] == p.plate_mm                            # on the deck = plate level
-    assert alt[-1] > parts["surface"].max()                # 3000m clears 1000m terrain
-
-
-def test_strip_is_capped_at_the_relief_ceiling(capsys):
-    """An airliner would print a 362mm wall: 12000m over 500m terrain runs straight
-    off the poster even on the clipped 1000m flight span. Above the relief's own ceiling the wall goes level instead."""
-    p, N, fpx, _, _, bounds = _synthetic()                 # bounds of the same track
-    M = _mpx(p)
-    elev = np.tile(np.linspace(0, 500, M), (M, 1))         # 500m of terrain...
-    track = np.array([[47.0, 8.0, 0.0], [47.5, 9.0, 12000.0]])   # ...under a jet
-    parts = poster.compose_parts(track, elev, np.zeros((M, M), np.uint8), bounds, p)
-    assert abs(parts["alt_mm"].max() - 362.12) < 1e-6      # 2.12 + 12000/1000*30, unprintable
-    m = poster.strip_mesh(parts["track_px"], parts["alt_mm"], parts["surface"], p)
-    assert m.is_watertight and m.is_winding_consistent and m.volume > 0
-    top = _strip_tops(m, parts["track_px"])
-    ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm      # 33.08mm
-    assert abs(top.max() - ceiling) < 1e-9                 # capped, not 362mm
-    assert np.abs(top - poster._snap(top, p)).max() < 1e-9
-    assert "ceiling" in capsys.readouterr().out            # and it says so, once
-    # (a flight below the ceiling is untouched — test_strip_follows_the_flight_
-    # altitude_over_flat_terrain tops out at 22.12mm against the same 33.08mm cap)
-
-
-def test_flat_land_under_a_circuit_is_scaled_to_the_flight():
-    """Blackpool: 30m of coast stretched over the whole relief read as hills and put
-    the 335m circuit on the strip ceiling as a flat fence. The span is the terrain
-    range or the flight's height over the lowest ground clipped to 300..1000m."""
-    p = _params()
-    M = _mpx(p)
-    elev = np.tile(np.linspace(0, 30, M), (M, 1))
-    full = p.relief_mm * p.exaggeration
-
-    def parts(alts):
-        t = TRACK3.copy()
-        t[:, 2] = alts
-        return poster.compose_parts(t, elev, np.zeros((M, M), np.uint8),
-                                    poster.track_bounds(t, p.margin_pct), p)
-
-    q = parts([0, 335, 0])                                 # span 335m: the flight
-    assert abs(q["alt_mm"].max() - (p.plate_mm + full)) < 1e-6
-    assert q["surface"].max() < p.plate_mm + 0.12 * full    # flat land stays flat
-    q = parts([0, 3000, 0])                                # span clipped to 1000m
-    assert abs(q["alt_mm"].max() - (p.plate_mm + 3 * full)) < 1e-6
-    q = parts([0, 0, 0])                                   # span clipped up to 300m
-    assert abs(q["surface"].max() - poster._snap(p.plate_mm + 30 / 300 * full, p)) < 1e-9
-
-
-TRACK3 = np.array([[47.0, 8.0, 0], [47.2, 8.4, 2000], [47.5, 9.0, 3000]])
+LEGS3 = [_leg("run", 300, 150)]
+TRI3 = [_leg("swim", 200, np.nan), _leg("bike", 400, 140, t0=3600, lat0=47.01),
+        _leg("run", 300, 160, t0=7200, lat0=47.02)]
 
 
 def _fake_fetches(monkeypatch, water=False, elev_top=500.0, roads=False):
@@ -1122,9 +874,70 @@ def _fake_fetches(monkeypatch, water=False, elev_top=500.0, roads=False):
                                             np.full((px, px), roads, bool)))
 
 
+def test_a_flat_city_is_scaled_to_the_300m_span_floor():
+    p = _params(); M = _mpx(p); full = p.relief_mm * p.exaggeration
+    none, dry = np.zeros((M, M), bool), np.zeros((M, M), np.uint8)
+    flat = poster.compose_parts(none, np.tile(np.linspace(0, 30, M), (M, 1)), dry, p)
+    assert abs(flat["surface"].max() - poster._snap(p.plate_mm + 30 / 300 * full, p)) < 1e-9
+    alps = poster.compose_parts(none, np.tile(np.linspace(0, 3000, M), (M, 1)), dry, p)
+    assert abs(alps["surface"].max() - poster._snap(p.plate_mm + full, p)) < 1e-9
+
+
+def test_build_poster_prints_a_single_sport_as_one_red_path(monkeypatch):
+    _fake_fetches(monkeypatch); p = _params()
+    _, _, paths = poster.build_poster([_leg("run", 400, 150), _leg("run", 400, 170, t0=3600, lat0=47.001)], p)
+    assert [n for n, _ in paths] == ["path"]
+    (m, name, colour, slot), = paths[0][1]
+    assert (name, colour, slot) == ("strip", poster.COLORS["strip"], 1)
+    assert m.is_watertight and abs(m.bounds[0][2] - poster.SLOT_FLOOR_MM) < 1e-9
+    assert m.bounds[1][2] <= p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm + p.wall_mm + 1e-6
+
+
+def test_build_poster_prints_a_triathlon_as_one_file_per_leg(monkeypatch):
+    _fake_fetches(monkeypatch)
+    _, _, paths = poster.build_poster(TRI3, _params())
+    assert [(n, b[0][1], b[0][2]) for n, b in paths] == [
+        ("path_swim", "swim", "#FFFFFF"), ("path_bike", "bike", "#CC2222"), ("path_run", "run", "#F4EE2A")]
+
+
+def test_generate_returns_one_path_per_leg_and_the_legs_note(monkeypatch):
+    from fastapi.testclient import TestClient
+    import app as appmod
+    from test_activity import _fit
+    _fake_fetches(monkeypatch)
+    fit = _fit([("swimming", 60, None), ("cycling", 120, 140), ("running", 90, 160)])
+    r = TestClient(appmod.app).post("/generate", files=[("files", ("tri.fit", fit, "application/octet-stream"))],
+                                    data={"params": json.dumps({"size_mm": 120.0})})
+    assert r.status_code == 200, r.text
+    assert sorted(r.json()["paths"]) == ["path_bike", "path_run", "path_swim"]
+    assert r.json()["legs"] == "swim: no HR, low line · bike: HR 100% · run: HR 100%"
+
+
+def test_generate_refuses_an_unsupported_file():
+    from fastapi.testclient import TestClient
+    import app as appmod
+    r = TestClient(appmod.app).post("/generate", files=[("files", ("x.kml", b"<kml/>", "text/xml"))])
+    assert r.status_code == 400 and "unsupported" in r.json()["detail"]
+
+
+def test_generate_leaves_nothing_behind(monkeypatch, tmp_path):
+    import tempfile
+    from fastapi.testclient import TestClient
+    import app as appmod
+    from test_activity import _health_zip
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    _fake_fetches(monkeypatch)
+    z = _health_zip([("Running", "2026-05-01 08:00:00 +0200", 300)],
+                    [(f"2026-05-01 08:0{m}:00 +0200", 150) for m in range(6)], pad_cda=2_000_000)
+    r = TestClient(appmod.app).post("/generate", files=[("files", ("export.zip", z, "application/zip"))],
+                                    data={"params": json.dumps({"size_mm": 120.0}), "workout_date": "2026-05-01"})
+    assert r.status_code == 200, r.text
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_build_poster_v2(monkeypatch):
     _fake_fetches(monkeypatch)
-    frame_bodies, bodies, strip = poster.build_poster(TRACK3, _params())
+    frame_bodies, bodies, paths = poster.build_poster(LEGS3, _params())
     assert [b[1] for b in frame_bodies] == ["frame"]            # no text asked for
     assert frame_bodies[0][2] == poster.COLORS["frame"] and frame_bodies[0][3] == 1
     assert frame_bodies[0][0].is_watertight and frame_bodies[0][0].volume > 0
@@ -1132,8 +945,9 @@ def test_build_poster_v2(monkeypatch):
     assert names == ["terrain"]                  # dry, below the snow line -> no caps
     assert bodies[0][2] == poster.COLORS["green"] and bodies[0][3] == 1
     assert bodies[0][0].is_watertight and bodies[0][0].volume > 0
-    assert [b[1:] for b in strip] == [("strip", poster.COLORS["strip"], 1)]
-    assert strip[0][0].is_watertight and strip[0][0].volume > 0
+    assert [(n, [b[1:] for b in bs]) for n, bs in paths] == [
+        ("path", [("strip", poster.COLORS["strip"], 1)])]
+    assert paths[0][1][0][0].is_watertight and paths[0][1][0][0].volume > 0
 
 
 def test_build_poster_text_is_its_own_white_body(monkeypatch):
@@ -1141,7 +955,7 @@ def test_build_poster_text_is_its_own_white_body(monkeypatch):
     TEXT_EMBOSS_MM proud of the ring, not an emboss in the frame's own filament."""
     _fake_fetches(monkeypatch)
     p = _params(text="HB-EZE")
-    frame_bodies, _, _ = poster.build_poster(TRACK3, p)
+    frame_bodies, _, _ = poster.build_poster(LEGS3, p)
     assert [b[1] for b in frame_bodies] == ["frame", "text"]
     text = frame_bodies[1]
     assert text[2] == poster.COLORS["text"] == "#FFFFFF" and text[3] == 2
@@ -1156,7 +970,7 @@ def test_build_poster_text_is_its_own_white_body(monkeypatch):
 
 def test_build_poster_emits_water_cap(monkeypatch):
     _fake_fetches(monkeypatch, water=True)       # whole plate is water
-    _, bodies, _ = poster.build_poster(TRACK3, _params())
+    _, bodies, _ = poster.build_poster(LEGS3, _params())
     assert [b[1] for b in bodies] == ["terrain", "water"]
     cap = bodies[1][0]
     assert bodies[1][2] == poster.COLORS["water"] and bodies[1][3] == 2
@@ -1165,13 +979,12 @@ def test_build_poster_emits_water_cap(monkeypatch):
 
 
 def test_build_poster_rejects_oversized_grid():
-    track = np.array([[47.0, 8.0, 0], [47.5, 9.0, 3000]])
     with pytest.raises(ValueError):
-        poster.build_poster(track, _params(size_mm=2500.0))   # typo, not a request
+        poster.build_poster(LEGS3, _params(size_mm=2500.0))   # typo, not a request
     with pytest.raises(ValueError):
-        poster.build_poster(track, _params(res_mm=0.01))
+        poster.build_poster(LEGS3, _params(res_mm=0.01))
     with pytest.raises(ValueError):   # slot floor would reach the back of the relief plate
-        poster.build_poster(track, _params(plate_mm=1.0))
+        poster.build_poster(LEGS3, _params(plate_mm=1.0))
 
 
 def test_build_poster_rejects_a_frame_taller_than_the_plate():
@@ -1179,10 +992,9 @@ def test_build_poster_rejects_a_frame_taller_than_the_plate():
 
     250mm with two caption lines is 249.6 x 260.0mm — 4mm of overhang nobody saw
     until the files were sliced. The refusal names both axes and the size that fits."""
-    track = np.array([[47.0, 8.0, 0], [47.5, 9.0, 3000]])
     p = poster.Params(size_mm=250.0, text="ZURICH", text2="HB-EZE")
     with pytest.raises(ValueError) as e:
-        poster.build_poster(track, p)
+        poster.build_poster(LEGS3, p)
     msg = str(e.value)
     assert "249.6 x 260.0mm" in msg and "256mm plate" in msg
     assert "one caption line" in msg          # the concrete way out of a two-liner
@@ -1198,7 +1010,13 @@ def test_build_poster_rejects_cap_thicker_than_plate(monkeypatch):
     """cap_mm >= plate_mm silently produced negative green heights (API-only path)."""
     _fake_fetches(monkeypatch)
     with pytest.raises(ValueError):
-        poster.build_poster(TRACK3, _params(plate_mm=2.0, cap_mm=3.0))
+        poster.build_poster(LEGS3, _params(plate_mm=2.0, cap_mm=3.0))
+
+
+def _run_gpx():
+    """A 300-fix run with heart rate as a Strava GPX upload, for /generate."""
+    from test_activity import _gpx, _pts
+    return "run.gpx", _gpx([("running", _pts(300))]), "application/gpx+xml"
 
 
 def test_generate_endpoint(monkeypatch):
@@ -1209,14 +1027,14 @@ def test_generate_endpoint(monkeypatch):
     # 120 is the smallest size the shop sells; frame_mm/res_mm are pinned coarse so
     # the endpoint test stays fast. Any other size_mm is a 400 (see the test below).
     params = '{"size_mm": 120, "frame_mm": 4, "res_mm": 0.5, "text": "ZRH-GVA"}'
-    r = client.post("/generate", files={"file": ("f.kml", KML.encode())},
-                    data={"params": params})
-    assert r.status_code == 200
+    r = client.post("/generate", files=[("files", _run_gpx())], data={"params": params})
+    assert r.status_code == 200, r.text
     import base64
     j = r.json()
-    assert set(j) == {"frame", "relief", "path", "resolved"}
+    assert set(j) == {"frame", "relief", "paths", "resolved", "legs"}
     assert j["resolved"]["frame_mm"] == 4 and j["resolved"]["text"] == "ZRH-GVA"
-    frame, relief, path = (base64.b64decode(j[k]) for k in ("frame", "relief", "path"))
+    assert list(j["paths"]) == ["path"] and j["legs"] == "run: HR 100%"   # one sport, one file
+    frame, relief, path = (base64.b64decode(v) for v in (j["frame"], j["relief"], j["paths"]["path"]))
     assert frame[:2] == relief[:2] == path[:2] == b"PK"     # all three are 3MF zips
     assert [b[0] for b in poster.read_3mf(frame)] == ["frame", "text"]
     assert [b[0] for b in poster.read_3mf(relief)] == ["terrain", "water"]
@@ -1230,7 +1048,7 @@ def test_generate_endpoint_auto_scales_at_the_small_size(monkeypatch):
     import app as appmod
     _fake_fetches(monkeypatch)
     r = TestClient(appmod.app).post(
-        "/generate", files={"file": ("f.kml", KML.encode())},
+        "/generate", files=[("files", _run_gpx())],
         data={"params": '{"size_mm": 120, "res_mm": 0.5}'})
     assert r.status_code == 200
     j = r.json()
@@ -1250,7 +1068,7 @@ def test_generate_only_sells_the_three_offered_sizes():
     from fastapi.testclient import TestClient
     import app as appmod
     client = TestClient(appmod.app)
-    post = lambda params: client.post("/generate", files={"file": ("f.kml", KML.encode())},
+    post = lambda params: client.post("/generate", files=[("files", _run_gpx())],
                                       data={"params": params})
     r = post('{"size_mm": 250}')      # the old default, over the plate with two lines
     assert r.status_code == 400 and "216, 170, 120mm" in r.json()["detail"]
@@ -1288,10 +1106,10 @@ def test_generate_refuses_a_poster_over_the_plate():
     from fastapi.testclient import TestClient
     import app as appmod
     r = TestClient(appmod.app).post(
-        "/generate", files={"file": ("f.kml", KML.encode())},
+        "/generate", files=[("files", _run_gpx())],
         data={"params": '{"size_mm": 216, "text": "ZURICH", "text2": "HB-EZE",'
                         ' "chin_mm": 20}'})
-    assert r.status_code == 502          # same generic handler the other guards use
+    assert r.status_code == 400          # an input check: the order's fault, not the server's
     detail = r.json()["detail"]
     assert "215.6 x 235.6mm" in detail and "prime tower" in detail and "<=" in detail
 
@@ -1327,15 +1145,15 @@ def test_generate_bad_file():
     from fastapi.testclient import TestClient
     import app as appmod
     r = TestClient(appmod.app).post(
-        "/generate", files={"file": ("x.csv", b"junk")}, data={"params": "{}"})
-    assert r.status_code == 400
+        "/generate", files=[("files", ("x.gpx", b"junk"))], data={"params": "{}"})
+    assert r.status_code == 400 and r.json()["detail"].startswith("x.gpx: ")
 
 
 def test_generate_bad_params_json():
     from fastapi.testclient import TestClient
     import app as appmod
     client = TestClient(appmod.app)
-    files = {"file": ("f.kml", KML.encode())}
+    files = [("files", _run_gpx())]
     assert client.post("/generate", files=files,
                        data={"params": "not-json"}).status_code == 400
     assert client.post("/generate", files=files,   # valid JSON, not an object
@@ -1524,7 +1342,9 @@ def test_orca_slices_every_plate(monkeypatch, tmp_path):
     import subprocess, zipfile
     _fake_fetches(monkeypatch, water=True)
     p = _params(text="HB", text_mm=3.0)
-    for plate, bodies in zip(("frame", "relief", "path"), poster.build_poster(TRACK3, p)):
+    frame, relief, paths = poster.build_poster(TRI3, p)
+    assert [n for n, _ in paths] == ["path_swim", "path_bike", "path_run"]
+    for plate, bodies in [("frame", frame), ("relief", relief), *paths]:
         f, out = tmp_path / f"{plate}.3mf", tmp_path / plate
         f.write_bytes(poster.write_3mf(bodies))
         out.mkdir()
@@ -1546,10 +1366,8 @@ def _text_body(**kw):
     """The shipped 250mm text case, without paying for a whole build_poster."""
     p = poster.resolve(poster.Params(**{"size_mm": 250.0, "text": "HB-EZE", **kw}))
     M = poster._grid(p)[1]
-    track = np.array([[47.0, 8.0, 0.0], [47.5, 9.0, 3000.0]])
-    parts = poster.compose_parts(track, np.zeros((M, M), np.float32),
-                                 np.zeros((M, M), np.uint8),
-                                 poster.track_bounds(track, p.margin_pct), p)
+    parts = poster.compose_parts(_band(M), np.zeros((M, M), np.float32),
+                                 np.zeros((M, M), np.uint8), p)
     t = poster.TEXT_EMBOSS_MM
     tm = parts["text_mask"]
     top = np.full(tm.shape, p.base_mm + p.frame_height_mm + t)
@@ -1660,10 +1478,13 @@ def test_frame_text_shrinks_to_fit_the_bar():
     _assert_text_meshes(p, parts, text, 20000)
 
 
-
-
-
-
+def _write_order(tmp_path, built):
+    """Write a build_poster result as its .3mf files -> check_output's positional args."""
+    frame, relief, paths = built
+    files = [("frame", frame), ("relief", relief), *paths]
+    for stem, bodies in files:
+        (tmp_path / f"{stem}.3mf").write_bytes(poster.write_3mf(bodies))
+    return [str(tmp_path / f"{stem}.3mf") for stem, _ in files]
 
 
 @pytest.mark.parametrize("text,text2", [("HB-EZE", ""), ("", ""),
@@ -1675,13 +1496,9 @@ def test_check_output_passes_on_freshly_built_files(monkeypatch, tmp_path, text,
     import check_output
     _fake_fetches(monkeypatch, water=True)
     p = _params(text=text, text2=text2, text_mm=3.0)
-    frame_bodies, bodies, strip = poster.build_poster(TRACK3, p)
-    (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
-    (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
-    (tmp_path / "path.3mf").write_bytes(poster.write_3mf(strip))
+    files = _write_order(tmp_path, poster.build_poster(TRI3, p))   # three path files
     params = json.dumps(asdict(p))   # the checker is handed exactly what was built
-    assert check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
-                              str(tmp_path / "path.3mf"), "--params", params]) == 0
+    assert check_output.main(files + ["--params", params]) == 0
 
 
 def test_check_output_passes_on_a_relief_with_a_grey_band(monkeypatch, tmp_path):
@@ -1690,14 +1507,10 @@ def test_check_output_passes_on_a_relief_with_a_grey_band(monkeypatch, tmp_path)
     import check_output
     _fake_fetches(monkeypatch, elev_top=4000.0)              # dry ramp through 2000m
     p = _params()
-    frame_bodies, bodies, strip = poster.build_poster(TRACK3, p)
-    assert [b[1] for b in bodies] == ["terrain", "snow"]
-    (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
-    (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
-    (tmp_path / "path.3mf").write_bytes(poster.write_3mf(strip))
-    assert check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
-                              str(tmp_path / "path.3mf"),
-                              "--params", json.dumps(asdict(p))]) == 0
+    built = poster.build_poster(LEGS3, p)
+    assert [b[1] for b in built[1]] == ["terrain", "snow"]
+    assert check_output.main(_write_order(tmp_path, built)
+                             + ["--params", json.dumps(asdict(p))]) == 0
 
 
 def test_check_output_flags_a_missing_text_body(monkeypatch, tmp_path, capsys):
@@ -1705,13 +1518,8 @@ def test_check_output_flags_a_missing_text_body(monkeypatch, tmp_path, capsys):
     not a hint — the body is recoverable from the mesh, unlike the old emboss."""
     import check_output
     _fake_fetches(monkeypatch)
-    frame_bodies, bodies, strip = poster.build_poster(TRACK3, _params())   # no text
-    (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
-    (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
-    (tmp_path / "path.3mf").write_bytes(poster.write_3mf(strip))
-    rc = check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
-                            str(tmp_path / "path.3mf"),
-                            "--params", json.dumps(asdict(_params(text="HB-EZE")))])
+    files = _write_order(tmp_path, poster.build_poster(LEGS3, _params()))   # no text
+    rc = check_output.main(files + ["--params", json.dumps(asdict(_params(text="HB-EZE")))])
     assert rc == 1 and "text body" in capsys.readouterr().out
 
 
@@ -1727,12 +1535,8 @@ def test_check_output_flags_a_chin_that_overflows_the_plate(monkeypatch, tmp_pat
     # the generation step only: check_output binds PLATE_MM at import, so the checker
     # below still measures the exported mesh against the real 256mm plate.
     monkeypatch.setattr(poster, "USABLE_MM", 1e6)
-    frame_bodies, bodies, strip = poster.build_poster(TRACK3, p)
-    (tmp_path / "frame.3mf").write_bytes(poster.write_3mf(frame_bodies))
-    (tmp_path / "relief.3mf").write_bytes(poster.write_3mf(bodies))
-    (tmp_path / "path.3mf").write_bytes(poster.write_3mf(strip))
-    rc = check_output.main([str(tmp_path / "frame.3mf"), str(tmp_path / "relief.3mf"),
-                            str(tmp_path / "path.3mf"), "--params", json.dumps(asdict(p))])
+    files = _write_order(tmp_path, poster.build_poster(LEGS3, p))
+    rc = check_output.main(files + ["--params", json.dumps(asdict(p))])
     out = capsys.readouterr().out
     assert rc == 1
     assert "FAIL  frame y footprint" in out       # 290mm > the 256mm plate
@@ -1944,10 +1748,8 @@ def test_sea_is_the_right_hand_side_of_the_coastline_and_prints_flat(monkeypatch
     monkeypatch.setattr(poster, "fetch_osm_masks", lambda b, px, res: (zeros(px), east(px), zeros(px)))
     seen, real = {}, poster.compose_parts
     monkeypatch.setattr(poster, "compose_parts", lambda *a: seen.setdefault("p", real(*a)))
-    t = TRACK3.copy()
-    t[:, 2] = [0, 100, 200]                    # low hop: 300m span, so 7m of seabed is ~6 layers
-    p = _params()
-    _, bodies, _ = poster.build_poster(t, p)
+    p = _params()                              # 30m of land: the 300m span floor, so
+    _, bodies, _ = poster.build_poster(LEGS3, p)   # 7m of seabed left in would be ~3 layers
     assert [b[1] for b in bodies] == ["terrain", "water"]
     q = seen["p"]
     M = q["surface"].shape[0]
@@ -1999,11 +1801,11 @@ def test_fetch_osm_masks_draws_roads_and_runways_by_scale(monkeypatch, capsys):
 def test_caps_follow_the_slot(monkeypatch, tmp_path):
     """Water/road caps drape into the groove: the slot is blue over the sea, not a
     green rim, and the strip still seats on the one flat SLOT_FLOOR_MM."""
-    p, N, fpx, elev, track, bounds = _synthetic()
+    p, N, fpx, elev = _synthetic()
     M = _mpx(p)
     lc = np.ones((M, M), np.uint8)
-    parts = poster.compose_parts(track, elev, lc, bounds, p)
-    gmask = poster._groove_mask(parts["track_px"], (M, M), p)
+    gmask = _band(M)
+    parts = poster.compose_parts(gmask, elev, lc, p)
     assert (parts["cap_top"][gmask] == poster.SLOT_FLOOR_MM).all()
     under = gmask & poster._cell_verts(parts["water_cells"])
     assert under.any()
@@ -2014,23 +1816,21 @@ def test_caps_follow_the_slot(monkeypatch, tmp_path):
     import check_output
     _fake_fetches(monkeypatch, water=True)
     p = _params()
-    frame_bodies, bodies, strip = poster.build_poster(TRACK3, p)
+    built = poster.build_poster(LEGS3, p)
+    bodies = built[1]
     assert [b[1] for b in bodies] == ["terrain", "water"]
     w = bodies[1][0]
     assert w.is_watertight and w.is_winding_consistent
     assert abs(w.bounds[0][2] - z) < 1e-9
     assert (np.abs(w.vertices[:, 2] - poster.SLOT_FLOOR_MM) < 1e-9).any()
-    path = poster.write_3mf(strip)
-    assert abs(poster.read_3mf(path)[0][1][:, 2].min() - poster.SLOT_FLOOR_MM) < 1e-4
-    for name, data in (("frame.3mf", poster.write_3mf(frame_bodies)),
-                       ("relief.3mf", poster.write_3mf(bodies)), ("path.3mf", path)):
-        (tmp_path / name).write_bytes(data)
-    assert check_output.main([str(tmp_path / n) for n in ("frame.3mf", "relief.3mf", "path.3mf")]
-                             + ["--params", json.dumps(asdict(p))]) == 0
+    files = _write_order(tmp_path, built)
+    assert abs(poster.read_3mf((tmp_path / "path.3mf").read_bytes())[0][1][:, 2].min()
+               - poster.SLOT_FLOOR_MM) < 1e-4
+    assert check_output.main(files + ["--params", json.dumps(asdict(p))]) == 0
 
     # roads are the same cap, grey, in the snow band's slot
     _fake_fetches(monkeypatch, roads=True)
-    _, bodies, _ = poster.build_poster(TRACK3, p)
+    _, bodies, _ = poster.build_poster(LEGS3, p)
     assert [b[1] for b in bodies] == ["terrain", "roads"]
     assert bodies[1][2] == poster.COLORS["snow"] and bodies[1][3] == 3
     assert bodies[1][0].is_watertight and bodies[1][0].is_winding_consistent
@@ -2047,7 +1847,7 @@ def test_build_poster_fails_loudly_when_overpass_is_down(monkeypatch):
 
     monkeypatch.setattr(poster, "_get", boom)
     with pytest.raises(RuntimeError, match="Overpass"):
-        poster.build_poster(TRACK3, _params())
+        poster.build_poster(LEGS3, _params())
 
 
 def test_get_sends_an_identifying_user_agent(monkeypatch):
@@ -2076,13 +1876,13 @@ def test_live_lake_zug_water_mask():
 
 def test_build_poster_snow_caps_above_the_snow_line(monkeypatch):
     _fake_fetches(monkeypatch, elev_top=4000.0)            # W-E ramp through 2000 m
-    _, bodies, _ = poster.build_poster(TRACK3, _params())
+    _, bodies, _ = poster.build_poster(LEGS3, _params())
     assert [b[1] for b in bodies] == ["terrain", "snow"]
     cap = bodies[1][0]
     assert bodies[1][2] == poster.COLORS["snow"] and bodies[1][3] == 3
     assert cap.is_watertight and cap.is_winding_consistent and cap.volume > 0
     # ...and the threshold is the parameter, not a constant
-    _, bodies, _ = poster.build_poster(TRACK3, _params(snow_line_m=5000.0))
+    _, bodies, _ = poster.build_poster(LEGS3, _params(snow_line_m=5000.0))
     assert [b[1] for b in bodies] == ["terrain"]
 
 
@@ -2100,7 +1900,7 @@ def test_a_small_peak_above_the_snow_line_is_a_solid_grey_body(monkeypatch):
     monkeypatch.setattr(poster, "fetch_elevation", elev)
     monkeypatch.setattr(poster, "fetch_osm_masks",
                         lambda b, px, res: tuple(np.zeros((px, px), bool) for _ in range(3)))
-    _, bodies, _ = poster.build_poster(TRACK3, _params())
+    _, bodies, _ = poster.build_poster(LEGS3, _params())
     assert [b[1] for b in bodies] == ["terrain", "snow"]   # the peak survives...
     m = bodies[1][0]
     assert m.is_watertight and m.is_winding_consistent and m.volume > 0   # ...as a solid
@@ -2113,22 +1913,29 @@ def test_a_small_peak_above_the_snow_line_is_a_solid_grey_body(monkeypatch):
 def test_water_beats_snow(monkeypatch):
     """High Alpine lakes sit above the snow line — they must still be blue."""
     _fake_fetches(monkeypatch, water=True, elev_top=4000.0)
-    _, bodies, _ = poster.build_poster(TRACK3, _params())
+    _, bodies, _ = poster.build_poster(LEGS3, _params())
     assert [b[1] for b in bodies] == ["terrain", "water"]
 
 
 # --- grey elevation band -----------------------------------------------------
 
-def _banded(snow_line_m=600.0, lc_all=False, **kw):
-    """Synthetic E-W ramp (0-1000m) with the ground above `snow_line_m` marked grey."""
+def _banded(snow_line_m=600.0, lc_all=False, groove=None, **kw):
+    """Synthetic E-W ramp (0-1000m) with the ground above `snow_line_m` marked grey, and
+    `groove(M, p)` (default _band) carved."""
     p = _params(snow_line_m=snow_line_m, **kw)
     M = _mpx(p)
     elev = np.tile(np.linspace(0, 1000, M), (M, 1))
-    track = np.array([[47.0, 8.0, 0], [47.5, 9.0, 3000]])
-    bounds = poster.track_bounds(track, p.margin_pct)
     lc = np.zeros((M, M), np.uint8)
     lc[np.ones_like(elev, bool) if lc_all else (elev >= snow_line_m)] = 2
-    return p, M, elev, poster.compose_parts(track, elev, lc, bounds, p)
+    g = _band(M) if groove is None else groove(M, p)
+    return p, M, elev, poster.compose_parts(g, elev, lc, p)
+
+
+def _wall_groove(M, p, deg=60):
+    """The groove one straight wall at heading deg carves. Oblique, so its staircase edge
+    leaves green rim vertices next to the band; the straight _band leaves none."""
+    P = _ray(M, deg)
+    return poster.groove_from_masks(poster.wall_masks([[(P, np.full(len(P), 150.0))]], M, p), M, p)
 
 
 def test_snap_lands_on_the_first_layer_grid():
@@ -2191,11 +1998,12 @@ def test_green_never_towers_above_the_snow_plane():
     plate's own skirt wall stayed green all the way up to the terrain. A band is a solid
     resting on the green below it, so it is exempt and reaches the edge.
 
-    Only the slot is excluded — green there is the slot floor, not terrain."""
-    p, M, elev, parts = _banded()
+    Only the slot is excluded — green there is the slot floor, not terrain. A real
+    wall's groove, so the rim the bound is about really occurs."""
+    p, M, elev, parts = _banded(groove=_wall_groove)
     s, z_snow = parts["surface"], parts["z_snow"]
     rise = max(np.abs(np.diff(s, axis=0)).max(), np.abs(np.diff(s, axis=1)).max())
-    plate = ~poster._groove_mask(parts["track_px"], (M, M), p)
+    plate = ~_wall_groove(M, p)
     assert s.max() > 15 * rise + z_snow                    # the ground really does tower
     assert s[:, -1].min() > z_snow                         # ...and off the plate edge
     assert parts["snow_cells"][:, -1].any()                # so the band reaches that edge
@@ -2217,7 +2025,7 @@ def test_the_band_does_not_change_the_assembled_surface():
     p, M, elev, parts = _banded()
     verts = poster._cell_verts(parts["snow_cells"])
     top = np.where(verts, parts["surface"], parts["green"])
-    gmask = poster._groove_mask(parts["track_px"], (M, M), p)
+    gmask = _band(M)
     assert np.abs(top - parts["surface"])[~gmask].max() < 1e-9
     assert verts.any() and gmask.any()
 
@@ -2226,7 +2034,7 @@ def test_snow_line_above_the_dem_leaves_no_band():
     p, M, elev, parts = _banded(snow_line_m=5000.0, lc_all=True)
     assert not parts["snow_cells"].any()
     assert poster.band_mesh(parts, p) is None
-    gmask = poster._groove_mask(parts["track_px"], (M, M), p)
+    gmask = _band(M)
     assert (parts["green"][~gmask] == parts["surface"][~gmask]).all()
 
 

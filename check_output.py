@@ -1,18 +1,20 @@
-"""Check generated files against the Flight Path Poster spec.
+"""Check generated files against the Activity Path Poster spec.
 
     uv run python check_output.py frame.3mf relief.3mf path.3mf
-    uv run python check_output.py frame.3mf relief.3mf path.3mf --params '{"size_mm":200}'
+    uv run python check_output.py frame.3mf relief.3mf path_swim.3mf path_bike.3mf \
+        path_run.3mf --params '{"size_mm":170}'
 
-frame.3mf (black frame + white text), relief.3mf (green/blue/grey) and path.3mf (the
-red strip) are OrcaSlicer project 3MFs. Bodies are measured in their local frame:
-read_3mf ignores the build item's bed placement.
+frame.3mf (black frame + white text), relief.3mf (green/blue/grey) and every path file
+(path.3mf, the red strip of a single sport, or one path_<sport>.3mf per leg) are
+OrcaSlicer project 3MFs. Bodies are measured in their local frame: read_3mf ignores
+the build item's bed placement.
 --params takes the same JSON override format as the app: Params field names only,
 unknown keys dropped. Exit 0 if every rule passes, 1 otherwise.
 
-Deliberately NOT checked: pixel-level groove containment (does the strip fit the
+Deliberately NOT checked: pixel-level groove containment (does each wall fit the
 carved groove along its whole length). That is proven at generation time by
-test_strip_seats_in_groove_at_every_angle, against the heightmap both meshes are
-derived from; re-deriving it from two exported meshes adds no information, only
+test_a_wall_is_never_narrower_than_the_strip_floor_and_its_groove_holds_its_clearance,
+against the masks both meshes are derived from; re-deriving it from two exported meshes adds no information, only
 rasterisation error of its own. Nor is the assembly fit of plate-in-ring: the two
 are exported in their own local frames, and _grid()'s pixel rounding is unit-tested
 by test_relief_plate_clears_the_frame_ring.
@@ -25,17 +27,19 @@ from poster import (SLOT_FLOOR_MM, TEXT_EMBOSS_MM, USABLE_MM, Params, _grid, _sn
                     read_3mf, resolve)
 
 TEXT_MM = TEXT_EMBOSS_MM     # build_poster() white text body thickness
+WALLS = ("strip", "swim", "bike", "run")   # a path file's one body: single sport, or a leg
 
 
 def _load_3mf(path, first):
-    """3MF -> [(name, Trimesh), ...] in build order, or raise."""
+    """3MF -> [(name, Trimesh), ...] in build order, or raise. `first` names the bodies
+    allowed to come first."""
     with open(path, "rb") as f:
         data = f.read()
     if data[:2] != b"PK":
         raise ValueError("not a zip, expected 3MF")
     bodies = [(n, trimesh.Trimesh(V, F, process=False)) for n, V, F in read_3mf(data)]
-    if not bodies or bodies[0][0] != first:
-        raise ValueError(f"expected a '{first}' body first, got {[b[0] for b in bodies]}")
+    if not bodies or bodies[0][0] not in first:
+        raise ValueError(f"expected a {'/'.join(first)} body first, got {[b[0] for b in bodies]}")
     return bodies
 
 
@@ -43,7 +47,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("frame_3mf")
     ap.add_argument("relief_3mf")
-    ap.add_argument("path_3mf")
+    ap.add_argument("path_3mf", nargs="+", help="every path file of the order")
     ap.add_argument("--params", default="{}", help="JSON overrides, Params field names")
     a = ap.parse_args(argv)
     allowed = {f.name for f in fields(Params)}
@@ -55,35 +59,36 @@ def main(argv=None):
     def chk(name, ok, got, want):
         rows.append((bool(ok), name, str(got), str(want)))
 
-    # 1. all three files load
-    strip = None
+    # 1. every file loads; each path file is one wall, labelled by its body's name
+    strips = []
+    for path in a.path_3mf:
+        try:
+            name, m = _load_3mf(path, WALLS)[0]
+            strips.append((name, m))
+            chk(f"{name} loads", True, f"{len(m.faces)} faces", f"3MF, {'/'.join(WALLS)} first")
+        except Exception as e:
+            chk(f"{path} loads", False, f"{type(e).__name__}: {e}", "loadable")
     bodies = frame_bodies = []
-    for label, path, first in (("strip", a.path_3mf, "strip"),
-                               ("frame", a.frame_3mf, "frame"),
-                               ("relief", a.relief_3mf, "terrain")):
+    for label, path, first in (("frame", a.frame_3mf, ("frame",)),
+                               ("relief", a.relief_3mf, ("terrain",))):
         try:
             got = _load_3mf(path, first)
-            if label == "strip":
-                strip = got[0][1]
-                chk("strip loads", True, f"{len(strip.faces)} faces", "3MF, strip first")
+            if label == "frame":
+                frame_bodies = got
             else:
-                names = ", ".join(n for n, _ in got)
-                if label == "frame":
-                    frame_bodies = got
-                else:
-                    bodies = got
-                chk(f"{label} loads", True, names, f"3MF, {got[0][0]} first")
+                bodies = got
+            chk(f"{label} loads", True, ", ".join(n for n, _ in got), f"3MF, {got[0][0]} first")
         except Exception as e:
             chk(f"{label} loads", False, f"{type(e).__name__}: {e}", "loadable")
 
-    if frame_bodies and strip is not None and bodies:
+    if frame_bodies and strips and bodies:
         frame = frame_bodies[0][1]
         text = dict(frame_bodies[1:]).get("text")
         terrain = bodies[0][1]
         caps = bodies[1:]
 
         # 2. printable solids (every body is its own object in a 3MF)
-        solids = [("frame", frame), ("strip", strip), ("terrain", terrain)]
+        solids = [("frame", frame), *strips, ("terrain", terrain)]
         solids += [(f"body {n}", m) for n, m in frame_bodies[1:]]
         solids += [(f"cap {n}", m) for n, m in caps]
         for label, m in solids:
@@ -94,7 +99,6 @@ def main(argv=None):
 
         lo, hi = frame.bounds
         rlo, rhi = terrain.bounds
-        slo, shi = strip.bounds
 
         # 3. frame footprint and plate fit. size_mm is the poster's WIDTH and the
         # square relief area; the chin is extra height hung below it, so y is
@@ -184,25 +188,25 @@ def main(argv=None):
                 chk(f"cap {name} z range", clo[2] >= rlo[2] - 0.01 and chi[2] <= cap_hi,
                     f"[{clo[2]:.3f}, {chi[2]:.3f}]mm", f"in [{rlo[2]:.3f}, {cap_hi:.3f}]mm")
 
-        # 9. strip stays inside the relief plate it drops into (same local frame)
-        for i, axis in enumerate("xy"):
-            chk(f"strip inside relief {axis}",
-                slo[i] >= rlo[i] - 0.5 and shi[i] <= rhi[i] + 0.5,
-                f"[{slo[i]:.2f}, {shi[i]:.2f}]mm",
-                f"in [{rlo[i]:.2f}, {rhi[i]:.2f}]mm +-0.5")
-
-        # 10. strip seats on the constant slot floor and stands proud of it. Its top
-        # follows the *flight altitude* now, so it is no longer bounded by the terrain
-        # the track happens to cross — but strip_mesh caps it at the relief's own
-        # ceiling (a full-scale peak plus proud_mm), and that bound catches the unit
-        # mixup a raw altitude would produce (12000m over 500m terrain -> 362mm).
-        ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm
-        chk("strip seats on slot floor", abs(slo[2] - SLOT_FLOOR_MM) <= 0.01,
-            f"{slo[2]:.3f}mm", f"{SLOT_FLOOR_MM:.2f}mm +-0.01")
-        chk("strip top is proud of the floor", shi[2] > slo[2] + p.proud_mm,
-            f"{shi[2]:.3f}mm", f"> {slo[2] + p.proud_mm:.3f}mm")
-        chk("strip top under the relief ceiling", shi[2] <= ceiling + 0.01,
-            f"{shi[2]:.3f}mm", f"<= {ceiling:.2f}mm (plate + relief*exag + proud)")
+        # The walls are all in the relief's own local frame, so 9 and 10 run per wall.
+        # The top is the terrain under the wall plus its heart-rate height, so the
+        # ceiling is a full-scale peak plus the tallest wall: proud_mm + wall_mm.
+        ceiling = p.plate_mm + p.relief_mm * p.exaggeration + p.proud_mm + p.wall_mm
+        for name, strip in strips:
+            slo, shi = strip.bounds
+            # 9. the wall stays inside the relief plate it drops into
+            for i, axis in enumerate("xy"):
+                chk(f"{name} inside relief {axis}",
+                    slo[i] >= rlo[i] - 0.5 and shi[i] <= rhi[i] + 0.5,
+                    f"[{slo[i]:.2f}, {shi[i]:.2f}]mm",
+                    f"in [{rlo[i]:.2f}, {rhi[i]:.2f}]mm +-0.5")
+            # 10. it seats on the constant slot floor, stands proud of it, stays under
+            chk(f"{name} seats on slot floor", abs(slo[2] - SLOT_FLOOR_MM) <= 0.01,
+                f"{slo[2]:.3f}mm", f"{SLOT_FLOOR_MM:.2f}mm +-0.01")
+            chk(f"{name} top is proud of the floor", shi[2] > slo[2] + p.proud_mm,
+                f"{shi[2]:.3f}mm", f"> {slo[2] + p.proud_mm:.3f}mm")
+            chk(f"{name} top under the relief ceiling", shi[2] <= ceiling + 0.01,
+                f"{shi[2]:.3f}mm", f"<= {ceiling:.2f}mm (plate + relief*exag + proud + wall)")
 
         # 11. layer snapping: every relief z lands on a printable layer boundary, so
         # flat ground slices as uniform layers instead of ragged single-layer islands.
@@ -211,7 +215,7 @@ def main(argv=None):
         if p.layer_mm > 0:
             for label, m, tol in ([("terrain", terrain, 1e-6)]
                                   + [(n, c, 1e-6) for n, c in caps]
-                                  + [("strip", strip, 1e-6)]):
+                                  + [(n, m, 1e-6) for n, m in strips]):
                 z = m.vertices[:, 2]
                 z = z[np.abs(z) > tol]                    # z=0 is the build plate
                 off = float(np.abs(z - _snap(z, p)).max()) if len(z) else 0.0
