@@ -226,7 +226,7 @@ def test_wall_dims_keep_neighbouring_lanes_clear_of_the_crossing_cut():
         p = _params(res_mm=res)
         res_f, W, dil, lane = poster._wall_dims(p)
         assert W >= p.groove_w_mm - 2 * p.clearance_mm
-        assert lane - W > dil * res_f
+        assert lane - W > 2 * dil * res_f
 
 
 def test_leg_stations_resample_one_per_pixel_and_carry_smoothed_hr():
@@ -324,6 +324,66 @@ def test_a_wall_leaving_the_shared_road_is_left_alone_off_it():
     [_, [(Pb, _)]] = poster.assign_lanes([[_line(10, 90, 50.0, 120)], [b]], lane_px=4, r_px=4, ramp=4)
     off = b[0][:, 1] >= 59
     assert np.array_equal(Pb[off], b[0][off]) and np.allclose(Pb[:30, 1], 54.0)
+
+
+def _dist_to(Q, wall):
+    """Distance of each Q to a wall's polyline (stations joined within a piece only)."""
+    A = np.concatenate([P[:-1] for P, _ in wall]); B = np.concatenate([P[1:] for P, _ in wall])
+    return poster._nearest_on_segments(Q, A, B)[1]
+
+
+def test_a_wall_leaving_the_shared_road_never_dips_toward_it():
+    a = _line(10, 90, 50.0, 120)
+    b = _cat(_line(10, 50, 50.5, 160), _vline(50, 51, 90, 160))
+    [_, [(Pb, _)]] = poster.assign_lanes([[a], [b]], lane_px=4, r_px=4, ramp=4)
+    assert _dist_to(Pb, [a]).min() >= 4 - 1e-6
+
+
+def test_an_out_and_back_earlier_wall_keeps_the_later_wall_on_one_side():
+    early0 = poster.collapse_passes([_cat(_line(10, 90, 50.0, 120), _line(90, 10, 50.6, 160))], r_px=4, ramp=4)
+    late0 = _line(10, 90, 50.4, 150)
+    for deg in (0, 33, 71):
+        c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
+        rot = lambda Q: (Q - 50) @ np.array([[c, s], [-s, c]]) + 50   # +deg about (50, 50)
+        early = [(rot(Q), h) for Q, h in early0]
+        [_, [(P, _)]] = poster.assign_lanes([early, [(rot(late0[0]), late0[1])]], lane_px=4, r_px=4, ramp=4)
+        side = np.sign(c * (P[:, 1] - 50) - s * (P[:, 0] - 50))     # road direction x P
+        assert np.ptp(side) == 0, deg
+        assert np.allclose(_dist_to(P, early), 4, rtol=0, atol=1e-6), deg
+    # unrotated, |y - 50| = 4 wherever the collapsed road is y = 50 (it keeps a
+    # 0.6 px stub beside the turnaround, x 83-90, and the lane follows that)
+    [_, [(P, _)]] = poster.assign_lanes([early0, [late0]], lane_px=4, r_px=4, ramp=4)
+    assert np.allclose(abs(P[P[:, 0] <= 80, 1] - 50), 4, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("lane_inside, off", [
+    (False, 0.4), (True, 0.4), (True, -0.4),
+    pytest.param(False, -0.4, marks=pytest.mark.xfail(strict=True, reason=(
+        "lane outside, later wall inside: one later station spans the lane's 90 deg "
+        "arc, so its chord comes to 0.745 L; open with the controller"))),
+])
+def test_lanes_round_a_sharp_corner_stay_clear_of_the_earlier_wall(lane_inside, off):
+    road = _cat(_line(5, 30, 30.0, 120), _vline(30, 29, 5, 120))   # the lane side is outside
+    early = (road[0][::-1], road[1]) if lane_inside else road
+    late = (early[0] + off, early[1])                               # +0.4 outside, -0.4 inside
+    [_, [(P, _)]] = poster.assign_lanes([[early], [late]], lane_px=4, r_px=4, ramp=4)
+    S = (P[:-1] + np.linspace(0, 1, 10)[:, None, None] * (P[1:] - P[:-1])).reshape(-1, 2)
+    assert _dist_to(S, [early]).min() >= 0.9 * 4
+    assert np.hypot(*np.diff(P, axis=0).T).max() <= 1.5 * 4
+
+
+def test_lanes_are_counted_against_the_earlier_walls_lines_before_they_moved():
+    # wall 2 is 1 px from wall 1's input line but 4.5 px from where wall 1 moved to
+    out = poster.assign_lanes([[_line(10, 90, y, 120)] for y in (50.0, 50.5, 49.5)], lane_px=4, r_px=4, ramp=4)
+    assert np.allclose(out[2][0][0][:, 1], 58.0)
+
+
+def test_the_lane_move_is_eased_per_piece():
+    # r_px > lane_px, so the stations eased in sit outside the lane and are not pushed
+    b = [_cat(_line(10, 50, 50.5, 160), _vline(50, 51, 70, 160)), _line(60, 90, 57.0, 160)]
+    [_, [(P0, _), (P1, _)]] = poster.assign_lanes([[_line(10, 90, 50.0, 120)], b], lane_px=4, r_px=8, ramp=4)
+    assert P0[b[0][0][:, 1] == 57, 1] == pytest.approx([56.25])   # 1/4 of the way at the edge
+    assert np.allclose(P1[:, 1], 54.0)          # a piece that starts on the road is not eased
 
 
 def test_relief_plate_clears_the_frame_ring():

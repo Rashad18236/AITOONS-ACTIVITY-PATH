@@ -1061,12 +1061,13 @@ def _wall_dims(p: Params) -> tuple[float, float, int, float]:
     W_mm    the drawn strip width: the strip core groove_w_mm - 2*clearance_mm plus
             WALL_PAD_PX fine pixels, so the meshed strip never comes out under the core.
     dil_px  fine pixels the crossing cut grows a wall by, clearance_mm rounded UP.
-    lane_mm centre-to-centre spacing of side-by-side walls: one W_mm strip plus its
-            dil_px cut plus one fine pixel, so a neighbour's cut never bites this wall."""
+    lane_mm centre-to-centre spacing of side-by-side walls: one W_mm strip plus twice
+            its dil_px cut plus one fine pixel. Twice, so a lane chamfered round an
+            outside corner (~0.92 lane_mm from the earlier wall) still clears the cut."""
     res_f = p.res_mm / WALL_SUB
     W = p.groove_w_mm - 2 * p.clearance_mm + WALL_PAD_PX * res_f
     dil = math.ceil(round(p.clearance_mm / res_f, 6))   # 0.3/0.1 is 2.9999999999999996
-    return res_f, W, dil, W + (dil + 1) * res_f
+    return res_f, W, dil, W + (2 * dil + 1) * res_f
 
 
 def legs_bounds(legs: list[activity.Leg], margin_pct: float) -> tuple:
@@ -1176,41 +1177,82 @@ def collapse_passes(pieces: list[tuple[np.ndarray, np.ndarray]], r_px: float, ra
     return list(zip(np.split(new, cut), np.split(out, cut)))
 
 
+def _unit(v, eps=1e-9):
+    """Rows of v scaled to length 1; rows shorter than eps come back as zeros."""
+    L = np.hypot(*v.T)[:, None]
+    return np.divide(v, L, out=np.zeros_like(v), where=L > eps)
+
+
+def _lane_ref(wall):
+    """(A, B, VA, VB, NS) of a wall's input polyline, or None if it has no segment.
+
+    Per segment A-B its normal NS = (-u_y, u_x) and the vertex normals VA, VB at its
+    ends: the unit mean of a vertex's two segment normals within its piece, an end
+    vertex its one segment's, zero at an exact reversal (assign_lanes falls back to NS).
+    Repeated stations are dropped first: collapse stacks several on one vertex."""
+    parts = []
+    for q, _ in wall:
+        q = np.asarray(q, float)
+        q = q[np.r_[True, (q[1:] != q[:-1]).any(1)]]
+        if len(q) < 2:
+            continue   # ponytail: a one-station piece has no direction to lane beside
+        u = _unit(np.diff(q, axis=0))
+        ns = np.stack([-u[:, 1], u[:, 0]], 1)
+        v = _unit(np.r_[ns[:1], ns[:-1] + ns[1:], ns[-1:]])
+        parts.append((q[:-1], q[1:], v[:-1], v[1:], ns))
+    return [np.concatenate(c) for c in zip(*parts)] if parts else None
+
+
 def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: float,
                  r_px: float, ramp: int) -> list[list[tuple[np.ndarray, np.ndarray]]]:
     """Collapsed walls, earliest first -> the same walls, shared roads in side-by-side lanes.
 
-    Wall 0 stays put. A station of a later wall takes lane = the number of earlier
-    walls whose INPUT polyline lies strictly within r_px, and moves to lane * lane_px
-    left of the earliest of them (left of that wall's travel, so the side never flips
-    with this wall's direction), eased in and out by _ramp (spec 6.6). hr is untouched.
-    Zero-length segments (collapse snaps several stations onto one vertex) are left out
-    of a reference; they have no direction and their point is a neighbour's end anyway."""
-    refs = []
-    for w in walls:
-        A = np.concatenate([q[:-1] for q, _ in w]).astype(float)
-        B = np.concatenate([q[1:] for q, _ in w]).astype(float)
-        # ponytail: a one-station piece is no reference (no direction to lane beside);
-        # give it a point segment and a fallback normal if such pieces ever reach here
-        keep = (A != B).any(1)
-        refs.append((A[keep], B[keep]))
+    Wall 0 stays put; hr is untouched. A station of a later wall takes lane = the
+    number of earlier walls whose INPUT polyline lies strictly within r_px; ref is the
+    earliest of them. Its target is the foot on ref plus lane * lane_px along ref's
+    vertex normals interpolated at the foot (so a corner fans out instead of jumping),
+    oriented to agree with the previous station along each run of lane > 0 (so an
+    out-and-back ref, whose two passes face opposite ways, never flips the side). The
+    move is eased by _ramp, then any lane station still closer than lane * lane_px to
+    ref is pushed straight away from its nearest ref point to exactly that (inside
+    corners, and a wall easing off the road), spec 6.6."""
+    refs = [_lane_ref(w) for w in walls]
     out = [walls[0]]
     for i, w in enumerate(walls[1:], 1):
         n_k = [len(q) for q, _ in w]
         P = np.concatenate([q for q, _ in w]).astype(float)
-        lane, foot, nrm = np.zeros(len(P), int), np.zeros_like(P), np.zeros_like(P)
-        for A, B in refs[i - 1::-1]:          # earliest last, so it ends up the ref
-            if not len(A):
-                continue                      # a wall of single stations has no road
+        g = np.repeat(np.arange(len(w)), n_k)
+        lane, ref = np.zeros(len(P), int), np.zeros(len(P), int)
+        foot, nrm = np.zeros_like(P), np.zeros_like(P)
+        for j in range(i - 1, -1, -1):        # earliest last, so it ends up the ref
+            if refs[j] is None:
+                continue
+            A, B, VA, VB, NS = refs[j]
             f, d, k = _nearest_on_segments(P, A, B)
+            AB = B[k] - A[k]
+            t = (((f - A[k]) * AB).sum(1) / (AB ** 2).sum(1))[:, None]
+            n = _unit((1 - t) * VA[k] + t * VB[k])
             m = d < r_px
-            u = (B - A)[k[m]]
             lane += m
-            foot[m], nrm[m] = f[m], np.stack([-u[:, 1], u[:, 0]], 1) / np.hypot(*u.T)[:, None]
+            ref[m], foot[m] = j, f[m]
+            nrm[m] = np.where((n ** 2).sum(1, keepdims=True) > 0, n, NS[k])[m]
         m = lane > 0
+        for s in np.flatnonzero(m[1:] & m[:-1] & (g[1:] == g[:-1])) + 1:
+            if nrm[s] @ nrm[s - 1] < 0:       # in order: s - 1 is already oriented
+                nrm[s] = -nrm[s]
+        off = lane[:, None] * lane_px
         new = P.copy()
-        new[m] += _ramp(m, np.repeat(np.arange(len(w)), n_k), ramp)[m, None] * (
-            foot[m] + lane[m, None] * lane_px * nrm[m] - P[m])
+        new[m] += _ramp(m, g, ramp)[m, None] * (foot[m] + off[m] * nrm[m] - P[m])
+        for j in np.unique(ref[m]):
+            s = np.flatnonzero(m & (ref == j))
+            for _ in range(8):   # ponytail: an inside corner settles in 2-3; raise if a lane dips
+                f, d = _nearest_on_segments(new[s], *refs[j][:2])[:2]
+                c = d < off[s, 0] - 1e-9
+                if not c.any():
+                    break
+                s, f, d = s[c], f[c], d[c, None]
+                away = np.divide(new[s] - f, d, out=nrm[s].copy(), where=d > 0)
+                new[s] = f + off[s] * away
         out.append(list(zip(np.split(new, np.cumsum(n_k)[:-1]), [h for _, h in w])))
     return out
 
