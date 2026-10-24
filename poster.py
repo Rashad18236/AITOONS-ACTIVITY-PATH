@@ -699,20 +699,38 @@ def max_size_mm(p):
     return s
 
 
-def _groove_mask(track_px, shape, p):
-    """Boolean groove footprint on a (H,W) grid, from the strip's own offset geometry.
+def _ribbon(draw, P, half, fill):
+    """Draw polyline P (k,2) px as one rectangle per segment, `half` px either side of it
+    along that segment's own normal; segment i -> i+1 gets fill[i] (or the one `fill`).
 
     line(width=) is not a constant perpendicular width (1.42mm at 45° for a nominal
-    2.0mm), so the strip would not seat. Per-segment quads, not one ribbon polygon —
-    a single polygon even-odd fills leaves holes where the track hairpins over itself."""
+    2.0mm). Per-segment quads, not one ribbon polygon — a single polygon even-odd fills
+    leaves holes where the track hairpins over itself. The segment's own normal, not a
+    station's averaged one: an averaged normal pinches a kink to cos(turn/2) of the
+    width, a segment's own rectangle is full width whatever its neighbours do. Two such
+    rectangles leave a wedge outside the vertex they share, and even at a 1 deg turn
+    pixel centres fall in it: a curved wall came out with a pinhole every few mm. So
+    each vertex also gets a bevel, the rectangle spanned by both segments' normals
+    there. Zero-length segments are skipped, and the bevel joins across them."""
+    v = np.diff(P, axis=0)
+    L = np.hypot(*v.T)
+    fill = np.broadcast_to(fill, len(v))
+    k = np.flatnonzero(L > 1e-9)
+    n = v[k][:, ::-1] * [-1, 1] * (half / L[k])[:, None]     # (-v_y, v_x), half long
+    a, b = P[k], P[k + 1]
+    for j, i in enumerate(k):
+        draw.polygon([tuple(a[j] + n[j]), tuple(b[j] + n[j]), tuple(b[j] - n[j]),
+                      tuple(a[j] - n[j])], fill=int(fill[i]))
+        if j:                                    # bevel at the vertex a[j] == b[j - 1]
+            draw.polygon([tuple(a[j] + n[j - 1]), tuple(a[j] + n[j]), tuple(a[j] - n[j - 1]),
+                          tuple(a[j] - n[j])], fill=int(fill[i]))
+
+
+def _groove_mask(track_px, shape, p):
+    """Boolean groove footprint on a (H,W) grid, from the strip's own offset geometry."""
     H, W = shape
     img = Image.new("L", (W, H))
-    d = ImageDraw.Draw(img)
-    C, nrm = _offsets(track_px)[:2]
-    half = p.groove_w_mm / 2 / p.res_mm
-    L, R = C + nrm * half, C - nrm * half
-    for i in range(len(C) - 1):
-        d.polygon([tuple(L[i]), tuple(L[i + 1]), tuple(R[i + 1]), tuple(R[i])], fill=255)
+    _ribbon(ImageDraw.Draw(img), _offsets(track_px)[0], p.groove_w_mm / 2 / p.res_mm, 255)
     return np.asarray(img) > 0
 
 
@@ -1043,9 +1061,13 @@ HR_SCALE_BPM = (100.0, 200.0)
 # 1.4mm strip is 3.5 px at 0.4mm and would stair-step by a third of its width.
 WALL_SUB = 4
 # Fine pixels added to the drawn strip width: rasterising and the four-corner cell rule
-# each shave about a pixel off a drawn width, and the meshed strip must never come out
-# under its core groove_w_mm - 2*clearance_mm (spec 6.5 allows "a couple" of pixels).
-WALL_PAD_PX = 2
+# shave up to ~2.7 px off a drawn width between the axes, and the meshed strip must never
+# come out under its core groove_w_mm - 2*clearance_mm (spec 6.5). 2 meshed 0.75mm at
+# 30 deg and res 0.5 (0.815 at 0.4) for a 0.84mm core; 3 holds >= 0.88 at 0-90 deg.
+WALL_PAD_PX = 3
+# A wall piece shorter than this, left between two crossings or at a plate edge, is
+# too small to pick up and glue; wall_masks drops it and says so (spec 6.6).
+MIN_PIECE_MM = 3.0
 # assign_lanes flips a station's lane normal only when it is over 150 deg off the previous
 # one: that is a collapsed out-and-back's two passes tying, never a corner of a road.
 LANE_FLIP_DOT = -0.866
@@ -1374,6 +1396,94 @@ def _slab_mesh(cells, top, bot, res_mm):
             if not incell(nr, nc):                       # boundary edge -> wall
                 F += [[v0, v1, v1 + n], [v0, v1 + n, v0 + n]]
     return trimesh.Trimesh(np.vstack([vt, vb]), np.array(F), process=False)
+
+
+def _components(mask: np.ndarray) -> list[np.ndarray]:
+    """The 4-connected components of a bool mask, each as its own bool mask.
+
+    ponytail: pure-Python floodfill like _sea_mask, ~0.2 s per 1000mm wall at 216mm;
+    swap for scipy.ndimage.label if it ever hurts."""
+    img = Image.fromarray(np.where(mask, -1, 0).astype(np.int32), "I")
+    n = 0
+    for y, x in np.argwhere(mask):
+        if img.getpixel((int(x), int(y))) == -1:
+            n += 1
+            ImageDraw.floodfill(img, (int(x), int(y)), n)
+    lab = np.asarray(img)
+    return [lab == k for k in range(1, n + 1)]
+
+
+def wall_masks(walls, M: int, p) -> list[np.ndarray]:
+    """Laned walls, earliest first -> one fine bool VERTEX mask per wall, after crossings.
+
+    The fine grid is ((M-1)*WALL_SUB+1)^2, so fine vertex r*WALL_SUB is relief vertex r
+    (the caption's registration, _text_mask). Each piece is drawn by _ribbon at W_mm.
+    Crossings (spec 6.6): the later wall runs through, and every earlier wall is cut
+    back dil_px (clearance_mm, rounded up) clear of what is left of each later one.
+    Then any piece under MIN_PIECE_MM (area / W_mm) is dropped, with a length-only line
+    on stdout. Walls are cut last to first, so a dropped fragment cuts nothing."""
+    S, n = WALL_SUB, (M - 1) * WALL_SUB + 1
+    res_f, W, dil, _ = _wall_dims(p)
+    out, cut = [], np.zeros((n, n), bool)
+    for wall in reversed(walls):
+        img = Image.new("L", (n, n))
+        d = ImageDraw.Draw(img)
+        for P, _ in wall:
+            _ribbon(d, np.asarray(P, float) * S, W / res_f / 2, 255)
+        m = (np.asarray(img) > 0) & ~cut
+        for c in _components(m):
+            if (length := c.sum() * res_f ** 2 / W) < MIN_PIECE_MM:
+                print(f"path: dropped a {length:.1f}mm wall fragment at a crossing")
+                m &= ~c
+        out.append(m)
+        cut |= _dilate(m, dil)
+    return out[::-1]
+
+
+def groove_from_masks(masks: list[np.ndarray], M: int, p) -> np.ndarray:
+    """The (M, M) relief vertex groove that holds every wall plus its clearance.
+
+    D is the union of the walls grown by dil_px. A relief cell is carved when any D
+    vertex falls in its fine block (both edges included), and the groove is that
+    cell set's vertices: every carved cell has all four corners at the slot floor, so
+    the floor-level opening contains every strip and its clearance by construction."""
+    S, dil = WALL_SUB, _wall_dims(p)[2]
+    D = np.zeros(((M - 1) * S + 1,) * 2, bool)
+    for m in masks:
+        D |= _dilate(m, dil)
+    E = D[:-1, :-1] | D[1:, :-1] | D[:-1, 1:] | D[1:, 1:]     # fine cell touches D
+    return _cell_verts(E.reshape(M - 1, S, M - 1, S).any((1, 3)))
+
+
+def wall_tops(walls, surface: np.ndarray, p) -> list[np.ndarray]:
+    """One fine float top per wall, mm: under each segment's _ribbon (the same pixels
+    wall_masks draws), the mean of its two stations' snapped surface + wall_height.
+
+    A station reads the surface at its nearest relief vertex. Segment ids go into an
+    "I" image and are looked up in float64: an "F" image is float32, which would put
+    every top ~1e-7mm off the layer grid. Where segments overlap the last one drawn wins."""
+    M, S = surface.shape[0], WALL_SUB
+    res_f, W = _wall_dims(p)[:2]
+    n = (M - 1) * S + 1
+    tops = []
+    for wall in walls:
+        img = Image.new("I", (n, n))
+        d = ImageDraw.Draw(img)
+        z = [np.zeros(1)]                          # id 0: no segment
+        for P, hr in wall:
+            P = np.asarray(P, float)
+            c, r = np.clip(np.rint(P).astype(int), 0, M - 1).T
+            zs = _snap(surface[r, c] + wall_height(hr, p), p)
+            _ribbon(d, P * S, W / res_f / 2, sum(map(len, z)) + np.arange(len(P) - 1))
+            z.append((zs[:-1] + zs[1:]) / 2)
+        tops.append(np.concatenate(z)[np.asarray(img)])
+    return tops
+
+
+def wall_mesh(mask: np.ndarray, top: np.ndarray, p) -> trimesh.Trimesh | None:
+    """Watertight wall: the mask's fine cells from the slot floor up to `top`."""
+    return _slab_mesh(_slab_cells(mask), top, np.full(top.shape, SLOT_FLOOR_MM),
+                      p.res_mm / WALL_SUB)
 
 
 def strip_mesh(track_px, alt_mm, surface, p):

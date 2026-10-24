@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import warnings
 from dataclasses import asdict, replace
 
 import numpy as np
@@ -439,6 +440,107 @@ def test_the_lane_move_is_eased_per_piece():
     assert np.allclose(P1[:, 1], 54.0)          # a piece that starts on the road is not eased
 
 
+def _flat(p):
+    """An (M, M) relief surface, flat at the layer boundary nearest 3mm."""
+    M = _mpx(p)
+    return np.full((M, M), poster._snap(3.0, p))
+
+
+def _ray(M, deg):
+    """A straight piece through the plate centre at heading deg, stations 1 px apart."""
+    c, n = (M - 1) / 2, int((M - 1) / 2) - 3
+    return c + np.arange(-n, n + 1)[:, None] * [np.cos(np.radians(deg)), np.sin(np.radians(deg))]
+
+
+def _figure8(cx, cy, R, hr):
+    """A figure eight crossing itself at (cx, cy), stations 1 px apart along it."""
+    t = np.linspace(0, 2 * np.pi, 4000)
+    Q = np.stack([cx + R * np.sin(t), cy + R * np.sin(t) * np.cos(t)], 1)
+    d = np.r_[0, np.cumsum(np.hypot(*np.diff(Q, axis=0).T))]
+    s = np.arange(0, d[-1], 1.0)
+    P = np.stack([np.interp(s, d, Q[:, 0]), np.interp(s, d, Q[:, 1])], 1)
+    return P, np.full(len(P), float(hr))
+
+
+def test_a_wall_mesh_is_watertight_seated_and_on_the_layer_grid():
+    p = _params(); s = _flat(p); P = _ray(s.shape[0], 30)
+    walls = [[(P, np.full(len(P), 150.0))]]
+    (mask,), (top,) = poster.wall_masks(walls, s.shape[0], p), poster.wall_tops(walls, s, p)
+    m = poster.wall_mesh(mask, top, p)
+    assert m.is_watertight and m.is_winding_consistent and m.volume > 0
+    assert abs(m.bounds[0][2] - poster.SLOT_FLOOR_MM) < 1e-9
+    assert abs(m.bounds[1][2] - poster._snap(s[0, 0] + 6.96, p)) < 1e-9
+
+
+@pytest.mark.parametrize("res", [0.5, 0.4, 0.25])
+def test_a_wall_is_never_narrower_than_the_strip_floor_and_its_groove_holds_its_clearance(res):
+    p = _params(res_mm=res, groove_w_mm=1.44)
+    M, S = _mpx(p), poster.WALL_SUB
+    res_f, _, dil, _ = poster._wall_dims(p)
+    for deg in range(0, 91, 15):
+        P = _ray(M, deg)
+        (mask,) = poster.wall_masks([[(P, np.full(len(P), 150.0))]], M, p)
+        C, nrm = poster._offsets(P * S)[:2]
+        assert _min_width_mm(poster._cell_verts(poster._slab_cells(mask)), C, nrm, res_f) >= 0.84
+        g = poster.groove_from_masks([mask], M, p)
+        R, Cc = np.nonzero(poster._slab_cells(poster._dilate(mask, dil)))
+        r, c = R // S, Cc // S
+        assert (g[r, c] & g[r + 1, c] & g[r, c + 1] & g[r + 1, c + 1]).all()
+
+
+@pytest.mark.parametrize("res", [0.5, 0.4, 0.25])
+def test_a_curved_wall_has_no_pinholes_and_its_top_covers_it(res):
+    # Two segment rectangles leave a wedge outside their shared vertex: without _ribbon's
+    # bevel a curved wall had a pinhole every few mm, some stations no wall at all.
+    p = _params(res_mm=res, groove_w_mm=1.44); M, S = _mpx(p), poster.WALL_SUB
+    for R in (8, 13.3, 27.7):
+        P, h = _arc((M - 1) / 2, (M - 1) / 2, R, 150)
+        walls = [[(P[: len(P) // 2], h[: len(h) // 2])]]
+        (m,), (top,) = poster.wall_masks(walls, M, p), poster.wall_tops(walls, _flat(p), p)
+        C, nrm = poster._offsets(walls[0][0][0] * S)[:2]
+        assert _min_width_mm(poster._cell_verts(poster._slab_cells(m)), C, nrm, p.res_mm / S) >= 0.84
+        assert (top[m] > poster.SLOT_FLOOR_MM).all()
+
+
+def test_repeated_stations_draw_the_same_wall_without_a_warning():
+    # snapping and the lane push-out leave consecutive duplicate stations
+    p = _params(); s = _flat(p); P = _ray(s.shape[0], 30); h = np.full(len(P), 150.0)
+    k = np.repeat(np.arange(len(P)), 3)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = [(poster.wall_masks(w, s.shape[0], p), poster.wall_tops(w, s, p))
+               for w in ([[(P, h)]], [[(P[k], h[k])]])]
+    assert all(np.array_equal(a, b) for a, b in zip(sum(out[0], []), sum(out[1], [])))
+
+
+def test_a_later_wall_runs_through_and_the_earlier_one_is_cut_clear_of_it():
+    p = _params(); M, S = _mpx(p), poster.WALL_SUB
+    ma, mb = poster.wall_masks([[_line(5, 55, 30.0, 150)], [_vline(30, 5, 55, 150)]], M, p)
+    assert len(poster._components(mb)) == 1 and len(poster._components(ma)) == 2
+    win = lambda m: np.argwhere(m[25 * S:36 * S, 25 * S:36 * S])
+    A, B = win(ma), win(mb)
+    gap = np.sqrt(((A[:, None] - B[None]) ** 2).sum(-1)).min() * p.res_mm / S
+    assert gap >= p.clearance_mm
+
+
+def test_walls_in_neighbouring_lanes_are_not_cut():
+    p = _params(); M = _mpx(p); lane = poster._wall_dims(p)[3] / p.res_mm
+    ma, mb = poster.wall_masks([[_line(5, 55, 30.0, 150)], [_line(5, 55, 30.0 + lane, 150)]], M, p)
+    assert len(poster._components(ma)) == len(poster._components(mb)) == 1 and not (ma & mb).any()
+
+
+def test_a_fragment_too_short_to_handle_is_dropped(capsys):
+    p = _params(); M = _mpx(p)
+    ma, _ = poster.wall_masks([[_line(5, 55, 30.0, 150)], [_vline(10, 5, 55, 150)]], M, p)
+    assert len(poster._components(ma)) == 1 and "dropped" in capsys.readouterr().out
+
+
+def test_a_wall_crossing_itself_stays_one_piece():
+    p = _params(); M = _mpx(p)
+    (m,) = poster.wall_masks([[_figure8(31, 31, 20, 150)]], M, p)
+    assert len(poster._components(m)) == 1
+
+
 def test_relief_plate_clears_the_frame_ring():
     """The relief plate must be at least fit_mm smaller than the ring opening per
     side, at every resolution — a gap that rounds down to zero is an interference
@@ -570,6 +672,28 @@ def test_smooth_is_an_identity_at_zero():
     assert (poster._smooth(e, 0.0) == e).all()
     assert poster._smooth(e, 2.0).shape == e.shape
     assert abs(poster._smooth(e, 2.0).mean() - e.mean()) < 1.0   # edge-clamped, no drift
+
+
+def _min_width_mm(mask, C, nrm, res):
+    """Narrowest perpendicular width, in mm, of what _slab_mesh meshes from the vertex
+    `mask` (the cells with all four corners set), across the stations C (pixel space,
+    unit normals nrm) of a grid of pitch res; two stations skipped per end.
+
+    The contiguous run of each station's perpendicular inside those cells, in 0.05 px
+    steps out to 64 px a side. Not _groove_widths' rounding of each sample to its
+    nearest vertex: that reads up to a pixel past the meshed edge, and it passed a
+    0.84mm-core wall that meshed 0.75mm wide at 30 deg."""
+    cells = mask[:-1, :-1] & mask[1:, :-1] & mask[:-1, 1:] & mask[1:, 1:]
+    step = np.arange(0, 64, 0.05)
+
+    def reach(sign):
+        q = np.floor(C[:, None] + sign * nrm[:, None] * step[None, :, None]).astype(int)
+        c, r = q[..., 0], q[..., 1]
+        ok = (r >= 0) & (c >= 0) & (r < cells.shape[0]) & (c < cells.shape[1])
+        ok &= cells[r.clip(0, cells.shape[0] - 1), c.clip(0, cells.shape[1] - 1)]
+        return (np.where(ok.all(1), len(step), ok.argmin(1)) - 1) * 0.05
+
+    return ((reach(1.0) + reach(-1.0))[2:-2] * res).min()   # skip the square ends
 
 
 def _groove_widths(p):
