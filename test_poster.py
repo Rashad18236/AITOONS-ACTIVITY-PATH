@@ -347,9 +347,11 @@ def test_a_wall_leaving_the_shared_road_never_dips_toward_it():
 def test_an_out_and_back_earlier_wall_keeps_the_later_wall_on_one_side(late_y, back_y):
     # The later wall runs on the lane side, on the far side (the mirror), or is itself an
     # out-and-back drifting 0.4 px to the far side on its way back (two out-and-backs
-    # sharing a turnaround). A turnaround is a 180 deg corner, inside assign_lanes'
-    # ceiling: as in the corner sweep, stations whose foot on the earlier wall lies within
-    # 3 lanes of its turnaround are not checked. Mid-stretch: one side, 4 px off.
+    # sharing a turnaround). One side, and 4 px off wherever the lane is fully eased in.
+    # A turnaround is a 180 deg corner, inside assign_lanes' ceiling, and on the lane side
+    # (50.4) the last station lands across: there, as in the corner sweep, stations whose
+    # foot on the earlier wall lies within 3 lanes of the turnaround are not checked. The
+    # other two hold at every station, which pins that no target clip comes back.
     early0 = poster.collapse_passes([_cat(_line(10, 90, 50.0, 120), _line(90, 10, 50.6, 160))], r_px=4, ramp=4)
     late0 = _line(10, 90, late_y, 150)
     if back_y is not None:
@@ -359,11 +361,13 @@ def test_an_out_and_back_earlier_wall_keeps_the_later_wall_on_one_side(late_y, b
         c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
         rot = lambda Q: (Q - 50) @ np.array([[c, s], [-s, c]]) + 50   # +deg about (50, 50)
         early = [(rot(Q), h) for Q, h in early0]
-        [_, [(P, _)]] = poster.assign_lanes([early, [(rot(late0[0]), late0[1])]], lane_px=4, r_px=4, ramp=4)
-        keep = np.hypot(*(_foot_on(P, early)[0] - rot(turn)).T) > 3 * 4
+        L = rot(late0[0])
+        [_, [(P, _)]] = poster.assign_lanes([early, [(L, late0[1])]], lane_px=4, r_px=4, ramp=4)
+        keep = np.hypot(*(_foot_on(P, early)[0] - rot(turn)).T) > 3 * 4 if late_y == 50.4 else np.ones(len(P), bool)
+        a1 = poster._ramp(_dist_to(L, early) < 4, np.zeros(len(L), int), 4) == 1
         side = np.sign(c * (P[:, 1] - 50) - s * (P[:, 0] - 50))     # road direction x P
         assert np.ptp(side[keep]) == 0, deg
-        assert np.allclose(_dist_to(P[keep], early), 4, rtol=0, atol=1e-6), deg
+        assert np.allclose(_dist_to(P[keep & a1], early), 4, rtol=0, atol=1e-6), deg
     # unrotated, |y - 50| = 4 mid-stretch, where the collapsed road is y = 50
     [_, [(P, _)]] = poster.assign_lanes([early0, [late0]], lane_px=4, r_px=4, ramp=4)
     keep = np.hypot(*(_foot_on(P, early0)[0] - turn).T) > 3 * 4
