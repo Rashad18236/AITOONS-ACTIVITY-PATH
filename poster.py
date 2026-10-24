@@ -1183,13 +1183,14 @@ def _unit(v, eps=1e-9):
     return np.divide(v, L, out=np.zeros_like(v), where=L > eps)
 
 
-def _lane_ref(wall):
+def _lane_ref(wall, win):
     """(A, B, VA, VB, NS) of a wall's input polyline, or None if it has no segment.
 
     Per segment A-B its normal NS = (-u_y, u_x) and the vertex normals VA, VB at its
-    ends: the unit mean of a vertex's two segment normals within its piece, an end
-    vertex its one segment's, zero at an exact reversal (assign_lanes falls back to NS).
-    Repeated stations are dropped first: collapse stacks several on one vertex."""
+    ends: at vertex v the unit mean of the segment normals v-win .. v+win-1, clipped
+    to its piece (win=1 is the two adjacent segments), zero at an exact reversal
+    (assign_lanes falls back to NS). Repeated stations are dropped first: collapse
+    stacks several on one vertex."""
     parts = []
     for q, _ in wall:
         q = np.asarray(q, float)
@@ -1198,7 +1199,8 @@ def _lane_ref(wall):
             continue   # ponytail: a one-station piece has no direction to lane beside
         u = _unit(np.diff(q, axis=0))
         ns = np.stack([-u[:, 1], u[:, 0]], 1)
-        v = _unit(np.r_[ns[:1], ns[:-1] + ns[1:], ns[-1:]])
+        c, x = np.r_[np.zeros((1, 2)), np.cumsum(ns, 0)], np.arange(len(q))
+        v = _unit(c[np.minimum(x + win, len(ns))] - c[np.maximum(x - win, 0)])
         parts.append((q[:-1], q[1:], v[:-1], v[1:], ns))
     return [np.concatenate(c) for c in zip(*parts)] if parts else None
 
@@ -1210,13 +1212,16 @@ def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: floa
     Wall 0 stays put; hr is untouched. A station of a later wall takes lane = the
     number of earlier walls whose INPUT polyline lies strictly within r_px; ref is the
     earliest of them. Its target is the foot on ref plus lane * lane_px along ref's
-    vertex normals interpolated at the foot (so a corner fans out instead of jumping),
+    vertex normals interpolated at the foot. A vertex normal averages the segment
+    normals within +-ramp segments, so a sharp corner turns the lane over ~2*ramp
+    stations instead of one chord across it. The normal is
     oriented to agree with the previous station along each run of lane > 0 (so an
     out-and-back ref, whose two passes face opposite ways, never flips the side). The
     move is eased by _ramp, then any lane station still closer than lane * lane_px to
     ref is pushed straight away from its nearest ref point to exactly that (inside
     corners, and a wall easing off the road), spec 6.6."""
-    refs = [_lane_ref(w) for w in walls]
+    # ponytail: the normal window is ramp, 0.908 L worst case at a 90 deg corner; widen if a lane chords
+    refs = [_lane_ref(w, ramp) for w in walls]
     out = [walls[0]]
     for i, w in enumerate(walls[1:], 1):
         n_k = [len(q) for q, _ in w]

@@ -356,12 +356,7 @@ def test_an_out_and_back_earlier_wall_keeps_the_later_wall_on_one_side():
     assert np.allclose(abs(P[P[:, 0] <= 80, 1] - 50), 4, rtol=0, atol=1e-6)
 
 
-@pytest.mark.parametrize("lane_inside, off", [
-    (False, 0.4), (True, 0.4), (True, -0.4),
-    pytest.param(False, -0.4, marks=pytest.mark.xfail(strict=True, reason=(
-        "lane outside, later wall inside: one later station spans the lane's 90 deg "
-        "arc, so its chord comes to 0.745 L; open with the controller"))),
-])
+@pytest.mark.parametrize("lane_inside, off", [(False, 0.4), (False, -0.4), (True, 0.4), (True, -0.4)])
 def test_lanes_round_a_sharp_corner_stay_clear_of_the_earlier_wall(lane_inside, off):
     road = _cat(_line(5, 30, 30.0, 120), _vline(30, 29, 5, 120))   # the lane side is outside
     early = (road[0][::-1], road[1]) if lane_inside else road
