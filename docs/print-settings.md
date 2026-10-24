@@ -1,4 +1,4 @@
-# Bambu Studio print settings — Flight Path Poster
+# Bambu Studio print settings — Activity Path Poster
 
 Target: Bambu X1C / P1S / H2D class, 256×256 plate, 0.4 mm nozzle, AMS, PLA.
 Three plates: `relief.3mf` (3 colours), `frame.3mf` (2 colours), `path.3mf` (1 colour;
