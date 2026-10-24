@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import urllib.parse
 import warnings
 from dataclasses import asdict, replace
 
@@ -1074,15 +1075,15 @@ def _fake_fetches(monkeypatch, water=False, elev_top=500.0, roads=False):
     monkeypatch.setattr(poster, "fetch_elevation",
                         lambda b, px: np.tile(np.linspace(0, elev_top, px), (px, 1)))
     monkeypatch.setattr(poster, "fetch_osm_masks",
-                        lambda b, px, res: (np.full((px, px), water, bool),
-                                            np.zeros((px, px), bool),
-                                            np.full((px, px), roads, bool)))
+                        lambda b, px, res, groups=frozenset(): (
+                            np.full((px, px), water, bool), np.zeros((px, px), bool),
+                            np.full((px, px), roads, bool)))
 
 
 def _fake_strips(monkeypatch):
     """Every relief body in one order: a W-E ramp to 4000 m (the band east of 2000 m),
     water on the west quarter and a road across the middle (a bridge over the water)."""
-    def masks(b, px, res):
+    def masks(b, px, res, groups=frozenset()):
         water, road = np.zeros((px, px), bool), np.zeros((px, px), bool)
         water[:, :px // 4] = True
         road[3 * px // 8:5 * px // 8] = True
@@ -2198,7 +2199,8 @@ def test_sea_is_the_right_hand_side_of_the_coastline_and_prints_flat(monkeypatch
     east = lambda px: np.tile(np.arange(px) >= px // 2, (px, 1))
     zeros = lambda px: np.zeros((px, px), bool)
     monkeypatch.setattr(poster, "fetch_elevation", elev)
-    monkeypatch.setattr(poster, "fetch_osm_masks", lambda b, px, res: (zeros(px), east(px), zeros(px)))
+    monkeypatch.setattr(poster, "fetch_osm_masks",
+                        lambda b, px, res, groups=frozenset(): (zeros(px), east(px), zeros(px)))
     seen, real = {}, poster.compose_parts
     monkeypatch.setattr(poster, "compose_parts", lambda *a: seen.setdefault("p", real(*a)))
     p = _params()                              # 30m of land: the 300m span floor, so
@@ -2249,6 +2251,68 @@ def test_fetch_osm_masks_draws_roads_and_runways_by_scale(monkeypatch, capsys):
     roads = poster.fetch_osm_masks(B, 100, 0.4)[2]
     assert roads.mean() <= poster.ROAD_MAX_FRAC
     assert "dropped" in capsys.readouterr().out
+
+
+def test_fine_classes_need_both_zoom_and_theme(monkeypatch, capsys):
+    """Streets, hiking routes and rail are drawn only when the theme permits them AND
+    the zoom can hold them. Trails are the member ways of route=hiking relations, one
+    road width like everything else; a closed member loop is a trail, never a lake.
+    Too much grey drops streets first, then trails."""
+    F = _wbounds(47.0, 8.0, 47.0036, 8.0053)    # ~400 m box: ~10 m per printed mm at 100 px
+    every = frozenset({"streets", "trails", "rail", "buildings"})
+    lon = lambda c: 8.0 + 0.0053 * c / 100        # column -> lon (approximate, 100 px)
+    lat = lambda r: 47.0036 - 0.0036 * r / 100    # row -> lat
+    row = lambda r, c0=5, c1=95: [(lat(r), lon(c0)), (lat(r), lon(c1))]
+    col = lambda c, r0, r1: [(lat(r0), lon(c)), (lat(r1), lon(c))]
+    loop = [(lat(10), lon(55)), (lat(10), lon(90)), (lat(30), lon(90)), (lat(30), lon(55)),
+            (lat(10), lon(55))]
+    hiking = dict(type="relation", tags={"type": "route", "route": "hiking"}, members=[
+        dict(type="node", ref=1, role="guidepost", lat=lat(60), lon=lon(50)),
+        dict(type="way", ref=2, role="", geometry=[{"lat": a, "lon": o} for a, o in row(60)]),
+        dict(type="way", ref=3, role="", tags={"highway": "footway", "tunnel": "yes"},
+             geometry=[{"lat": a, "lon": o} for a, o in row(40, 5, 45)]),
+        dict(type="way", ref=4, role="", geometry=[{"lat": a, "lon": o} for a, o in loop])])
+    rail = {"railway": "rail"}
+    els = [_way(row(80), tags={"highway": "residential"}), hiking,
+           _way(col(25, 50, 95), tags=rail),
+           _way(col(15, 10, 30), tags={**rail, "tunnel": "yes"})]
+    seen = []
+    monkeypatch.setattr(poster, "_get", lambda url, **k: seen.append(urllib.parse.unquote(url))
+                        or json.dumps({"elements": els}).encode())
+
+    poster.fetch_osm_masks(B, 100, 0.4, groups=every)          # ~189 m/mm: too far out
+    poster.fetch_osm_masks(F, 100, 0.4)                         # close, but not permitted
+    for q in seen:
+        assert not any(k in q for k in ("residential", "route", "railway")), q
+    # classic's query is exactly what it was: same string, same Overpass cache key
+    w, s = poster._unmerc(F[0], F[1]); e, n = poster._unmerc(F[2], F[3])
+    assert seen[1].endswith(poster.OVERPASS_QL.format(
+        s=s, w=w, n=n, e=e, roads='way["highway"~"^(tertiary|secondary|primary|trunk|motorway)$"];'))
+
+    water, sea, roads = poster.fetch_osm_masks(F, 100, 0.4, groups=every)
+    q = seen[2]
+    assert "residential" in q and 'relation["route"="hiking"]' in q and 'way["railway"="rail"]' in q
+    at = lambda m, la, lo: m[_rc(F, la, lo, 100)]
+    assert at(roads, lat(80), lon(50))                              # the street
+    assert at(roads, lat(60), lon(50))                              # the hiking route
+    assert at(roads, lat(10), lon(70)) and at(roads, lat(20), lon(55))   # the loop's edge...
+    assert not at(roads, lat(20), lon(72)) and not water.any()      # ...not a lake
+    assert at(roads, lat(70), lon(25))                              # the railway
+    assert not at(roads, lat(40), lon(25))                          # tunnelled footway member
+    assert not at(roads, lat(20), lon(15))                          # rail tunnel
+    width = lambda r: roads[r - 8:r + 9, _rc(F, lat(r), lon(50), 100)[1]].sum()
+    r_trail, r_street = _rc(F, lat(60), lon(50), 100)[0], _rc(F, lat(80), lon(50), 100)[0]
+    assert width(r_trail) == width(r_street) == round(poster.ROAD_MM / 0.4) + 1   # ROAD_MM
+    assert "dropped" not in capsys.readouterr().out
+
+    # a dense street grid would grey the plate: streets go first, the hiking route stays
+    els[0:1] = [_way(row(4 * i), tags={"highway": "residential"}) for i in range(25)]
+    poster._overpass.cache_clear()
+    roads = poster.fetch_osm_masks(F, 100, 0.4, groups=every)[2]
+    out = capsys.readouterr().out
+    assert "streets" in out and "dropped" in out and "trails" not in out
+    assert roads.mean() <= poster.ROAD_MAX_FRAC
+    assert at(roads, lat(60), lon(50)) and not at(roads, lat(80), lon(50))
 
 
 def test_caps_follow_the_slot(monkeypatch, tmp_path):
@@ -2352,7 +2416,7 @@ def test_a_small_peak_above_the_snow_line_is_a_solid_grey_body(monkeypatch):
 
     monkeypatch.setattr(poster, "fetch_elevation", elev)
     monkeypatch.setattr(poster, "fetch_osm_masks",
-                        lambda b, px, res: tuple(np.zeros((px, px), bool) for _ in range(3)))
+                        lambda b, px, res, groups=frozenset(): tuple(np.zeros((px, px), bool) for _ in range(3)))
     _, bodies, _ = poster.build_poster(LEGS3, _params())
     assert [b[1] for b in bodies] == ["terrain", "snow"]   # the peak survives...
     m = bodies[1][0]
