@@ -326,10 +326,14 @@ def test_a_wall_leaving_the_shared_road_is_left_alone_off_it():
     assert np.array_equal(Pb[off], b[0][off]) and np.allclose(Pb[:30, 1], 54.0)
 
 
-def _dist_to(Q, wall):
-    """Distance of each Q to a wall's polyline (stations joined within a piece only)."""
+def _foot_on(Q, wall):
+    """(feet, dist, seg) of each Q on a wall's polyline (stations joined within a piece only)."""
     A = np.concatenate([P[:-1] for P, _ in wall]); B = np.concatenate([P[1:] for P, _ in wall])
-    return poster._nearest_on_segments(Q, A, B)[1]
+    return poster._nearest_on_segments(Q, A, B)
+
+
+def _dist_to(Q, wall):
+    return _foot_on(Q, wall)[1]
 
 
 def test_a_wall_leaving_the_shared_road_never_dips_toward_it():
@@ -339,21 +343,31 @@ def test_a_wall_leaving_the_shared_road_never_dips_toward_it():
     assert _dist_to(Pb, [a]).min() >= 4 - 1e-6
 
 
-def test_an_out_and_back_earlier_wall_keeps_the_later_wall_on_one_side():
+@pytest.mark.parametrize("late_y, back_y", [(50.4, None), (49.6, None), (50.0, 49.6)])
+def test_an_out_and_back_earlier_wall_keeps_the_later_wall_on_one_side(late_y, back_y):
+    # The later wall runs on the lane side, on the far side (the mirror), or is itself an
+    # out-and-back drifting 0.4 px to the far side on its way back (two out-and-backs
+    # sharing a turnaround). A turnaround is a 180 deg corner, inside assign_lanes'
+    # ceiling: as in the corner sweep, stations whose foot on the earlier wall lies within
+    # 3 lanes of its turnaround are not checked. Mid-stretch: one side, 4 px off.
     early0 = poster.collapse_passes([_cat(_line(10, 90, 50.0, 120), _line(90, 10, 50.6, 160))], r_px=4, ramp=4)
-    late0 = _line(10, 90, 50.4, 150)
+    late0 = _line(10, 90, late_y, 150)
+    if back_y is not None:
+        (late0,) = poster.collapse_passes([_cat(late0, _line(90, 10, back_y, 150))], r_px=4, ramp=4)
+    turn = np.array([90.0, 50.0])
     for deg in (0, 33, 71):
         c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
         rot = lambda Q: (Q - 50) @ np.array([[c, s], [-s, c]]) + 50   # +deg about (50, 50)
         early = [(rot(Q), h) for Q, h in early0]
         [_, [(P, _)]] = poster.assign_lanes([early, [(rot(late0[0]), late0[1])]], lane_px=4, r_px=4, ramp=4)
+        keep = np.hypot(*(_foot_on(P, early)[0] - rot(turn)).T) > 3 * 4
         side = np.sign(c * (P[:, 1] - 50) - s * (P[:, 0] - 50))     # road direction x P
-        assert np.ptp(side) == 0, deg
-        assert np.allclose(_dist_to(P, early), 4, rtol=0, atol=1e-6), deg
-    # unrotated, |y - 50| = 4 wherever the collapsed road is y = 50 (it keeps a
-    # 0.6 px stub beside the turnaround, x 83-90, and the lane follows that)
+        assert np.ptp(side[keep]) == 0, deg
+        assert np.allclose(_dist_to(P[keep], early), 4, rtol=0, atol=1e-6), deg
+    # unrotated, |y - 50| = 4 mid-stretch, where the collapsed road is y = 50
     [_, [(P, _)]] = poster.assign_lanes([early0, [late0]], lane_px=4, r_px=4, ramp=4)
-    assert np.allclose(abs(P[P[:, 0] <= 80, 1] - 50), 4, rtol=0, atol=1e-6)
+    keep = np.hypot(*(_foot_on(P, early0)[0] - turn).T) > 3 * 4
+    assert np.allclose(abs(P[keep, 1] - 50), 4, rtol=0, atol=1e-6)
 
 
 @pytest.mark.parametrize("lane_inside, off", [(False, 0.4), (False, -0.4), (True, 0.4), (True, -0.4)])

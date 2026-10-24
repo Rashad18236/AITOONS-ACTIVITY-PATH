@@ -1125,19 +1125,6 @@ def _nearest_on_segments(Q: np.ndarray, A: np.ndarray, B: np.ndarray
     return feet, dist, k
 
 
-def _ray_hit(O: np.ndarray, D: np.ndarray, A: np.ndarray, B: np.ndarray) -> np.ndarray:
-    """Per ray O + t*D, the smallest t > 1e-6 where it meets a segment A-B, inf if none."""
-    E, hit = B - A, np.full(len(O), np.inf)
-    for sl in _rows(len(O), len(A)):
-        w, d = A - O[sl, None], D[sl, None]
-        den = d[..., 0] * E[:, 1] - d[..., 1] * E[:, 0]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            t = (w[..., 0] * E[:, 1] - w[..., 1] * E[:, 0]) / den
-            u = (w[..., 0] * d[..., 1] - w[..., 1] * d[..., 0]) / den
-        hit[sl] = np.where((den != 0) & (u >= 0) & (u <= 1) & (t > 1e-6), t, np.inf).min(1)
-    return hit
-
-
 def _ramp(mask: np.ndarray, piece: np.ndarray, k: int) -> np.ndarray:
     """Per station, min(1, d/k), d the index distance to the nearest False of its own piece.
 
@@ -1232,16 +1219,17 @@ def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: floa
     normals within +-ramp segments, so a corner turns the lane over ~2*ramp stations.
     Along a run of lane > 0 the normal is flipped only where it points over 150 deg
     away from the previous station's (LANE_FLIP_DOT): a collapsed out-and-back's two
-    passes tying, never a corner. A target that would cross another stretch of ref (a
-    turnaround, an inside corner) stops half way to it. The move is eased by _ramp,
-    then every lane station closer than lane * lane_px to ref is pushed straight away
-    from its nearest ref point to exactly that, repeated until none is (64 rounds,
-    then one line on stdout), spec 6.6.
+    passes tying, never a corner. The move is eased by _ramp, then every lane station
+    closer than lane * lane_px to ref is pushed straight away from its nearest ref
+    point to exactly that, repeated until none is (64 rounds, then one line on stdout),
+    spec 6.6.
 
     Ceiling: the lane is clear of a neighbour's crossing cut only where the shared road
     turns up to 90 deg and the later track stays within ~0.4 px of it. At a sharper
-    corner, or where the later track cuts the corner, the lane can come inside the cut
-    and Task 9's crossing rule gives the EARLIER wall a short gap there."""
+    corner, a turnaround (a 180 deg corner: a shared out-and-back's last few stations
+    can land on the wrong side), or where the later track cuts the corner, the lane
+    can come inside the cut and Task 9's crossing rule gives the EARLIER wall a short
+    gap there."""
     # ponytail: per-station offsets; build lanes from a true offset polyline of the earlier
     # wall's road (round joins outside, trimmed loops inside) to clear any corner
     refs = [_lane_ref(w, ramp) for w in walls]
@@ -1269,12 +1257,8 @@ def assign_lanes(walls: list[list[tuple[np.ndarray, np.ndarray]]], lane_px: floa
             if nrm[s] @ nrm[s - 1] < LANE_FLIP_DOT:   # in order: s - 1 is already oriented
                 nrm[s] = -nrm[s]
         off = lane[:, None] * float(lane_px)
-        aim = off.copy()
-        for j in np.unique(ref[m]):   # never aim across another stretch of ref (a turnaround,
-            s = np.flatnonzero(m & (ref == j))   # an inside corner): stop half way, push the rest
-            aim[s] *= np.minimum(1, _ray_hit(foot[s], off[s] * nrm[s], *refs[j][:2]) / 2)[:, None]
         new = P.copy()
-        new[m] += _ramp(m, g, ramp)[m, None] * (foot[m] + aim[m] * nrm[m] - P[m])
+        new[m] += _ramp(m, g, ramp)[m, None] * (foot[m] + off[m] * nrm[m] - P[m])
         for j in np.unique(ref[m]):
             s = np.flatnonzero(m & (ref == j))
             for it in range(65):   # 64 pushes at most; a narrow inside corner converges slowly
