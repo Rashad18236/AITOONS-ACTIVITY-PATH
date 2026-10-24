@@ -313,6 +313,12 @@ SLOT_FLOOR_MM = 1.16
 # 2 layers, not cap_mm's 4: 1.16 - 0.96 would leave only the 0.2mm first layer green,
 # while 1.16 - 0.48 = 0.68 = 0.2 + 2*0.24 keeps the green under it on the layer grid.
 SLOT_CAP_MM = 0.48
+# A building is a raised cap: the surface under it goes up 2 layers, then it is capped
+# like a road, in the detail colour. Walls stand on the roofs.
+BUILDING_MM = 0.48
+# ...drawn only this close: a 15 m house is 0.4mm at Zermatt's 33 m/mm, under the 0.84
+# colour floor (a box under ~2.5 km at 216mm). ponytail: fitted to previews, not prints
+BUILDING_MAX_M_PER_MM = 12
 
 # The slicer's first layer is thicker than the rest (Bambu: nozzle diameter x 50%),
 # so a printable height is FIRST_LAYER_MM + n*layer_mm, not n*layer_mm.
@@ -658,16 +664,16 @@ def _road_mask(items, bounds, px_out):
 
 
 def fetch_osm_masks(bounds, px_out, res_mm, groups=frozenset(), max_frac=ROAD_MAX_FRAC):
-    """OSM water, sea and grey roads/runways over bounds -> (water, sea, roads), each
-    bool (px_out, px_out), row 0 = north. One Overpass call for all three. `groups` are
-    the detail classes the theme permits (Theme.groups); the zoom decides which of
-    them are drawn, and hiking routes and rail go into `roads`. Above `max_frac` of the
-    plate the finest class is dropped."""
+    """OSM water, sea, grey roads/runways and buildings over bounds -> (water, sea,
+    roads, buildings), each bool (px_out, px_out), row 0 = north. One Overpass call for
+    all four. `groups` are the detail classes the theme permits (Theme.groups); the zoom
+    decides which of them are drawn, and hiking routes and rail go into `roads`. Above
+    `max_frac` of the plate the finest road class is dropped; buildings never count."""
     w, s = _unmerc(bounds[0], bounds[1])
     e, n = _unmerc(bounds[2], bounds[3])
     if e - w > 4.0:   # a transoceanic track; Overpass would time out on the ocean
         print(f"water: {e - w:.1f}deg bbox is too wide for Overpass — no water drawn")
-        return tuple(np.zeros((px_out, px_out), bool) for _ in range(3))
+        return tuple(np.zeros((px_out, px_out), bool) for _ in range(4))
     # pseudo-mercator x is longitude in radians: ground metres = dx * R * cos(lat)
     lat = _unmerc(0, (bounds[1] + bounds[3]) / 2)[1]
     m_per_mm = (bounds[2] - bounds[0]) * 6371000 * math.cos(math.radians(lat)) / px_out / res_mm
@@ -676,15 +682,19 @@ def fetch_osm_masks(bounds, px_out, res_mm, groups=frozenset(), max_frac=ROAD_MA
     classes = [c for c, _ in tiers]
     tier_of = {h: c for c, rx in tiers if rx for h in rx.split("|")}
     rail = "rail" in groups and m_per_mm <= RAIL_MAX_M_PER_MM
+    bld = "buildings" in groups and m_per_mm <= BUILDING_MAX_M_PER_MM
     hw = "|".join(rx for _, rx in tiers if rx)
     # appended inside {roads}, so classic's query string (and cache key) is unchanged.
     # ponytail: `out geom` sends every hiking relation's member ways whole, unclipped
     # (Zermatt: 2 MB / 32 s, 34% of the points inside the box). Upgrade: a way(r) member
     # fetch scoped to the hiking set, which also brings the member tags; never
     # `out geom(bbox)` on the shared `out`, which would clip the lake rings.
+    # ponytail: buildings are closed ways only; multipolygon buildings (courtyard blocks,
+    # a few % of footprints) are skipped. Add relation["building"] if a city shows a hole.
     roads = ((f'way["highway"~"^({hw})$"];' if hw else "")
              + ('relation["route"="hiking"];' if "trails" in classes else "")
-             + ('way["railway"~"^(rail|narrow_gauge)$"];' if rail else ""))
+             + ('way["railway"~"^(rail|narrow_gauge)$"];' if rail else "")
+             + ('way["building"];' if bld else ""))
     els = _overpass(OVERPASS_QL.format(s=s, w=w, n=n, e=e, roads=roads))
     tag = lambda el, k: (el.get("tags") or {}).get(k)
     # a tunnel is skipped, not "water": a closed roundabout way would otherwise reach
@@ -696,7 +706,8 @@ def fetch_osm_masks(bounds, px_out, res_mm, groups=frozenset(), max_frac=ROAD_MA
                         else None) if tag(el, "highway") else
                        (None if tag(el, "tunnel") or tag(el, "service") else "rail")
                        if tag(el, "railway") in ("rail", "narrow_gauge") else
-                       "trails" if tag(el, "route") == "hiking" else "water")
+                       "trails" if tag(el, "route") == "hiking" else
+                       "building" if bld and tag(el, "building") else "water")
     # coastline must never reach the polygon rasteriser: a closed coastline way is an
     # island, and painted as a polygon it would print as a lake
     pick = lambda k: [el for el in els if kind(el) == k]
@@ -730,9 +741,12 @@ def fetch_osm_masks(bounds, px_out, res_mm, groups=frozenset(), max_frac=ROAD_MA
             break
         print(f"roads: {classes[0]} would grey {grey.mean():.0%} of the plate — dropped")
         classes.pop(0)
+    # buildings are filled like lakes (MIN_RING_PX2 is their print floor) and stay out of
+    # the cap: in a city they define the streets as the gaps between them
     return (_water_mask_from_elements(pick("water"), bounds, px_out),
             _sea_mask(pick("sea"), bounds, px_out),
-            grey | _water_mask_from_elements(areas, bounds, px_out))
+            grey | _water_mask_from_elements(areas, bounds, px_out),
+            _water_mask_from_elements(pick("building"), bounds, px_out))
 
 
 @dataclass
@@ -1126,11 +1140,12 @@ def compose_parts(gmask, elev, lc, p):
     rows extends the poster southward); the opening keeps its indices.
     text_mask / text_res: the glyph pixels on their own TEXT_SUB-times finer grid,
     printed as their own white body on top of the ring (empty when no text).
-    green/surface/water/roads/snow/snow_cells/z_snow: the (M,M) relief plate that drops
-    into the ring, its pre-slot pre-cap top, the water, road and grey vertex masks, and
-    the grey band's meshed cells and the horizontal plane it starts from.
-    water_cells/road_cells/cap_top/cap_bot: the caps' meshed cells and the vertex
-    surfaces they span (draped to the slot floor in the groove)."""
+    green/surface/water/roads/buildings/snow/snow_cells/z_snow: the (M,M) relief plate
+    that drops into the ring, its pre-slot pre-cap top (roofs included), the water, road,
+    building and grey vertex masks, and the grey band's meshed cells and the horizontal
+    plane it starts from.
+    water_cells/road_cells/building_cells/cap_top/cap_bot: the caps' meshed cells and
+    the vertex surfaces they span (draped to the slot floor in the groove)."""
     N, M, fpx, chin_px = _grid(p)
     H = N + chin_px
     frame = np.full((H, N), p.base_mm)
@@ -1166,10 +1181,20 @@ def compose_parts(gmask, elev, lc, p):
     # seats on SLOT_FLOOR_MM, now on the cap's top; the cap there is SLOT_CAP_MM thick.
     water = (lc == 1) & border
     roads = (lc == 3) & border
+    buildings = (lc == 4) & border
+    water_cells, road_cells = _slab_cells(water), _slab_cells(roads)
+    building_cells = _slab_cells(buildings)
+    # A building is a raised cap: the surface goes up BUILDING_MM under it (never through
+    # the relief ceiling) before anything is derived from it, so its cap, the carve and
+    # the walls standing on it all follow the roof. Only under cells the mesher meshes,
+    # like the carve below: a raised vertex no cap covers would print a green bump.
+    roof = _cell_verts(building_cells)
+    surface[roof] = np.minimum(surface[roof] + BUILDING_MM,
+                               _snap(p.plate_mm + p.relief_mm * p.exaggeration, p))
     snow = (lc == 2) & ~gmask              # the band stays out, as before
     cap_top = np.where(gmask, SLOT_FLOOR_MM, surface)
     cap_bot = np.where(gmask, SLOT_FLOOR_MM - SLOT_CAP_MM, surface - p.cap_mm)
-    water_cells, road_cells = _slab_cells(water), _slab_cells(roads)
+    caps = water_cells | road_cells | building_cells
     # Grey is a BAND, not a cap: the terrain solid is split at the horizontal plane
     # z_snow (the snow line on the relief's own scale, on a layer boundary), green
     # below it and grey above. A conformal cap surfaced as a `cap_mm / slope` stripe
@@ -1179,18 +1204,28 @@ def compose_parts(gmask, elev, lc, p):
     z_snow = _snap(max(to_mm(p.snow_line_m), p.plate_mm), p)
     # Cells, not vertices: the band's footprint has to be exactly what the mesher
     # meshes, or the green top drops to z_snow along a rim the grey does not cover
-    # and the assembled surface gains a gash.
-    snow_cells = _slab_cells(snow & (surface > z_snow))
+    # and the assembled surface gains a gash. Detail draws over the band, so a cap
+    # vertex next to the band joins its footprint (else a green gash opens between the
+    # band and a trail through it) and the cap cells leave it again (no two bodies
+    # share a volume); the cut can pinch the band, hence the second _unpinch.
+    hi = surface > z_snow
+    near = _dilate(snow & hi, 1)
+    snow_cells = _unpinch(_slab_cells((lc > 0) & ~gmask & hi & near) & ~caps)
     green = surface.copy()
+    # Band to z_snow FIRST, then the cap bottoms: where the two share an edge vertex the
+    # cap must sit on the terrain, not over a cavity down to the plane.
+    # ponytail: the band cell beside it then holds a terrain wedge between z_snow and
+    # cap_bot (inside the grey, so the slicer gives it to one of the two; a sub-cap_mm
+    # void when the cap is within cap_mm of z_snow). Confirm on a sliced 4-slot relief.
+    green[_cell_verts(snow_cells)] = z_snow
     # carved only under cells the mesher really meshes: a vertex-mask carve left orphan
     # pits along every edge a cap's four-corner cell rule drops (a 4px road loses one)
-    cv = _cell_verts(water_cells | road_cells)
+    cv = _cell_verts(caps)
     green[cv] = cap_bot[cv]
-    green[_cell_verts(snow_cells)] = z_snow
     green[gmask & ~cv] = SLOT_FLOOR_MM  # full-depth slot, constant floor
     return dict(frame=frame, text_mask=text_mask, text_res=text_res,
-                green=green, surface=surface, water=water, roads=roads,
-                water_cells=water_cells, road_cells=road_cells,
+                green=green, surface=surface, water=water, roads=roads, buildings=buildings,
+                water_cells=water_cells, road_cells=road_cells, building_cells=building_cells,
                 cap_top=cap_top, cap_bot=cap_bot,
                 snow=snow, snow_cells=snow_cells, z_snow=z_snow)
 
@@ -1808,7 +1843,7 @@ def build_poster(legs: list[activity.Leg], p=Params()) -> tuple[list, list, list
     if p.theme not in THEMES:
         raise ValueError(f"unknown theme {p.theme!r}; one of: {', '.join(THEMES)}")
     t = THEMES[p.theme]
-    road = t.detail or t.band   # roads take the last relief slot; neither set: not drawn
+    road = t.detail or t.band   # roads and buildings take the last relief slot; neither set: not drawn
     # ponytail: reject rather than clamp — a typo'd 2500mm is a mistake to surface,
     # not to silently honour, and N^2 grids OOM the box. Raise the cap if a bigger
     # plate ever shows up.
@@ -1837,8 +1872,9 @@ def build_poster(legs: list[activity.Leg], p=Params()) -> tuple[list, list, list
     elev = fetch_elevation(bounds, M)
     # No soft-fail: a poster without its coast keeps the seabed in the DEM and prints
     # different relief from the same order, so Overpass being down is a 502.
-    water, sea, roads = fetch_osm_masks(bounds, M, p.res_mm, groups=t.groups,
-                                        max_frac=DETAIL_MAX_FRAC if t.detail else ROAD_MAX_FRAC)
+    water, sea, roads, buildings = fetch_osm_masks(
+        bounds, M, p.res_mm, groups=t.groups,
+        max_frac=DETAIL_MAX_FRAC if t.detail else ROAD_MAX_FRAC)
     # the sea is flat; terrarium carries bathymetry (Blackpool: -7.85 m seabed,
     # 45% of the grid). np.where, not in place: fetch_elevation's array is read-only
     elev = np.where(sea, 0.0, elev)
@@ -1857,7 +1893,10 @@ def build_poster(legs: list[activity.Leg], p=Params()) -> tuple[list, list, list
         lc[elev >= p.snow_line_m] = 2
     lc[water] = 1   # high Alpine lakes sit above the snow line and stay blue
     if road:
-        lc[roads & (lc != 2)] = 3   # after water, so a bridge is grey across the river; never over snow
+        # after water, so a bridge is grey across the river; and over the band, so a
+        # yellow trail at 3000 m shows (compose_parts cuts the band for it)
+        lc[roads] = 3
+        lc[buildings & (lc == 0)] = 4   # on open land only: never in a lake, a road or the band
     # Walls (spec 6.5, 6.6): passes collapse inside a sport, then sports take lanes, then
     # crossings cut the earlier wall; the groove is carved from those very masks. "The
     # same road" is within one lane pitch, and every snap eases over two pitches.
@@ -1870,12 +1909,15 @@ def build_poster(legs: list[activity.Leg], p=Params()) -> tuple[list, list, list
     parts = compose_parts(groove_from_masks(masks, M, p), elev, lc, p)
     tops = wall_tops(laned, parts["surface"], p)
     bodies = [(heightmap_mesh(parts["green"], p.res_mm), "terrain", t.land, 1)]
-    # water and roads stay conformal caps (lakes are flat, so their slices are lake-wide
-    # anyway) draped into the slot; grey is a band standing on the z_snow plane
+    # water, roads and buildings stay conformal caps (lakes are flat, so their slices are
+    # lake-wide anyway) draped into the slot, buildings on their raised roofs; grey is a
+    # band standing on the z_snow plane. Roads and buildings share the detail slot.
     cap = lambda k: _slab_mesh(parts[k], parts["cap_top"], parts["cap_bot"], p.res_mm)
+    detail = len(relief_colours(t))
     for name, colour, slot, m in (("water", t.water, 2, cap("water_cells")),
                                   ("snow", t.band, 3, band_mesh(parts, p)),
-                                  ("roads", road, len(relief_colours(t)), cap("road_cells"))):
+                                  ("roads", road, detail, cap("road_cells")),
+                                  ("buildings", road, detail, cap("building_cells"))):
         if m is not None:
             bodies.append((m, name, colour, slot))
     ring_top = p.base_mm + p.frame_height_mm

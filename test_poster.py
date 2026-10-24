@@ -111,7 +111,7 @@ def test_fixed_constants_sit_on_the_default_layer_grid():
     for v in (poster.SLOT_FLOOR_MM, poster.SLOT_FLOOR_MM - poster.SLOT_CAP_MM,
               p.base_mm, p.plate_mm):
         assert abs(v - poster._snap(v, p)) < 1e-6, v
-    for v in (p.cap_mm, poster.SLOT_CAP_MM, poster.TEXT_EMBOSS_MM):
+    for v in (p.cap_mm, poster.SLOT_CAP_MM, poster.TEXT_EMBOSS_MM, poster.BUILDING_MM):
         n = v / p.layer_mm
         assert abs(n - round(n)) < 1e-6, v
 
@@ -1071,23 +1071,27 @@ TRI3 = [_leg("swim", 200, np.nan), _leg("bike", 400, 140, t0=3600, lat0=47.01),
         _leg("run", 300, 160, t0=7200, lat0=47.02)]
 
 
-def _fake_fetches(monkeypatch, water=False, elev_top=500.0, roads=False):
+def _fake_fetches(monkeypatch, water=False, elev_top=500.0, roads=False, buildings=False):
     monkeypatch.setattr(poster, "fetch_elevation",
                         lambda b, px: np.tile(np.linspace(0, elev_top, px), (px, 1)))
     monkeypatch.setattr(poster, "fetch_osm_masks",
-                        lambda b, px, res, **kw: (
+                        lambda b, px, res, groups=frozenset(), max_frac=None: (
                             np.full((px, px), water, bool), np.zeros((px, px), bool),
-                            np.full((px, px), roads, bool)))
+                            np.full((px, px), roads, bool), np.full((px, px), buildings, bool)))
 
 
-def _fake_strips(monkeypatch):
+def _fake_strips(monkeypatch, buildings=False):
     """Every relief body in one order: a W-E ramp to 4000 m (the band east of 2000 m),
-    water on the west quarter and a road across the middle (a bridge over the water)."""
-    def masks(b, px, res, **kw):
-        water, road = np.zeros((px, px), bool), np.zeros((px, px), bool)
+    water on the west quarter and a road across the middle (a bridge over the water, and
+    a trail through the band). `buildings`: a block north of the road, its west half over
+    the water, which stays water."""
+    def masks(b, px, res, groups=frozenset(), max_frac=None):
+        water, road, bld = (np.zeros((px, px), bool) for _ in range(3))
         water[:, :px // 4] = True
         road[3 * px // 8:5 * px // 8] = True
-        return water, np.zeros((px, px), bool), road
+        if buildings:
+            bld[px // 8:px // 4, px // 8:3 * px // 8] = True
+        return water, np.zeros((px, px), bool), road, bld
     monkeypatch.setattr(poster, "fetch_elevation",
                         lambda b, px: np.tile(np.linspace(0, 4000.0, px), (px, 1)))
     monkeypatch.setattr(poster, "fetch_osm_masks", masks)
@@ -1915,12 +1919,12 @@ def test_frame_text_shrinks_to_fit_the_bar():
     _assert_text_meshes(p, parts, text, 20000)
 
 
-def _write_order(tmp_path, built):
+def _write_order(tmp_path, built, theme=poster.CLASSIC):
     """Write a build_poster result as its .3mf files -> check_output's positional args."""
     frame, relief, paths = built
     files = [("frame", frame), ("relief", relief), *paths]
     for stem, bodies in files:
-        (tmp_path / f"{stem}.3mf").write_bytes(poster.write_3mf(bodies))
+        (tmp_path / f"{stem}.3mf").write_bytes(poster.write_3mf(bodies, theme=theme))
     return [str(tmp_path / f"{stem}.3mf") for stem, _ in files]
 
 
@@ -2177,8 +2181,8 @@ def test_overpass_responses_are_cached_per_query(monkeypatch):
 def test_fetch_osm_masks_skips_transoceanic_spans(monkeypatch, capsys):
     monkeypatch.setattr(poster, "_get",
                         lambda *a, **k: pytest.fail("must not query Overpass"))
-    m = poster.fetch_osm_masks(_wbounds(40.0, -70.0, 50.0, 10.0), 32, 0.4)[0]
-    assert m.shape == (32, 32) and not m.any()
+    masks = poster.fetch_osm_masks(_wbounds(40.0, -70.0, 50.0, 10.0), 32, 0.4)
+    assert len(masks) == 4 and all(m.shape == (32, 32) and not m.any() for m in masks)
     assert "water" in capsys.readouterr().out.lower()
 
 
@@ -2200,7 +2204,7 @@ def test_sea_is_the_right_hand_side_of_the_coastline_and_prints_flat(monkeypatch
     zeros = lambda px: np.zeros((px, px), bool)
     monkeypatch.setattr(poster, "fetch_elevation", elev)
     monkeypatch.setattr(poster, "fetch_osm_masks",
-                        lambda b, px, res, **kw: (zeros(px), east(px), zeros(px)))
+                        lambda b, px, res, **kw: (zeros(px), east(px), zeros(px), zeros(px)))
     seen, real = {}, poster.compose_parts
     monkeypatch.setattr(poster, "compose_parts", lambda *a: seen.setdefault("p", real(*a)))
     p = _params()                              # 30m of land: the 300m span floor, so
@@ -2231,7 +2235,7 @@ def test_fetch_osm_masks_draws_roads_and_runways_by_scale(monkeypatch, capsys):
     seen = []
     monkeypatch.setattr(poster, "_get", lambda url, **k: seen.append(url)
                         or json.dumps({"elements": els}).encode())
-    water, sea, roads = poster.fetch_osm_masks(B, 100, 0.4)
+    water, sea, roads, _ = poster.fetch_osm_masks(B, 100, 0.4)
     assert "primary" in seen[0] and "tertiary" not in seen[0]
     at = lambda m, la, lo: m[_rc(B, la, lo, 100)]
     assert at(roads, 47.03, 8.03) and at(roads, 47.05, 8.03)       # primary, runway
@@ -2294,7 +2298,7 @@ def test_fine_classes_need_both_zoom_and_theme(monkeypatch, capsys):
     assert seen[1].endswith(poster.OVERPASS_QL.format(
         s=s, w=w, n=n, e=e, roads='way["highway"~"^(tertiary|secondary|primary|trunk|motorway)$"];'))
 
-    water, sea, roads = poster.fetch_osm_masks(F, 100, 0.4, groups=EVERY)
+    water, sea, roads, _ = poster.fetch_osm_masks(F, 100, 0.4, groups=EVERY)
     q = seen[2]
     assert "residential" in q and 'relation["route"="hiking"]' in q
     assert 'way["railway"~"^(rail|narrow_gauge)$"]' in q
@@ -2355,10 +2359,41 @@ def test_detail_in_its_own_colour_is_capped_at_20_percent(monkeypatch, capsys):
     caps = []
     _fake_fetches(monkeypatch)
     monkeypatch.setattr(poster, "fetch_osm_masks", lambda b, px, res, **kw: caps.append(
-        kw["max_frac"]) or tuple(np.zeros((px, px), bool) for _ in range(3)))
+        kw["max_frac"]) or tuple(np.zeros((px, px), bool) for _ in range(4)))
     for theme in ("classic", "triathlon", "alpine_hiking"):     # band-shared x2, own detail
         poster.build_poster(LEGS3, _params(theme=theme))
     assert caps == [poster.ROAD_MAX_FRAC, poster.ROAD_MAX_FRAC, poster.DETAIL_MAX_FRAC]
+
+
+def test_buildings_need_the_theme_and_a_close_box(monkeypatch, capsys):
+    """Buildings are asked for only when the theme permits them AND the box is close:
+    <= BUILDING_MAX_M_PER_MM, since a 15 m house is 0.4mm at Zermatt's 33 m/mm, under
+    the colour floor. They are closed ways filled like lakes (MIN_RING_PX2 is their print
+    floor), never water, and never part of the density cap: in a city they ARE the
+    street grid, drawn as gaps."""
+    row = lambda r, c0=5, c1=95: [_F(r, c0), _F(r, c1)]
+    box = lambda r0, c0, r1, c1: _way(_ring(*_F(r1, c0), *_F(r0, c1)), tags={"building": "yes"})
+    els = [box(40, 20, 60, 40),                                    # a house, 20 x 20 px
+           box(70, 70, 72, 72),                                    # a shed, ~4 px2
+           box(5, 50, 35, 95),                                     # a block, ~14% of the plate
+           box(5, 5, 30, 45),                                      # ...and its neighbour, ~10%
+           _way(row(80), tags={"highway": "residential"})]
+    seen = []
+    monkeypatch.setattr(poster, "_get", lambda url, **k: seen.append(urllib.parse.unquote(url))
+                        or json.dumps({"elements": els}).encode())
+    # F at 100 px is ~10 m/mm; at 80 px ~12.6, just past the limit; Zermatt-like ~37.6
+    for b, px, g in ((F, 100, EVERY - {"buildings"}), (F, 80, EVERY),
+                     (_wbounds(47.0, 8.0, 47.0134, 8.0198), 100, EVERY)):
+        assert not poster.fetch_osm_masks(b, px, 0.4, groups=g)[3].any()
+    assert seen and not any("building" in q for q in seen)
+    water, sea, roads, bld = poster.fetch_osm_masks(F, 85, 0.4, groups=EVERY)   # ~11.8 m/mm
+    assert 'way["building"];' in seen[-1]
+    water, sea, roads, bld = poster.fetch_osm_masks(F, 100, 0.4, groups=EVERY)
+    at = lambda m, r, c: m[_rc(F, *_F(r, c), 100)]
+    assert at(bld, 50, 30) and not at(water, 50, 30) and not at(roads, 50, 30)   # not a lake
+    assert not at(bld, 71, 71)                                     # under MIN_RING_PX2
+    assert at(bld, 20, 70) and bld.mean() > poster.DETAIL_MAX_FRAC
+    assert at(roads, 80, 50) and "dropped" not in capsys.readouterr().out   # the street stays
 
 
 def test_caps_follow_the_slot(monkeypatch, tmp_path):
@@ -2397,6 +2432,50 @@ def test_caps_follow_the_slot(monkeypatch, tmp_path):
     assert [b[1] for b in bodies] == ["terrain", "roads"]
     assert bodies[1][2] == poster.COLORS["snow"] and bodies[1][3] == 3
     assert bodies[1][0].is_watertight and bodies[1][0].is_winding_consistent
+
+
+def test_buildings_are_a_two_layer_roof_in_the_detail_colour(monkeypatch, tmp_path):
+    """A building is the road cap on a surface raised BUILDING_MM: the ground under it
+    goes up two layers (never through the relief ceiling, so a summit hut sits flush),
+    and the cap and the carve follow that surface. Walls stand on roofs, and
+    check_output's cap rule holds unchanged."""
+    p, N, fpx, elev = _synthetic()
+    M = _mpx(p)
+    elev = elev.copy()
+    elev[:, -12:] = 1000.0                                 # a flat summit, top of the scale
+    lc = np.zeros((M, M), np.uint8)
+    lc[5:12, 10:16] = 4                                    # a house on the ramp
+    lc[5:12, -8:-2] = 4                                    # a hut on the summit
+    bare = poster.compose_parts(_band(M), elev, np.zeros_like(lc), p)["surface"]
+    parts = poster.compose_parts(_band(M), elev, lc, p)
+    s, roof = parts["surface"], poster._cell_verts(parts["building_cells"])
+    assert (roof == (lc == 4)).all() and (parts["buildings"] == (lc == 4)).all()
+    house, hut = roof.copy(), roof.copy()
+    house[:, M // 2:] = hut[:, :M // 2] = False
+    ceiling = poster._snap(p.plate_mm + p.relief_mm * p.exaggeration, p)
+    assert np.allclose(s[house], bare[house] + poster.BUILDING_MM)          # two layers up
+    assert np.abs(s - poster._snap(s, p)).max() < 1e-9                       # on the grid
+    assert np.allclose(s[hut], ceiling) and s.max() <= ceiling + 1e-9        # flush at the top
+    assert (s[~roof] == bare[~roof]).all()                                   # nothing else moves
+    assert np.allclose(parts["cap_top"][roof], s[roof])
+    assert np.allclose(parts["cap_bot"][roof], s[roof] - p.cap_mm)           # roof - cap_mm
+    assert np.allclose(parts["green"][roof], parts["cap_bot"][roof])         # terrain carved to it
+
+    import check_output
+    t = poster.THEMES["concrete"]                          # 4 slots, may draw buildings
+    _fake_strips(monkeypatch, buildings=True)
+    q = _params(theme="concrete")
+    built = poster.build_poster(LEGS3, q)
+    assert [b[1:] for b in built[1]] == [("terrain", t.land, 1), ("water", t.water, 2),
+                                         ("snow", t.band, 3), ("roads", t.detail, 4),
+                                         ("buildings", t.detail, 4)]
+    m = built[1][-1][0]
+    assert m.is_watertight and m.is_winding_consistent and m.volume > 0
+    assert check_output.main(_write_order(tmp_path, built, t)
+                             + ["--params", json.dumps(asdict(q))]) == 0
+    # no band and no detail colour: no buildings either, like roads
+    _, relief, _ = poster.build_poster(LEGS3, _params(theme="gallery"))
+    assert [b[1] for b in relief] == ["terrain", "water"]
 
 
 def test_build_poster_fails_loudly_when_overpass_is_down(monkeypatch):
@@ -2462,7 +2541,7 @@ def test_a_small_peak_above_the_snow_line_is_a_solid_grey_body(monkeypatch):
 
     monkeypatch.setattr(poster, "fetch_elevation", elev)
     monkeypatch.setattr(poster, "fetch_osm_masks",
-                        lambda b, px, res, **kw: tuple(np.zeros((px, px), bool) for _ in range(3)))
+                        lambda b, px, res, **kw: tuple(np.zeros((px, px), bool) for _ in range(4)))
     _, bodies, _ = poster.build_poster(LEGS3, _params())
     assert [b[1] for b in bodies] == ["terrain", "snow"]   # the peak survives...
     m = bodies[1][0]
@@ -2607,3 +2686,29 @@ def test_snow_line_below_the_dem_leaves_no_green_above_the_plate():
     verts = poster._cell_verts(parts["snow_cells"])
     assert verts.mean() > 0.8
     assert np.abs(parts["green"][verts] - p.plate_mm).max() < 1e-9
+
+
+def test_a_trail_over_the_band_cuts_the_band_not_a_void():
+    """Detail draws over the band (a yellow trail at 3000 m is the point of the hiking
+    theme). The band reaches the trail's edge vertices, so no green gash opens between
+    them; its cells stop where the trail's cap cells start, so no two bodies share a
+    volume; and the band is carved to z_snow BEFORE the cap bottoms, so the cap sits on
+    the terrain instead of over a cavity down to the plane."""
+    p = _params(snow_line_m=600.0)
+    M = _mpx(p)
+    elev = np.tile(np.linspace(0, 1000, M), (M, 1))
+    lc = np.where(elev >= p.snow_line_m, 2, 0).astype(np.uint8)
+    lc[10:14] = 3                                          # a 4px trail W-E, into the band
+    lc[20:22] = 3                                          # a 2px one: every vertex an edge
+    g = _band(M)
+    parts = poster.compose_parts(g, elev, lc, p)
+    band, road = parts["snow_cells"], parts["road_cells"]
+    assert road[20].any() and not (band & road).any()
+    # not a void: inside the band, every cell around the trails is band or trail
+    c0 = int(np.argmax(elev[0] >= p.snow_line_m)) + 1
+    assert (band | road)[6:26, c0:M - 2].all()
+    cv = poster._cell_verts(road)
+    assert (parts["green"][cv] >= parts["cap_bot"][cv] - 1e-9).all()
+    for m in (poster.heightmap_mesh(parts["green"], p.res_mm), poster.band_mesh(parts, p),
+              poster._slab_mesh(road, parts["cap_top"], parts["cap_bot"], p.res_mm)):
+        assert m.is_watertight and m.is_winding_consistent and m.volume > 0
